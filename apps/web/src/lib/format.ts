@@ -18,37 +18,25 @@ export function formatNum(value: number, opts?: { compact?: boolean; decimals?: 
 export function formatPct(value: number, opts?: { decimals?: number; sign?: boolean }): string {
   if (Number.isNaN(value)) return '—';
   const decimals = opts?.decimals ?? 2;
-  const sign = value > 0 ? '+' : '';
-  const prefix = opts?.sign || value > 0 ? sign : '';
+  const showSign = opts?.sign !== false && value > 0;
+  const prefix = showSign ? '+' : '';
   return `${prefix}${value.toFixed(decimals)}%`;
 }
 
 export function formatTime(iso: string): string {
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-  } catch {
-    return iso;
-  }
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 }
 
 export function formatDate(iso: string): string {
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return d.toLocaleDateString('ru-RU');
-  } catch {
-    return iso;
-  }
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('ru-RU');
 }
 
 export function formatDateTime(iso: string): string {
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return `${formatDate(iso)} ${formatTime(iso)}`;
-  } catch {
-    return iso;
-  }
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return `${formatDate(iso)} ${formatTime(iso)}`;
 }

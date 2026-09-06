@@ -12,19 +12,27 @@ function hash(s: string): number {
   return Math.abs(h);
 }
 
+// Build a series from the same formula Sparkline uses, so we can predict the trend direction.
+function seriesFor(symbol: string, n = 9): number[] {
+  const seed = hash(symbol);
+  const series: number[] = [];
+  let v = 50 + (seed % 20);
+  for (let i = 0; i < n; i++) {
+    v += ((seed >> (i * 3)) & 0xff) / 64 - 2;
+    series.push(v);
+  }
+  return series;
+}
+
+export { hash, seriesFor };
+
 export function Sparkline({ symbol, width = 60, height = 16 }: Props) {
   const { points, color } = useMemo(() => {
-    const seed = hash(symbol);
-    const n = 9;
-    const series: number[] = [];
-    let v = 50 + (seed % 20);
-    for (let i = 0; i < n; i++) {
-      v += ((seed >> (i * 3)) & 0xff) / 64 - 2;
-      series.push(v);
-    }
+    const series = seriesFor(symbol);
+    const n = series.length;
     const min = Math.min(...series);
     const max = Math.max(...series);
-    const range = max - min || 1;
+    const range = max - min;
     const step = width / (n - 1);
     const pts = series.map((val, i) => {
       const x = i * step;

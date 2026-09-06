@@ -79,7 +79,6 @@ export function useBars(symbol: string | null) {
   return useQuery<BarsSeries>({
     queryKey: ['bars', symbol],
     queryFn: async () => {
-      if (!symbol) throw new Error('symbol required');
       const data = await api<unknown>(`/bars/${symbol}`);
       return BarsSeriesSchema.parse(data);
     },
