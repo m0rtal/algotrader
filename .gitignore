@@ -1,0 +1,14 @@
+node_modules
+dist
+build
+coverage
+.DS_Store
+*.log
+.env
+.env.local
+.vite
+openspec/.DS_Store
+.idea
+.vscode/*
+!.vscode/settings.json
+*.tsbuildinfo
