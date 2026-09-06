@@ -16,7 +16,8 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "test:api": "cd apps/api && uv run pytest --cov=algotrader_api --cov-report=term",
-    "test:all": "pnpm test && pnpm test:api",
+    "test:scripts": "cd apps/api && uv run pytest ../../scripts/test_scan_credentials.py",
+    "test:all": "pnpm test && pnpm test:api && pnpm test:scripts",
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md,css}\"",
     "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md,css}\"",
     "prepare": "husky"

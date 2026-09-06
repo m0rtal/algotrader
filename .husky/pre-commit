@@ -1,2 +1,12 @@
+#!/usr/bin/env bash
+# Pre-commit: lint staged, scan for secrets, refresh codebase memory index.
+set -euo pipefail
+
+# 1. Block commit on credential leaks BEFORE linting (fail fast).
+python3 "$(dirname -- "$0")/../scripts/scan-credentials.py"
+
+# 2. Lint staged files.
 pnpm exec lint-staged
+
+# 3. Refresh codebase-memory graph for the staged slice.
 python3 "$(dirname -- "$0")/refresh-codebase-memory.py"

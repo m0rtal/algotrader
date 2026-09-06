@@ -23,6 +23,9 @@ openspec/.DS_Store
 .coverage
 
 # Runtime data (bars, sqlite state)
+/apps/api/data/
+/apps/api/data/bars/
+/apps/api/data/state.db*
 /data/bars/*
 !/data/bars/.gitkeep
 /data/state.db*
