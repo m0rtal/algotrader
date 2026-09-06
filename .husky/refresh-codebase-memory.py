@@ -16,7 +16,7 @@ from pathlib import Path
 REPO = Path("/home/hermes/algotrader").resolve()
 MCP_BIN = "/home/hermes/.local/bin/codebase-memory-mcp"
 PROJECT = "home-hermes-algotrader"
-SOURCE_GLOBS = (".ts", ".tsx", ".js", ".jsx", ".json", ".css", ".html")
+SOURCE_GLOBS = (".ts", ".tsx", ".js", ".jsx", ".json", ".css", ".html", ".py")
 
 
 def diff_files() -> list[str]:
