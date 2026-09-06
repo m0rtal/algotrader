@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     data_dir: str = "./data"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_sample_health: float = 0.1
+    # Data ingest defaults — overridable via ALGOTRADER_INGEST_* env vars (worker scope).
+    history_years: int = 5
+    fetch_disabled: bool = False
+    synth_seed: bool = False
 
     cors_origins: str = '["http://localhost:5173","http://192.168.1.101:5173"]'
 

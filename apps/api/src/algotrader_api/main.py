@@ -15,8 +15,8 @@ from .observability.correlation import CorrelationMiddleware
 from .observability.logging import get_logger, setup_logging
 from .observability.middleware import LatencyMiddleware
 from .observability.tracing import setup_tracing, shutdown_tracing
-from .routes import bars, health, settings as settings_route
-from .seed import seed_bars
+from .routes import admin, bars, health, pipeline as pipeline_route, settings as settings_route
+from .seed import seed_bars, should_seed_synth
 
 logger = get_logger("algotrader_api.main")
 
@@ -56,14 +56,23 @@ def create_app() -> FastAPI:
             raise
         duck.get_connection(settings.bars_dir)  # warm DuckDB connection
 
-        # Seed if no bars present
+        # Seed synthetic bars only when:
+        # - no parquet files exist yet, AND
+        # - ALGOTRADER_SYNTH_SEED is set OR the Tinkoff token file is missing
+        #   (dev environment without secrets).
         existing = list(Path(settings.bars_dir).glob("*.parquet"))
-        if not existing:
+        if not existing and should_seed_synth():
             logger.info("seed.start", bars_dir=settings.bars_dir)
             n = seed_bars(settings.bars_dir)
             logger.info("seed.done", bars_written=n)
             # Re-init DuckDB so the view picks up the freshly written parquet files
             duck.close()
+            duck.get_connection(settings.bars_dir)
+        elif not existing:
+            logger.info(
+                "seed.skipped",
+                reason="no parquet files but token file present; worker will populate on next cron tick",
+            )
             duck.get_connection(settings.bars_dir)
 
         # Wire route paths
@@ -103,6 +112,8 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(settings_route.router)
     app.include_router(bars.router)
+    app.include_router(pipeline_route.router)
+    app.include_router(admin.router)
 
     # OpenTelemetry FastAPI instrumentation
     FastAPIInstrumentor.instrument_app(app)

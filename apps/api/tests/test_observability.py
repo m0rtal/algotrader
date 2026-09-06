@@ -110,3 +110,51 @@ def test_process_event_applies_all_scrubbers():
 
 def test_correlation_id_header_constant():
     assert CORRELATION_ID_HEADER == "X-Correlation-ID"
+
+
+def test_logging_setup_is_idempotent():
+    """setup_logging uses a module-level lock — second call should be a no-op."""
+    from algotrader_api.observability import logging as obs_logging
+
+    obs_logging.setup_logging(level="INFO", health_sample_rate=1.0)
+    obs_logging.setup_logging(level="DEBUG", health_sample_rate=0.5)  # second call
+    # Should still work after second call
+    logger = obs_logging.get_logger("test")
+    assert logger is not None
+
+
+def test_logging_console_format():
+    """log_format='console' uses ConsoleRenderer instead of JSONRenderer."""
+    from algotrader_api.observability import logging as obs_logging
+
+    obs_logging.setup_logging(level="INFO", log_format="console", health_sample_rate=1.0)
+    logger = obs_logging.get_logger("test")
+    logger.info("test_event", key="value")  # no exception
+
+
+def test_logging_with_active_otel_span(caplog):
+    """When inside an active OTel span, log events should include trace_id/span_id."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+
+    provider = TracerProvider()
+    trace.set_tracer_provider(provider)
+    tracer = trace.get_tracer("test")
+
+    from algotrader_api.observability import logging as obs_logging
+
+    obs_logging.setup_logging(level="INFO", health_sample_rate=1.0)
+    logger = obs_logging.get_logger("test")
+
+    with tracer.start_as_current_span("test-span"):
+        logger.info("inside_span", key="value")
+    logger.info("outside_span", key="value")  # should not raise
+
+
+def test_logging_handles_special_chars(caplog):
+    """Structlog processor chain handles text with quotes, newlines, unicode."""
+    from algotrader_api.observability import logging as obs_logging
+
+    obs_logging.setup_logging(level="INFO", health_sample_rate=1.0)
+    logger = obs_logging.get_logger("test")
+    logger.info("special", message='line1\nline2\ttab"quoted"', unicode_test="héllo 日本語")

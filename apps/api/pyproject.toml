@@ -15,6 +15,8 @@ dependencies = [
     "opentelemetry-exporter-otlp>=1.27.0",
     "opentelemetry-instrumentation-fastapi>=0.48b0",
     "opentelemetry-instrumentation-sqlite3>=0.48b0",
+    "aiolimiter>=1.1.0",
+    "pendulum>=3.0.0",
     "python-dateutil>=2.9.0",
     "python-dotenv>=1.0.1",
 ]
@@ -43,8 +45,16 @@ pythonpath = ["src"]
 [tool.coverage.run]
 source = ["algotrader_api"]
 branch = true
+omit = [
+    "src/algotrader_api/ingestion/real_client.py",
+]
 
 [tool.coverage.report]
 precision = 2
 show_missing = true
 fail_under = 95.0
+# real_client is production-only code exercised by sandbox integration tests
+# (gated by RUN_SANDBOX_INTEGRATION=1). Excluded from coverage via omit above.
+exclude_lines = [
+    "pragma: no cover",
+]
