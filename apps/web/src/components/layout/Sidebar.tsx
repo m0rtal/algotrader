@@ -9,7 +9,7 @@ export function Sidebar() {
   if (!regime) return null;
 
   return (
-    <div className="p-4 space-y-3.5 overflow-y-auto">
+    <div className="p-4 space-y-3.5">
       <div className="bg-surface-2 border border-border rounded-md p-3">
         <div className="text-[10px] uppercase tracking-wider text-text-dim font-semibold">Режим рынка</div>
         <div className="flex items-center gap-2.5 mt-2">

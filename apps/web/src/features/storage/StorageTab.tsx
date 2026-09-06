@@ -24,7 +24,7 @@ export function StorageTab() {
       <div className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2.5">
         По тикерам · кликни для деталей
       </div>
-      <div className="max-h-[360px] overflow-y-auto">
+      <div className="max-h-[360px] overflow-auto">
         <table className="w-full text-[11px]">
           <thead>
             <tr className="bg-surface">

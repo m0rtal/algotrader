@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+. "$(dirname -- "$0")/_/husky.sh"
+
+# Existing lint-staged hook from package.json
+pnpm exec lint-staged
+
+# Refresh codebase-memory index when source code changed
+python3 "$(dirname -- "$0")/refresh-codebase-memory.py"

@@ -39,7 +39,7 @@ describe('Dashboard', () => {
       expect(screen.getByRole('button', { name: 'Сделки' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Портфель' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Бэктест' })).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: 'Бары (хранилище)' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Бары' })).toBeInTheDocument();
     });
   });
 
@@ -112,9 +112,9 @@ describe('Dashboard', () => {
       </Wrapper>,
     );
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Бары (хранилище)' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Бары' })).toBeInTheDocument();
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Бары (хранилище)' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Бары' }));
     await waitFor(() => {
       expect(screen.getByText('Всего баров')).toBeInTheDocument();
     });

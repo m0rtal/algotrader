@@ -5,8 +5,8 @@ export function PortfolioTab() {
   const { data, isLoading } = usePortfolio();
   if (isLoading || !data) return <div className="p-4 text-text-muted">Загрузка…</div>;
   return (
-    <div className="p-4">
-      <div className="grid grid-cols-4 gap-2 mb-3.5">
+    <div className="p-4 overflow-x-auto">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 mb-3.5 min-w-[600px]">
         <Card label="Свободно" value={formatRUB(data.cash)} sub={`${((data.cash / data.total) * 100).toFixed(1)}%`} />
         <Card
           label="В позициях"
@@ -24,7 +24,7 @@ export function PortfolioTab() {
           sub={`net ${data.netExposure.toFixed(2)}x`}
         />
       </div>
-      <table className="w-full text-xs">
+      <table className="w-full text-xs min-w-[700px]">
         <thead>
           <tr className="bg-surface">
             {['Тикер', 'Сторона', 'Кол-во', 'Средняя', 'Цена', 'Стоимость', 'Доля', 'P&L'].map((h) => (

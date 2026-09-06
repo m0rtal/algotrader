@@ -16,7 +16,7 @@ export function LogStrip() {
   });
   if (!data) return null;
   return (
-    <div className="bg-surface border-t border-border px-4 py-2 mono text-[11px] text-text-muted flex gap-5 overflow-x-auto whitespace-nowrap">
+    <div className="bg-surface border-t border-border px-4 py-2 mono text-[11px] text-text-muted flex flex-wrap gap-x-4 gap-y-1">
       {data.map((l, i) => (
         <span key={i} className={toneClass(l.tone)}>
           [{l.ts}] {l.text}

@@ -33,7 +33,7 @@ export function TickerDrilldown() {
         if (e.target === e.currentTarget) close();
       }}
     >
-      <div className="bg-surface border border-border rounded-lg p-5 w-[800px] max-w-[90vw] max-h-[80vh] overflow-y-auto">
+      <div className="bg-surface border border-border rounded-lg p-5 w-full max-w-[640px] sm:max-w-[800px] max-h-[80vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-4">
           <div className="text-base font-semibold mono">
             {symbol} · {ticker?.name ?? ''}

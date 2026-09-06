@@ -6,8 +6,8 @@ export function BacktestTab() {
   const { data, isLoading } = useFolds();
   if (isLoading || !data) return <div className="p-4 text-text-muted">Загрузка…</div>;
   return (
-    <div className="p-4 space-y-4">
-      <div className="grid grid-cols-5 gap-2">
+    <div className="p-4 space-y-4 overflow-x-auto">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-2 min-w-[500px]">
         <Card label="OOS Sharpe" value="1.84" tone="pos" />
         <Card label="CAGR" value="+18.2%" tone="pos" />
         <Card label="Win Rate" value="54.7%" />
@@ -18,7 +18,7 @@ export function BacktestTab() {
         <div className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2.5">
           Walk-Forward Folds
         </div>
-        <table className="w-full text-xs">
+        <table className="w-full text-xs min-w-[700px]">
           <thead>
             <tr className="bg-surface">
               {['Fold', 'Train', 'Test', 'Sharpe', 'CAGR', 'Win%', 'Trades', 'Max DD'].map((h) => (

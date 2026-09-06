@@ -5,8 +5,8 @@ export function TradesTab() {
   const { data, isLoading } = useTrades();
   if (isLoading || !data) return <div className="p-4 text-text-muted">Загрузка…</div>;
   return (
-    <div className="p-4">
-      <table className="w-full text-xs">
+    <div className="p-4 overflow-x-auto">
+      <table className="w-full text-xs min-w-[600px]">
         <thead>
           <tr className="bg-surface">
             {['Время', 'Тикер', 'Сторона', 'Кол-во', 'Цена', 'Сумма', 'P&L', 'Стратегия'].map((h) => (

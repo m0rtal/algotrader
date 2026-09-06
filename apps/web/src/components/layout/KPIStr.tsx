@@ -4,7 +4,7 @@ export function KPIStr() {
   const { data: kpis } = useKpis();
   if (!kpis) return null;
   return (
-    <div className="grid grid-cols-6 bg-surface">
+    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 bg-surface">
       {kpis.map((k) => (
         <div key={k.label} className="px-[18px] py-3 border-r border-border-soft last:border-r-0">
           <div className="text-[10px] uppercase text-text-dim tracking-wider mb-1">{k.label}</div>
