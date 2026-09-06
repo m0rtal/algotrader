@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+. "$(dirname -- "$0")/_/husky.sh"
+
+# ADR is documentation; do not block the commit. Rewrite only on structural changes.
+python3 "$(dirname -- "$0")/update-adr.py"
