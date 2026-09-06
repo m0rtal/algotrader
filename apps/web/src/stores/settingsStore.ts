@@ -14,7 +14,6 @@ interface SettingsState {
   setValues: (values: Settings, version?: string | null) => void;
   update: <K extends keyof Settings>(section: K, patch: Partial<Settings[K]>) => void;
   isDirty: () => boolean;
-  save: () => Promise<void>;
   reset: () => void;
   setError: (error: string | null) => void;
 }
@@ -28,12 +27,12 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   loaded: false,
 
   setValues: (values, version) =>
-    set({
+    set((state) => ({
       values,
       baseline: values,
-      version: version ?? get().version,
+      version: version === undefined ? state.version : version,
       loaded: true,
-    }),
+    })),
 
   update: (section, patch) => {
     const next = { ...get().values, [section]: { ...get().values[section], ...patch } };
@@ -41,21 +40,6 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   },
 
   isDirty: () => JSON.stringify(get().values) !== JSON.stringify(get().baseline),
-
-  save: async () => {
-    set({ saving: true, error: null });
-    try {
-      // Implementation: actual API call lives in lib/hooks.ts useSaveSettings.
-      // This store method exists for state-machine symmetry and is invoked
-      // by SettingsTab after the mutation hook resolves.
-      set({ baseline: get().values });
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : 'unknown' });
-      throw e;
-    } finally {
-      set({ saving: false });
-    }
-  },
 
   reset: () => set({ values: get().baseline }),
 

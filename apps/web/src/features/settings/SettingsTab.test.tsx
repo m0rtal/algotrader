@@ -1,7 +1,9 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { DEFAULT_SETTINGS } from '@algotrader/shared';
 import { SettingsTab } from '@features/settings/SettingsTab';
+import { useSettingsStore } from '@stores/settingsStore';
 
 function makeWrapper() {
   const client = new QueryClient({
@@ -13,6 +15,26 @@ function makeWrapper() {
 }
 
 describe('SettingsTab', () => {
+  beforeEach(() => {
+    useSettingsStore.setState({
+      values: DEFAULT_SETTINGS,
+      baseline: DEFAULT_SETTINGS,
+      version: null,
+      saving: false,
+      error: null,
+      loaded: false,
+    });
+  });
+  afterEach(() => {
+    useSettingsStore.setState({
+      values: DEFAULT_SETTINGS,
+      baseline: DEFAULT_SETTINGS,
+      version: null,
+      saving: false,
+      error: null,
+      loaded: false,
+    });
+  });
   it('renders the 4 section tabs', async () => {
     const Wrapper = makeWrapper();
     render(
@@ -57,6 +79,35 @@ describe('SettingsTab', () => {
       expect(screen.getByText('Макс размер позиции (%)')).toBeInTheDocument();
       expect(screen.getByText('Kill switch')).toBeInTheDocument();
     });
+  });
+
+  it('clicking save sends version v1 when store version is null', async () => {
+    const { server } = await import('../../mocks/server');
+    const { http, HttpResponse } = await import('msw');
+    let receivedVersion: string | undefined;
+    server.use(
+      http.put('/api/settings', async ({ request }) => {
+        const body = (await request.json()) as { values: unknown; version: string };
+        receivedVersion = body.version;
+        return HttpResponse.json({
+          values: body.values,
+          version: 'v1-new',
+          updatedAt: new Date().toISOString(),
+        });
+      }),
+    );
+    const Wrapper = makeWrapper();
+    render(
+      <Wrapper>
+        <SettingsTab />
+      </Wrapper>,
+    );
+    await waitFor(() => screen.getByRole('button', { name: 'Сохранить' }));
+    act(() => useSettingsStore.setState({ version: null }));
+    fireEvent.change(screen.getByLabelText('Account ID'), { target: { value: 'Y' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
+    await waitFor(() => expect(screen.getByText('Сохранено')).toBeInTheDocument());
+    expect(receivedVersion).toBe('v1');
   });
 
   it('switching to ML shows ml fields with readonly model version', async () => {

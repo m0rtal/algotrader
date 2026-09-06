@@ -16,19 +16,22 @@ describe('ConfirmDialog', () => {
     expect(screen.getByText('Точно?')).toBeInTheDocument();
   });
 
-  it('fires onCancel on backdrop click', () => {
+  it('fires onCancel when backdrop is clicked directly', () => {
+    let cancelCount = 0;
+    const { container } = render(
+      <ConfirmDialog open title="t" body="b" onConfirm={() => {}} onCancel={() => cancelCount++} />,
+    );
+    fireEvent.click(container.firstChild as HTMLElement);
+    expect(cancelCount).toBe(1);
+  });
+
+  it('does not fire onCancel when clicking inside dialog', () => {
     let cancelCount = 0;
     render(
-      <div
-        onClick={(e) => {
-          if (e.target === e.currentTarget) cancelCount++;
-        }}
-      >
-        <ConfirmDialog open title="t" body="b" onConfirm={() => {}} onCancel={() => cancelCount++} />
-      </div>,
+      <ConfirmDialog open title="t" body="body-text" onConfirm={() => {}} onCancel={() => cancelCount++} />,
     );
-    fireEvent.click(screen.getByText('t').parentElement!.parentElement!.parentElement!);
-    // Not exact; this just ensures no crash
+    fireEvent.click(screen.getByText('body-text'));
+    expect(cancelCount).toBe(0);
   });
 
   it('fires onConfirm when confirm button is clicked', () => {

@@ -134,6 +134,51 @@ describe('BrokerSection', () => {
     expect(handleChange).toHaveBeenCalledWith({ accountId: 'NEW' });
   });
 
+  it('selecting sandbox when already sandbox fires onChange without confirm', () => {
+    const onChange = vi.fn();
+    const sandbox: BrokerSettings = { ...broker, environment: 'sandbox' };
+    render(
+      <BrokerSection values={sandbox} onChange={onChange} onSave={() => {}} saving={false} dirty={false} />,
+    );
+    const select = screen.getByRole('combobox', { name: 'Окружение' });
+    fireEvent.change(select, { target: { value: 'sandbox' } });
+    expect(onChange).toHaveBeenCalledWith({ environment: 'sandbox' });
+  });
+
+  it('confirming live trading fires onChange with environment=live', async () => {
+    const onChange = vi.fn();
+    render(
+      <BrokerSection values={broker} onChange={onChange} onSave={() => {}} saving={false} dirty={false} />,
+    );
+    const select = screen.getByRole('combobox', { name: 'Окружение' });
+    fireEvent.change(select, { target: { value: 'live' } });
+    await waitFor(() => expect(screen.getByText('Включить live-торговлю?')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Включить Live' }));
+    expect(onChange).toHaveBeenCalledWith({ environment: 'live' });
+  });
+
+  it('cancelling live trading confirm keeps environment as sandbox', async () => {
+    const onChange = vi.fn();
+    render(
+      <BrokerSection values={broker} onChange={onChange} onSave={() => {}} saving={false} dirty={false} />,
+    );
+    const select = screen.getByRole('combobox', { name: 'Окружение' });
+    fireEvent.change(select, { target: { value: 'live' } });
+    await waitFor(() => expect(screen.getByText('Включить live-торговлю?')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Отмена' }));
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('account id input fires onChange', () => {
+    const onChange = vi.fn();
+    render(
+      <BrokerSection values={broker} onChange={onChange} onSave={() => {}} saving={false} dirty={false} />,
+    );
+    const input = screen.getByLabelText('Account ID');
+    fireEvent.change(input, { target: { value: 'NEW-ID' } });
+    expect(onChange).toHaveBeenCalledWith({ accountId: 'NEW-ID' });
+  });
+
   it('renders the Save button', () => {
     render(
       <BrokerSection values={broker} onChange={() => {}} onSave={vi.fn()} saving={false} dirty={true} />,
@@ -242,6 +287,18 @@ describe('RiskSection', () => {
     );
     const input = screen.getByLabelText('Kill switch порог (%)') as HTMLInputElement;
     expect(input.disabled).toBe(false);
+  });
+
+  it('confirming kill switch disable fires onChange false', async () => {
+    const onChange = vi.fn();
+    const enabled: RiskSettings = { ...risk, killSwitchEnabled: true };
+    render(
+      <RiskSection values={enabled} onChange={onChange} onSave={() => {}} saving={false} dirty={false} />,
+    );
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Kill switch' }));
+    await waitFor(() => expect(screen.getByText('Отключить kill switch?')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Отключить' }));
+    expect(onChange).toHaveBeenCalledWith({ killSwitchEnabled: false });
   });
 
   it('clicking threshold input fires onChange', () => {

@@ -75,32 +75,26 @@ describe('useSettingsStore', () => {
     expect(result.current.values.risk.maxDrawdownPct).toBe(5);
   });
 
-  it('save sets saving true then false; on success baseline becomes values', async () => {
-    const { result } = renderHook(() => useSettingsStore());
-    act(() => result.current.setValues(sample));
-    await act(async () => {
-      await result.current.save();
-    });
-    expect(result.current.saving).toBe(false);
-    expect(result.current.baseline).toEqual(result.current.values);
-  });
-
-  it('save propagates errors to state', async () => {
-    const { result } = renderHook(() => useSettingsStore());
-    act(() => result.current.setValues(sample));
-    await act(async () => {
-      // Force an error by passing invalid input through a custom save wrapper
-      // (the store's save never throws in normal flow; simulate via direct setError)
-      result.current.setError('boom');
-    });
-    expect(result.current.error).toBe('boom');
-  });
-
   it('setError sets the error field', () => {
     const { result } = renderHook(() => useSettingsStore());
     act(() => result.current.setError('something failed'));
     expect(result.current.error).toBe('something failed');
     act(() => result.current.setError(null));
     expect(result.current.error).toBeNull();
+  });
+
+  it('setValues preserves previous version when called without version arg', () => {
+    const { result } = renderHook(() => useSettingsStore());
+    act(() => result.current.setValues(sample, 'v1'));
+    expect(result.current.version).toBe('v1');
+    act(() => result.current.setValues(sample));
+    expect(result.current.version).toBe('v1');
+  });
+
+  it('setValues accepts null version to clear it', () => {
+    const { result } = renderHook(() => useSettingsStore());
+    act(() => result.current.setValues(sample, 'v1'));
+    act(() => result.current.setValues(sample, null));
+    expect(result.current.version).toBeNull();
   });
 });
