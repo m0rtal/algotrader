@@ -32,4 +32,11 @@ describe('Topbar', () => {
     render(<Topbar />);
     expect(screen.getByText('Sandbox')).toBeInTheDocument();
   });
+
+  it('renders the settings gear link to /settings', () => {
+    render(<Topbar />);
+    const link = screen.getByLabelText('Open settings');
+    expect(link).toBeInTheDocument();
+    expect(link.getAttribute('href')).toBe('/settings');
+  });
 });

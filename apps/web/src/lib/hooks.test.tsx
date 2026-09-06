@@ -4,6 +4,7 @@ import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   useBars,
+  useDeleteSettings,
   useFolds,
   useKpis,
   useModel,
@@ -11,6 +12,8 @@ import {
   usePipeline,
   usePortfolio,
   useRegime,
+  useSaveSettings,
+  useSettings,
   useSignals,
   useTickers,
   useTrades,
@@ -116,5 +119,65 @@ describe('data hooks', () => {
     const { result } = renderHook(() => useBars('UNKNOWN'), { wrapper });
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect((result.current.error as Error).message).toBeTruthy();
+  });
+
+  it('useSettings returns values from GET /api/settings', async () => {
+    const { result } = renderHook(() => useSettings(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.values.broker.environment).toBe('sandbox');
+    expect(result.current.data?.values.risk.maxDrawdownPct).toBe(10);
+    expect(result.current.data?.version).toBeTruthy();
+  });
+
+  it('useSaveSettings PUTs and the new values land in state', async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const { result } = renderHook(
+      () => ({
+        save: useSaveSettings(),
+        settings: useSettings(),
+      }),
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+    await waitFor(() => expect(result.current.settings.isSuccess).toBe(true));
+    const current = result.current.settings.data!.values;
+    const next = {
+      ...current,
+      risk: { ...current.risk, maxDrawdownPct: 8, killSwitchThresholdPct: 15 },
+    };
+    await act(async () => {
+      await result.current.save.mutateAsync({
+        values: next,
+        version: result.current.settings.data!.version,
+      });
+    });
+    await waitFor(() => expect(result.current.settings.data?.values.risk.maxDrawdownPct).toBe(8));
+  });
+
+  it('useDeleteSettings returns 204 and triggers invalidation', async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const { result } = renderHook(
+      () => ({
+        del: useDeleteSettings(),
+      }),
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+    let response: unknown;
+    await act(async () => {
+      response = await result.current.del.mutateAsync();
+    });
+    // 204 No Content — undefined body
+    expect(response).toBeUndefined();
   });
 });

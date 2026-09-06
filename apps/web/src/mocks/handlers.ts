@@ -1,4 +1,5 @@
 import { http, HttpResponse } from 'msw';
+import { SettingsSchema } from '@algotrader/shared';
 import {
   barsByTicker,
   features,
@@ -10,6 +11,7 @@ import {
   portfolio,
   regime,
   signals,
+  settingsStore,
   tickers,
   trades,
 } from './data';
@@ -26,6 +28,62 @@ export const handlers = [
   http.get('/api/backtest/folds', () => HttpResponse.json(folds)),
   http.get('/api/tickers', () => HttpResponse.json(tickers)),
   http.get('/api/logs', () => HttpResponse.json(logs)),
+
+  // ─── Settings ──────────────────────────────────────────────────────
+  http.get('/api/settings', () =>
+    HttpResponse.json({
+      values: settingsStore.values,
+      version: settingsStore.version,
+      updatedAt: '2026-09-06T19:34:00+03:00',
+    }),
+  ),
+  http.put('/api/settings', async ({ request }) => {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return HttpResponse.json({ error: 'invalid json' }, { status: 400 });
+    }
+    const parsed = SettingsSchema.safeParse((body as { values?: unknown })?.values);
+    if (!parsed.success) {
+      return HttpResponse.json(
+        { error: 'validation', issues: parsed.error.issues },
+        { status: 400 },
+      );
+    }
+    const incomingBody = body as { values: typeof settingsStore.values; version?: string };
+    if (incomingBody.version && incomingBody.version !== settingsStore.version) {
+      return HttpResponse.json(
+        { error: 'version conflict', current: settingsStore.values },
+        { status: 409 },
+      );
+    }
+    // Persist. Preserve token if redacted.
+    const incoming = incomingBody.values;
+    if (incoming.broker.tokenRedacted || !incoming.broker.tokenLast4) {
+      settingsStore.values.broker = {
+        ...settingsStore.values.broker,
+        ...incoming.broker,
+        tokenLast4: settingsStore.values.broker.tokenLast4,
+      };
+    } else {
+      settingsStore.values.broker = incoming.broker;
+    }
+    settingsStore.values.risk = incoming.risk;
+    settingsStore.values.ml = incoming.ml;
+    settingsStore.values.data = incoming.data;
+    settingsStore.version = `v1-${new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace('T', ' ')
+      .replace(/[-:]/g, '-')}`;
+    return HttpResponse.json({
+      values: settingsStore.values,
+      version: settingsStore.version,
+      updatedAt: new Date().toISOString(),
+    });
+  }),
+  http.delete('/api/settings', () => new HttpResponse(null, { status: 204 })),
 
   http.get('/api/bars/:symbol', ({ params }) => {
     const symbol = String(params.symbol).toUpperCase();

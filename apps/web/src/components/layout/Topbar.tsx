@@ -18,6 +18,14 @@ export function Topbar() {
           Обновлено <span className="text-text mono ml-1.5">19:34 МСК</span>
         </span>
         <span className="shrink-0">Sandbox</span>
+        <a
+          href="/settings"
+          className="shrink-0 text-text-muted hover:text-text text-base"
+          title="Настройки"
+          aria-label="Open settings"
+        >
+          ⚙
+        </a>
       </div>
     </div>
   );

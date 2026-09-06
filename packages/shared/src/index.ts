@@ -161,3 +161,78 @@ export const PipelineStepSchema = z.object({
   detail: z.string().optional(),
 });
 export type PipelineStep = z.infer<typeof PipelineStepSchema>;
+
+// ─── Settings ────────────────────────────────────────────────────────
+export const BrokerEnvSchema = z.enum(['sandbox', 'live']);
+export type BrokerEnv = z.infer<typeof BrokerEnvSchema>;
+
+export const BrokerSettingsSchema = z.object({
+  environment: BrokerEnvSchema,
+  /** Last 4 chars of the token, displayed. Full token is held server-side only. */
+  tokenLast4: z.string(),
+  /** Set to true when client PUTs without changing the token — backend preserves existing. */
+  tokenRedacted: z.boolean(),
+  accountId: z.string(),
+});
+export type BrokerSettings = z.infer<typeof BrokerSettingsSchema>;
+
+export const RiskSettingsSchema = z
+  .object({
+    maxDrawdownPct: z.number().min(1).max(50),
+    maxPositionSizePct: z.number().min(1).max(100),
+    killSwitchEnabled: z.boolean(),
+    killSwitchThresholdPct: z.number().min(1).max(50),
+  })
+  .refine((r) => r.killSwitchThresholdPct >= r.maxDrawdownPct, {
+    message: 'killSwitchThresholdPct should be >= maxDrawdownPct',
+    path: ['killSwitchThresholdPct'],
+  });
+export type RiskSettings = z.infer<typeof RiskSettingsSchema>;
+
+export const RegimeFilterSchema = z.enum(['trend', 'range', 'vol', 'all']);
+export type RegimeFilter = z.infer<typeof RegimeFilterSchema>;
+
+export const MLSettingsSchema = z.object({
+  modelVersion: z.string(),
+  retrainIntervalDays: z.number().int().min(1).max(90),
+  confidenceThreshold: z.number().min(0).max(1),
+  regimeFilter: RegimeFilterSchema,
+});
+export type MLSettings = z.infer<typeof MLSettingsSchema>;
+
+export const DataSourceSchema = z.enum(['tinkoff', 'moex_iss', 'file']);
+export type DataSource = z.infer<typeof DataSourceSchema>;
+
+export const DataSettingsSchema = z.object({
+  source: DataSourceSchema,
+  cacheTtlMinutes: z.number().int().min(1).max(1440),
+  historyYears: z.number().int().min(1).max(10),
+  autoFetch: z.boolean(),
+});
+export type DataSettings = z.infer<typeof DataSettingsSchema>;
+
+export const SettingsSchema = z.object({
+  broker: BrokerSettingsSchema,
+  risk: RiskSettingsSchema,
+  ml: MLSettingsSchema,
+  data: DataSettingsSchema,
+});
+export type Settings = z.infer<typeof SettingsSchema>;
+
+export const DEFAULT_SETTINGS: Settings = {
+  broker: { environment: 'sandbox', tokenLast4: '', tokenRedacted: true, accountId: '' },
+  risk: {
+    maxDrawdownPct: 10,
+    maxPositionSizePct: 20,
+    killSwitchEnabled: false,
+    killSwitchThresholdPct: 15,
+  },
+  ml: { modelVersion: 'v2.3', retrainIntervalDays: 30, confidenceThreshold: 0.6, regimeFilter: 'all' },
+  data: { source: 'tinkoff', cacheTtlMinutes: 60, historyYears: 5, autoFetch: true },
+};
+
+/** Sentinel for the masked display: shows last 4 chars of a token, or '—' if empty. */
+export function maskToken(tokenLast4: string): string {
+  if (!tokenLast4) return '—';
+  return `••••••${tokenLast4}`;
+}

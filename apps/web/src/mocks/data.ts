@@ -152,3 +152,19 @@ export const logs = [
   { ts: '19:34:25', tone: 'flat' as const, text: 'broker.py · dry-run (sandbox) · 12 orders queued' },
   { ts: '19:34:25', tone: 'ok' as const, text: 'pipeline ok · next run 2026-09-07 19:30 МСК' },
 ] as const;
+
+// ─── Settings (mock) ──────────────────────────────────────────────
+export const settings = {
+  broker: { environment: 'sandbox' as const, tokenLast4: 'ABCD', tokenRedacted: true, accountId: 'ACC-DEMO-001' },
+  risk: { maxDrawdownPct: 10, maxPositionSizePct: 20, killSwitchEnabled: false, killSwitchThresholdPct: 15 },
+  ml: { modelVersion: 'v2.3', retrainIntervalDays: 30, confidenceThreshold: 0.6, regimeFilter: 'all' as const },
+  data: { source: 'tinkoff' as const, cacheTtlMinutes: 60, historyYears: 5, autoFetch: true },
+};
+
+// Module-level mutable state for the mocked settings store. Hidden behind an
+// object so the handlers can update fields without TS rejecting const export.
+export const settingsStore: { values: typeof settings; version: string } = {
+  values: settings,
+  version: 'v1-2026-09-06-001',
+};
+
