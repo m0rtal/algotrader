@@ -9,7 +9,9 @@ export class ApiError extends Error {
   }
 }
 
-const BASE_URL = '/api';
+// Default to MSW in dev (path /api intercepted by service worker).
+// Set VITE_API_BASE_URL to override (e.g. http://127.0.0.1:8000/api for real backend).
+const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '/api';
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const url = `${BASE_URL}${path}`;

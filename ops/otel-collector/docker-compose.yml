@@ -1,0 +1,62 @@
+version: "3.8"
+
+services:
+  # OpenTelemetry Collector — receives OTLP gRPC + HTTP from the API,
+  # exports to Loki (logs) and Tempo (traces).
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    container_name: algotrader-otel-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:13133/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Loki — log aggregation.
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: algotrader-loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+
+  # Tempo — trace storage + querying.
+  tempo:
+    image: grafana/tempo:2.6.0
+    container_name: algotrader-tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+    ports:
+      - "3200:3200"   # Tempo HTTP
+      - "4317"        # OTLP gRPC (also, collector and Tempo can share)
+    restart: unless-stopped
+
+  # Grafana — UI for Loki + Tempo + correlation drill-down.
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: algotrader-grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_USERS_DEFAULT_THEME=dark
+    volumes:
+      - ./grafana-provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - loki
+      - tempo
+    restart: unless-stopped
+
+volumes:
+  loki-data:
+  tempo-data:
+  grafana-data:

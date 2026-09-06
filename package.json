@@ -10,10 +10,13 @@
   "packageManager": "pnpm@9.15.0",
   "scripts": {
     "dev": "pnpm --filter @algotrader/web dev",
+    "dev:api": "cd apps/api && uv run uvicorn algotrader_api.main:app --host 127.0.0.1 --port 8000 --reload",
     "build": "pnpm -r build",
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
+    "test:api": "cd apps/api && uv run pytest --cov=algotrader_api --cov-report=term",
+    "test:all": "pnpm test && pnpm test:api",
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md,css}\"",
     "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md,css}\"",
     "prepare": "husky"

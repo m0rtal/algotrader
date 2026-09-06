@@ -1,0 +1,51 @@
+# OpenTelemetry Collector config — receives OTLP from algotrader-api,
+# exports to Loki (logs) and Tempo (traces).
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+  # Inject service.name as a Loki label for easier filtering
+  resource/labels:
+    attributes:
+      - key: service.name
+        action: insert
+        from_attribute: service.name
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+    default_labels_enabled:
+      exporter: "OTLP"
+    labels:
+      resource:
+        service.name: "service_name"
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch, resource/labels]
+      exporters: [otlp/tempo]
+    logs:
+      receivers: [otlp]
+      processors: [batch, resource/labels]
+      exporters: [loki]

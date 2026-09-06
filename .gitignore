@@ -12,3 +12,18 @@ openspec/.DS_Store
 .vscode/*
 !.vscode/settings.json
 *.tsbuildinfo
+
+# Backend
+/apps/api/.venv/
+/apps/api/.env
+/apps/api/__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+
+# Runtime data (bars, sqlite state)
+/data/bars/*
+!/data/bars/.gitkeep
+/data/state.db*
+!/data/.gitkeep

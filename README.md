@@ -5,33 +5,47 @@ Self-hosted algorithmic trading platform for MOEX (Moscow Exchange).
 ## Stack
 
 - **Frontend**: React 19 + Vite 8 + TypeScript 5.7 (Wouter, TanStack Query, Zustand, Tailwind 4, shadcn-style components, Lightweight Charts, MSW)
-- **Backend**: FastAPI + tinkoff-python (planned)
+- **Backend**: Python 3.11+ FastAPI + DuckDB + SQLite + OpenTelemetry (OTLP → Loki + Tempo via Grafana)
 - **Data**: parquet on disk + DuckDB
 - **ML**: XGBoost + hmmlearn (planned)
+- **Observability**: structlog → OTLP, correlation IDs, secret scrubbing, health sampling
 - **Spec**: OpenSpec (capability-driven, GIVEN/WHEN/THEN scenarios)
 
 ## Quick start
 
 ```bash
-# Requires Node 22 + pnpm 9
+# Frontend (requires Node 22 + pnpm 9)
 nvm use                 # or: nvm install 22
 pnpm install
 pnpm dev                # web at http://localhost:5173
+
+# Backend (requires Python 3.11+)
+cd apps/api
+uv sync --extra dev
+uv run uvicorn algotrader_api.main:app --host 127.0.0.1 --port 8000
+
+# Observability stack (optional, for traces/logs)
+cd ops/otel-collector
+docker compose up -d    # Grafana at http://localhost:3000
 ```
 
-MSW intercepts all `/api/*` calls in dev — no backend needed.
+MSW intercepts all `/api/*` calls in dev. Point the frontend at a real backend by setting `VITE_API_BASE_URL=http://127.0.0.1:8000/api` in `apps/web/.env.local`.
 
 ## Workspace layout
 
 ```
 apps/
   web/                 # React + Vite frontend
-  api/                 # FastAPI backend (placeholder)
+  api/                 # FastAPI + DuckDB + SQLite backend
+  api/src/algotrader_api/observability/  # tracing, logging, correlation, scrubbing
 packages/
   shared/              # cross-cutting TypeScript types + Zod schemas
 openspec/
   specs/               # canonical capability specs
   changes/             # active and archived changes
+ops/
+  otel-collector/      # docker-compose for OTel → Loki → Tempo → Grafana
+data/                  # runtime data (bars parquet + sqlite state, gitignored)
 ```
 
 ## Scripts
@@ -39,7 +53,8 @@ openspec/
 ```bash
 pnpm dev              # start web dev server
 pnpm build            # build all workspaces
-pnpm test             # run all tests
+pnpm test             # run all web tests
+pnpm test:api         # run all backend tests (uv run pytest)
 pnpm lint             # eslint
 pnpm typecheck        # tsc --noEmit
 pnpm format           # prettier
