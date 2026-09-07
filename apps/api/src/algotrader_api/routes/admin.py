@@ -29,17 +29,59 @@ def _is_disabled() -> bool:
     return bool(settings.fetch_disabled) or os.environ.get("ALGOTRADER_FETCH_DISABLED") == "1"
 
 
+@router.get("/fetch/status")
+async def fetch_status() -> dict:
+    """Quick health probe: is the broker token set in DB?
+
+    No Tinkoff call is made. Safe to poll. Used by the Settings page to decide
+    whether the 'Run fetch' button is enabled.
+    """
+    from ..db.secrets import get_broker_token as _get_token
+
+    db_path = _get_sqlite_path()
+    token = _get_token(db_path)
+
+    return {
+        "fetch_disabled": _is_disabled(),
+        "token_set": bool(token),
+        "token_last4": token[-4:] if token else None,
+    }
+
+
 @router.post("/fetch", status_code=202)
 async def trigger_fetch() -> dict:
-    """Manually trigger a fetch run. Returns run_id for tracking."""
+    """Manually trigger a fetch run. Returns run_id for tracking.
+
+    Reads the broker token from the application DB on every call — no cached
+    state, no restart needed after the user pastes a new token via
+    PUT /api/settings/token.
+    """
     if _is_disabled():
         raise HTTPException(
             status_code=503,
             detail={"error": "fetch_disabled", "message": "fetch is disabled by configuration"},
         )
 
-    # Generate run id by inserting a discover_universe phase row first
     db_path = _get_sqlite_path()
+    use_fake = os.environ.get("ALGOTRADER_INGEST_FAKE") == "1"
+    # Only require a broker token when actually going to hit the real Tinkoff
+    # API. Fake ingest (ALGOTRADER_INGEST_FAKE=1) doesn't need one — used in
+    # dev/test where the SDK isn't installed.
+    token_last4: str | None = None
+    if not use_fake:
+        from ..db.secrets import get_broker_token as _get_token
+
+        token = _get_token(db_path)
+        if not token:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "broker_token_missing",
+                    "message": "broker token not set — POST /api/settings/token first",
+                },
+            )
+        token_last4 = token[-4:]
+
     from ..ingestion import pipeline as pipeline_mod
 
     run_id = pipeline_mod.start_phase(db_path, "discover_universe")
@@ -48,7 +90,11 @@ async def trigger_fetch() -> dict:
     _running.add(task)
     task.add_done_callback(_running.discard)
 
-    return {"run_id": run_id, "started_at": _now_iso()}
+    return {
+        "run_id": run_id,
+        "started_at": _now_iso(),
+        "token_last4": token_last4,
+    }
 
 
 async def _run_phases(run_id: int, db_path: str) -> None:
@@ -64,8 +110,12 @@ async def _run_phases(run_id: int, db_path: str) -> None:
     )
 
     settings = get_settings()
+    # use_fake gate: ALGOTRADER_INGEST_FAKE=1 forces the in-memory client even
+    # when a real broker token is present. This is the path used in dev/test
+    # where the tinkoff-investments SDK isn't installed.
+    use_fake = os.environ.get("ALGOTRADER_INGEST_FAKE") == "1"
     try:
-        client = client_mod.make_client()
+        client = client_mod.make_client(sqlite_path=db_path, use_fake=use_fake)
     except RuntimeError as e:
         logger.error("admin.client.failed", error=str(e))
         pipeline_mod.end_phase(db_path, run_id, status="err", detail=str(e))

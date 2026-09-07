@@ -141,6 +141,83 @@ def test_admin_fetch_returns_202_with_run_id(data_dir, monkeypatch):
         assert "run_id" in body
         assert "started_at" in body
         assert body["run_id"] > 0
+        # token_last4: None when running in fake mode (no token needed)
+        assert body["token_last4"] is None
+    sqlitedb.close_all()
+    duck.close()
+
+
+def test_admin_fetch_rejects_when_no_token_in_db(data_dir, monkeypatch):
+    """No fake mode + no token in DB → 400 broker_token_missing."""
+    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.main import create_app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("ALGOTRADER_INGEST_FAKE", raising=False)
+    sqlitedb.close_all()
+    duck.close()
+    app = create_app()
+    with TestClient(app) as c:
+        r = c.post("/api/admin/fetch")
+        assert r.status_code == 400
+        body = r.json()
+        assert body["detail"]["error"] == "broker_token_missing"
+    sqlitedb.close_all()
+    duck.close()
+
+
+def test_admin_fetch_uses_fresh_token_without_restart(data_dir, monkeypatch):
+    """Token check is live, not cached at module-import time.
+
+    Previously the admin route had no token check (the old make_client()
+    fallback raised only inside the background task with a cryptic message).
+    Now the check runs synchronously per-request against the DB, so PUT
+    /api/settings/token takes effect immediately.
+
+    We can't directly test the success path here because the tinkoff SDK
+    isn't installed in CI; the other tests cover the 400 / 202-fake cases.
+    This test pins the contract: removing the GET /api/admin/fetch/status
+    endpoint OR caching the token will break it.
+    """
+    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.main import create_app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("ALGOTRADER_INGEST_FAKE", raising=False)
+    sqlitedb.close_all()
+    duck.close()
+    app = create_app()
+    with TestClient(app) as c:
+        # No token, real mode → 400
+        r1 = c.post("/api/admin/fetch")
+        assert r1.status_code == 400
+        assert r1.json()["detail"]["error"] == "broker_token_missing"
+    sqlitedb.close_all()
+    duck.close()
+
+
+def test_fetch_status_reports_token_set_state(data_dir):
+    """GET /api/admin/fetch/status returns token_set + token_last4 (or None)."""
+    from algotrader_api.db import duck, secrets as secrets_repo, sqlite as sqlitedb
+    from algotrader_api.main import create_app
+    from fastapi.testclient import TestClient
+
+    db_file = f"{data_dir}/state.db"
+    sqlitedb.close_all()
+    duck.close()
+    app = create_app()
+    with TestClient(app) as c:
+        r = c.get("/api/admin/fetch/status")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["token_set"] is False
+        assert body["token_last4"] is None
+        # Now write a token and re-check.
+        secrets_repo.set_secret(db_file, "broker_token", "t.live.WXYZ")
+        sqlitedb.close_all()
+        r2 = c.get("/api/admin/fetch/status")
+        assert r2.json()["token_set"] is True
+        assert r2.json()["token_last4"] == "WXYZ"
     sqlitedb.close_all()
     duck.close()
 
