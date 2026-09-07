@@ -32,11 +32,14 @@ PATTERNS = [
     ("pan_card", re.compile(r"\b(?:\d[ -]*?){13,16}\b")),  # rough CC heuristic, high false-positive rate
 ]
 
-# Names that, if assigned a non-empty value, look suspicious
+# Names that, if assigned a literal value, look suspicious.
+# The (?![\w.]+\s*\() lookahead skips function calls (e.g. get_broker_token(arg))
+# which would otherwise false-positive on the word 'token' in a function name.
 SUSPECT_NAMES = re.compile(
     r"""(?ix)
     \b(?:api[_-]?key|secret|token|password|passwd|access[_-]?key|private[_-]?key)
     \s*[:=]\s*
+    (?![\w.]+\s*\()
     ['"]?([A-Za-z0-9+/=_\-]{16,})['"]?
     """
 )
@@ -51,6 +54,8 @@ ALLOWLIST_FILES = {
     "uv.lock",
     ".gitignore",
     "README.md",
+    "scan-credentials.py",        # regex definitions + sample literals
+    "test_scan_credentials.py",  # test fixtures with sample credential strings
     "AGENTS.md",
 }
 

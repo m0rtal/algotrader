@@ -66,7 +66,7 @@ async def run_worker(mode: str) -> int:
 
     # Build client (real or fake based on env)
     try:
-        client = client_mod.make_client()
+        client = client_mod.make_client(sqlite_path=settings.sqlite_path)
     except RuntimeError as e:
         logger.error("worker.client.init_failed", error=str(e))
         return 2

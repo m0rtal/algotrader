@@ -111,23 +111,25 @@ def test_delete_settings_when_empty_is_noop(client):
     assert r.status_code == 204
 
 
-def test_put_token_writes_file_and_returns_last4(client, tmp_path, monkeypatch):
-    """PUT /api/settings/token writes to HOME/.hermes/secrets/tinkoff_token."""
-    secrets_dir = tmp_path / ".hermes" / "secrets"
-    secrets_dir.mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(tmp_path))
+def test_put_token_writes_db_and_returns_last4(client):
+    """PUT /api/settings/token stores in the secrets table, returns last-4."""
+    from algotrader_api.db.secrets import get_broker_token
+    from algotrader_api.db.sqlite import execute
+    from algotrader_api.routes.settings import _get_sqlite_path
     r = client.put("/api/settings/token", json={"token": "t.realvalue.9999"})
     assert r.status_code == 200
     body = r.json()
     assert body["tokenLast4"] == "9999"
     assert body["tokenRedacted"] is True
-    on_disk = secrets_dir / "tinkoff_token"
-    assert on_disk.exists()
-    assert on_disk.read_text().strip() == "t.realvalue.9999"
-    # mode 0600
-    import stat
-    mode = on_disk.stat().st_mode & 0o777
-    assert mode == 0o600
+    # Verify the value landed in the secrets table (not a file)
+    stored = get_broker_token(_get_sqlite_path())
+    assert stored == "t.realvalue.9999"
+    # And the structured settings table is untouched
+    rows = execute(_get_sqlite_path(), "SELECT value FROM settings WHERE key = 'main'", ())
+    if rows:
+        import json
+        settings = json.loads(rows[0]["value"])
+        assert "token" not in settings.get("broker", {})
 
 
 def test_put_token_rejects_empty(client):
@@ -135,16 +137,23 @@ def test_put_token_rejects_empty(client):
     assert r.status_code == 422  # Pydantic min_length=1
 
 
-def test_put_token_strips_whitespace(client, tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+def test_put_token_strips_whitespace(client):
     r = client.put("/api/settings/token", json={"token": "  t.realvalue.ABCD\n  "})
     assert r.status_code == 200
     assert r.json()["tokenLast4"] == "ABCD"
 
 
-def test_put_token_emits_span_and_log(client, tmp_path, monkeypatch):
+def test_put_token_overwrites_previous_value(client):
+    """PUT /api/settings/token replaces existing value."""
+    from algotrader_api.db.secrets import get_broker_token
+    from algotrader_api.routes.settings import _get_sqlite_path
+    client.put("/api/settings/token", json={"token": "t.first.AAAA"})
+    client.put("/api/settings/token", json={"token": "t.second.BBBB"})
+    assert get_broker_token(_get_sqlite_path()) == "t.second.BBBB"
+
+
+def test_put_token_emits_span_and_log(client):
     """Tracer span records token_last4; logger emits info event."""
-    monkeypatch.setenv("HOME", str(tmp_path))
     r = client.put("/api/settings/token", json={"token": "t.long.token.1234"})
     assert r.status_code == 200
     # Span attribute is internal — verified by absence of exception.

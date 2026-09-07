@@ -125,6 +125,15 @@ def test_suspect_assignment_detected(tmp_path):
     assert code == 1
 
 
+def test_function_call_with_token_in_name_not_flagged(tmp_path):
+    """get_broker_token(sqlite_path) is a call, not an assignment — no flag."""
+    code = run_on_file(
+        tmp_path,
+        'token = load_broker_token(sqlite_path="some_path_value_long_enough")\n',
+    )
+    assert code == 0
+
+
 def test_no_false_positive_on_test_fixture(tmp_path):
     # Short lowercase hex in non-secret context should not trigger.
     code = run_on_file(tmp_path, "x = 'abcdefghij'\n")  # length 11 < 16, won't match

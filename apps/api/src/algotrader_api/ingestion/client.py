@@ -2,43 +2,41 @@
 
 Defines a Protocol so we can swap a real client for a FakeTinkoffClient
 in tests. The factory picks based on the ALGOTRADER_INGEST_FAKE env var.
+
+The broker token lives in the application SQLite database (secrets table)
+— see db/secrets.py. Worker reads it via get_broker_token() on each run.
 """
 from __future__ import annotations
 
 import os
-import threading
-from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from ..db.secrets import get_broker_token
 from ..observability.logging import get_logger
 
 logger = get_logger("algotrader_api.ingestion.client")
 
-DEFAULT_TOKEN_PATH = "~/.hermes/secrets/tinkoff_token"
 
+def load_broker_token(sqlite_path: str | None = None) -> str | None:
+    """Read the broker token from the application database.
 
-def read_token_file(path: str = DEFAULT_TOKEN_PATH) -> str | None:
-    """Read the Tinkoff token from a file. Return None if unreadable.
-
-    The token file should be owner-readable only (mode 0600). This function
-    does NOT log the token value — only that the file was read.
+    Returns None if the token row is empty or unreadable. Never logs the
+    token value — only its presence and length.
     """
-    expanded = Path(path).expanduser()
-    if not expanded.exists():
-        logger.warning("tinkoff.token.missing", path=str(expanded))
-        return None
-    if not os.access(expanded, os.R_OK):
-        logger.warning("tinkoff.token.unreadable", path=str(expanded))
+    if sqlite_path is None:
+        sqlite_path = os.environ.get("ALGOTRADER_SQLITE_PATH", "")
+    if not sqlite_path:
+        logger.warning("tinkoff.token.sqlite_path_unset")
         return None
     try:
-        token = expanded.read_text(encoding="utf-8").strip()
-    except OSError as e:
-        logger.warning("tinkoff.token.read_error", path=str(expanded), error=str(e))
+        token = get_broker_token(sqlite_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("tinkoff.token.read_error", error=str(exc))
         return None
     if not token:
-        logger.warning("tinkoff.token.empty", path=str(expanded))
+        logger.warning("tinkoff.token.empty")
         return None
-    logger.info("tinkoff.token.loaded", path=str(expanded), length=len(token))
+    logger.info("tinkoff.token.loaded", length=len(token))
     return token
 
 
@@ -51,15 +49,10 @@ class TinkoffClient(Protocol):
     """
 
     async def get_accounts(self) -> list[dict]: ...
-
     async def get_shares(self) -> list[dict]: ...
-
     async def get_bonds(self) -> list[dict]: ...
-
     async def get_etfs(self) -> list[dict]: ...
-
     async def get_futures(self) -> list[dict]: ...
-
     async def get_options(self) -> list[dict]: ...
 
     async def get_candles(
@@ -77,7 +70,7 @@ class TinkoffClient(Protocol):
 def make_client(
     *,
     use_fake: bool | None = None,
-    token_path: str = DEFAULT_TOKEN_PATH,
+    sqlite_path: str | None = None,
 ) -> TinkoffClient:
     """Factory: pick real or fake Tinkoff client.
 
@@ -85,6 +78,8 @@ def make_client(
     - use_fake=True → InMemoryTinkoffClient (tests)
     - use_fake=False → RealTinkoffClient (production)
     - use_fake=None → ALGOTRADER_INGEST_FAKE=1 → fake, else real
+
+    RealTinkoffClient reads the token from `db.secrets` via load_broker_token().
     """
     if use_fake is None:
         use_fake = os.environ.get("ALGOTRADER_INGEST_FAKE") == "1"
@@ -93,11 +88,11 @@ def make_client(
         logger.info("tinkoff.client.fake")
         return InMemoryTinkoffClient()
     from .real_client import RealTinkoffClient
-    token = read_token_file(token_path)
+    token = load_broker_token(sqlite_path)
     if not token:
         raise RuntimeError(
-            f"Tinkoff token not found at {token_path}. "
-            "Set ALGOTRADER_INGEST_FAKE=1 for dev mode, or write token to file."
+            "Tinkoff broker token not set. Save it via Settings → Broker → "
+            "Токен, or set ALGOTRADER_INGEST_FAKE=1 for dev mode."
         )
-    logger.info("tinkoff.client.real", token_path=token_path)
+    logger.info("tinkoff.client.real")
     return RealTinkoffClient(token=token)

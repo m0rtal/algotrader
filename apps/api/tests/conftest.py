@@ -17,9 +17,6 @@ def data_dir(tmp_path, monkeypatch):
     bars_dir.mkdir()
     monkeypatch.setenv("ALGOTRADER_DATA_DIR", str(d))
     monkeypatch.setenv("ALGOTRADER_LOG_SAMPLE_HEALTH", "1.0")  # no sampling in tests
-    # Force synth seed in tests: redirect HOME to an empty dir so
-    # should_seed_synth() sees no token file and falls back to seed_bars.
-    monkeypatch.setenv("HOME", str(tmp_path))
     return str(d)
 
 

@@ -1,125 +1,125 @@
-"""Tests for the TinkoffClient Protocol + read_token_file + make_client factory."""
+"""Tests for the TinkoffClient Protocol + load_broker_token + make_client factory."""
 from __future__ import annotations
 
-import os
-from pathlib import Path
+import sqlite3
 from unittest.mock import patch
 
 import pytest
 
-from algotrader_api.ingestion.client import TinkoffClient, make_client, read_token_file
-from algotrader_api.ingestion.fake_client import InMemoryTinkoffClient
+from algotrader_api.db.secrets import set_secret
+from algotrader_api.ingestion.client import (
+    TinkoffClient,
+    load_broker_token,
+    make_client,
+)
 
 
-def test_read_token_file_returns_none_when_missing(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    # No token file exists
-    assert read_token_file("~/.hermes/secrets/nonexistent_token") is None
+def _seed_db(tmp_path, value: str = ""):
+    """Create a fresh SQLite state.db and return its path."""
+    import sqlite3
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(str(db))
+    con.execute("CREATE TABLE secrets (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+    if value:
+        con.execute("INSERT INTO secrets (key, value, updated_at) VALUES ('broker_token', ?, datetime('now'))", (value,))
+    con.commit()
+    con.close()
+    return str(db)
 
 
-def test_read_token_file_returns_none_when_unreadable(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    f = tmp_path / "locked_token"
-    f.write_text("t.fake")
-    os.chmod(f, 0o000)
-    # We can't actually make a file unreadable to root in many envs, so this
-    # test may be skipped. Skip if running as root.
-    if os.geteuid() == 0:
-        pytest.skip("running as root, chmod 0o000 ineffective")
-    assert read_token_file(str(f)) is None
+def test_load_broker_token_returns_none_when_db_missing(tmp_path):
+    assert load_broker_token(str(tmp_path / "nope.db")) is None
 
 
-def test_read_token_file_returns_content_when_valid(tmp_path):
-    f = tmp_path / "token"
-    f.write_text("t.fake_token_for_test\n")  # trailing newline should be stripped
-    assert read_token_file(str(f)) == "t.fake_token_for_test"
+def test_load_broker_token_returns_none_when_row_empty(tmp_path):
+    db = _seed_db(tmp_path, value="")
+    assert load_broker_token(db) is None
 
 
-def test_read_token_file_returns_none_for_empty_file(tmp_path):
-    f = tmp_path / "empty_token"
-    f.write_text("   \n")
-    assert read_token_file(str(f)) is None
+def test_load_broker_token_returns_value_when_set(tmp_path):
+    db = _seed_db(tmp_path, value="t.real.ABCD")
+    assert load_broker_token(db) == "t.real.ABCD"
 
 
-def test_read_token_file_returns_none_on_oserror(tmp_path, monkeypatch):
-    """If read_text raises OSError (e.g., disk error), return None."""
-    f = tmp_path / "broken_token"
-    f.write_text("t.fake")
-    # Patch the Path.read_text on this specific file to raise
-    from pathlib import Path as PathCls
-
-    def broken_read_text(self, *args, **kwargs):
-        raise OSError("disk error simulation")
-
-    monkeypatch.setattr(PathCls, "read_text", broken_read_text)
-    assert read_token_file(str(f)) is None
+def test_load_broker_token_uses_env_var_when_no_path(tmp_path, monkeypatch):
+    db = _seed_db(tmp_path, value="t.env.val.9999")
+    monkeypatch.setenv("ALGOTRADER_SQLITE_PATH", db)
+    assert load_broker_token() == "t.env.val.9999"
 
 
-def test_make_client_with_fake_env_returns_fake(monkeypatch):
-    monkeypatch.setenv("ALGOTRADER_INGEST_FAKE", "1")
-    client = make_client()
-    assert isinstance(client, InMemoryTinkoffClient)
+def test_load_broker_token_returns_none_when_sqlite_path_unset(monkeypatch):
+    monkeypatch.delenv("ALGOTRADER_SQLITE_PATH", raising=False)
+    assert load_broker_token() is None
 
 
-def test_make_client_with_token_file_returns_real(monkeypatch, tmp_path):
-    token_file = tmp_path / "token"
-    token_file.write_text("t.fake_test_token")
-    monkeypatch.setenv("ALGOTRADER_DATA_DIR", str(tmp_path))  # so config picks up
-    monkeypatch.setenv("ALGOTRADER_INGEST_FAKE", "")  # ensure not fake
-    # Use the explicit token_path arg so we don't depend on HOME expansion
-    # Move the token file to the expected location
-    monkeypatch.setenv("HOME", str(tmp_path))
-    (tmp_path / ".hermes" / "secrets").mkdir(parents=True)
-    (tmp_path / ".hermes" / "secrets" / "tinkoff_token").write_text("t.fake")
-
-    # Patch to prevent RealTinkoffClient from actually trying to instantiate SDK
-    with patch("algotrader_api.ingestion.real_client.RealTinkoffClient") as mock_cls:
-        mock_cls.return_value = "real-client-stub"
-        client = make_client()
-        # Real path was taken, but our mock stands in
-        assert mock_cls.called
-
-
-def test_read_token_file_returns_none_on_oserror(tmp_path, monkeypatch):
-    """OSError on read_text → None + log warning."""
-    from unittest.mock import patch
-    f = tmp_path / "tok"
-    f.write_text("data")
-    monkeypatch.setattr("pathlib.Path.read_text", lambda self, **kw: (_ for _ in ()).throw(OSError("disk error")))
-    assert read_token_file(str(f)) is None
-
-
-def test_read_token_file_returns_none_when_unreadable(tmp_path):
-    """File exists but os.access R_OK is False → None."""
-    f = tmp_path / "tok"
-    f.write_text("data")
-    f.chmod(0o000)
-    import stat
-    # On some systems root can still read; check that access returns False
-    import os
-    if not os.access(f, os.R_OK):
-        assert read_token_file(str(f)) is None
-    else:
-        # If running as root, skip — defensive branch unreachable in this env
-        import pytest
-        pytest.skip("running as root, cannot test unreadable file")
-
-
-def test_read_token_file_strips_whitespace(tmp_path):
-    f = tmp_path / "tok"
-    f.write_text("  t.realval.ABCD\n")
-    assert read_token_file(str(f)) == "t.realval.ABCD"
-
-
-def test_make_client_raises_when_token_missing_and_not_fake(tmp_path, monkeypatch):
-    """No token file + not fake → RuntimeError."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("ALGOTRADER_INGEST_FAKE", raising=False)
-    with pytest.raises(RuntimeError, match="Tinkoff token not found"):
-        make_client(use_fake=False)
+def test_load_broker_token_logs_no_token_value(tmp_path):
+    """Token never appears in logs — only length matters."""
+    db = _seed_db(tmp_path, value="t.real.ABCD")
+    with patch("algotrader_api.ingestion.client.logger") as mock_log:
+        token = load_broker_token(db)
+    assert token == "t.real.ABCD"
+    # Confirm no call passes the value
+    for call in mock_log.info.call_args_list:
+        assert "t.real.ABCD" not in str(call)
 
 
 def test_make_client_returns_fake_when_use_fake_true():
     from algotrader_api.ingestion.fake_client import InMemoryTinkoffClient
     c = make_client(use_fake=True)
     assert isinstance(c, InMemoryTinkoffClient)
+
+
+def test_make_client_raises_when_no_token_in_db(tmp_path):
+    """No token row + not fake → RuntimeError."""
+    db = _seed_db(tmp_path, value="")
+    with pytest.raises(RuntimeError, match="broker token not set"):
+        make_client(use_fake=False, sqlite_path=db)
+
+
+def test_make_client_returns_real_when_token_in_db(tmp_path):
+    """make_client(use_fake=False) builds a RealTinkoffClient when token present.
+
+    SDK isn't installed in CI — so the constructor raises immediately. We just
+    assert that the factory attempts the real path (it gets past token lookup
+    before failing on SDK import).
+    """
+    db = _seed_db(tmp_path, value="t.real.ABCD")
+    # Patch RealTinkoffClient where it's looked up (lazy import inside make_client)
+    with patch("algotrader_api.ingestion.real_client.RealTinkoffClient") as MockClient:
+        MockClient.return_value = "mocked-instance"
+        c = make_client(use_fake=False, sqlite_path=db)
+    assert c == "mocked-instance"
+    MockClient.assert_called_once_with(token="t.real.ABCD")
+
+
+def test_make_client_uses_env_var_for_fake_flag(monkeypatch):
+    monkeypatch.setenv("ALGOTRADER_INGEST_FAKE", "1")
+    from algotrader_api.ingestion.fake_client import InMemoryTinkoffClient
+    c = make_client()
+    assert isinstance(c, InMemoryTinkoffClient)
+
+
+def test_tinkoff_client_protocol_accepts_fake():
+    """Protocol runtime check — fake implements all required methods."""
+    from algotrader_api.ingestion.fake_client import InMemoryTinkoffClient
+    c = InMemoryTinkoffClient()
+    assert isinstance(c, TinkoffClient)
+
+
+def test_set_secret_then_load_via_factory(tmp_path):
+    """End-to-end: write token via db.secrets → factory attempts real client."""
+    db = _seed_db(tmp_path, value="")
+    set_secret(db, "broker_token", "t.written.1234")
+    with patch("algotrader_api.ingestion.real_client.RealTinkoffClient") as MockClient:
+        MockClient.return_value = "mocked"
+        c = make_client(use_fake=False, sqlite_path=db)
+    assert c == "mocked"
+    MockClient.assert_called_once_with(token="t.written.1234")
+
+
+def test_load_broker_token_handles_db_error(tmp_path, monkeypatch):
+    """DB raises → load_broker_token returns None + logs warning."""
+    db = tmp_path / "broken.db"
+    db.write_text("not a sqlite db")
+    with patch("algotrader_api.ingestion.client.get_broker_token", side_effect=sqlite3.DatabaseError("corrupt")):
+        assert load_broker_token(str(db)) is None
