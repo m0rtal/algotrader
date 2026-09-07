@@ -78,3 +78,48 @@ def test_make_client_with_token_file_returns_real(monkeypatch, tmp_path):
         client = make_client()
         # Real path was taken, but our mock stands in
         assert mock_cls.called
+
+
+def test_read_token_file_returns_none_on_oserror(tmp_path, monkeypatch):
+    """OSError on read_text → None + log warning."""
+    from unittest.mock import patch
+    f = tmp_path / "tok"
+    f.write_text("data")
+    monkeypatch.setattr("pathlib.Path.read_text", lambda self, **kw: (_ for _ in ()).throw(OSError("disk error")))
+    assert read_token_file(str(f)) is None
+
+
+def test_read_token_file_returns_none_when_unreadable(tmp_path):
+    """File exists but os.access R_OK is False → None."""
+    f = tmp_path / "tok"
+    f.write_text("data")
+    f.chmod(0o000)
+    import stat
+    # On some systems root can still read; check that access returns False
+    import os
+    if not os.access(f, os.R_OK):
+        assert read_token_file(str(f)) is None
+    else:
+        # If running as root, skip — defensive branch unreachable in this env
+        import pytest
+        pytest.skip("running as root, cannot test unreadable file")
+
+
+def test_read_token_file_strips_whitespace(tmp_path):
+    f = tmp_path / "tok"
+    f.write_text("  t.realval.ABCD\n")
+    assert read_token_file(str(f)) == "t.realval.ABCD"
+
+
+def test_make_client_raises_when_token_missing_and_not_fake(tmp_path, monkeypatch):
+    """No token file + not fake → RuntimeError."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ALGOTRADER_INGEST_FAKE", raising=False)
+    with pytest.raises(RuntimeError, match="Tinkoff token not found"):
+        make_client(use_fake=False)
+
+
+def test_make_client_returns_fake_when_use_fake_true():
+    from algotrader_api.ingestion.fake_client import InMemoryTinkoffClient
+    c = make_client(use_fake=True)
+    assert isinstance(c, InMemoryTinkoffClient)

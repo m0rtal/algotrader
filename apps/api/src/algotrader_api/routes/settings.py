@@ -1,11 +1,14 @@
-"""Settings routes: GET/PUT/DELETE /api/settings."""
+"""Settings routes: GET/PUT/DELETE /api/settings + PUT /api/settings/token."""
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field
 
 from ..db.sqlite import execute
 from ..observability.correlation import correlation_id
@@ -21,6 +24,15 @@ from ..schemas.api import (
 router = APIRouter(prefix="/api", tags=["settings"])
 logger = get_logger("algotrader_api.settings")
 tracer = get_tracer("algotrader_api")
+
+
+def _token_file() -> Path:
+    """Where the broker token lives on disk.
+
+    Resolved per request so tests that monkeypatch HOME see the override.
+    Written by PUT /api/settings/token, read by the ingestion worker. Mode 0600.
+    """
+    return Path.home() / ".hermes" / "secrets" / "tinkoff_token"
 
 
 def _now_iso() -> str:
@@ -104,6 +116,55 @@ def delete_settings() -> None:
         execute(_get_sqlite_path(), "DELETE FROM settings WHERE key = 'main'", ())
         span.set_attribute("settings.section", "all")
         logger.info("settings.reset", correlation_id=correlation_id())
+
+
+class TokenPutRequest(BaseModel):
+    token: str = Field(..., min_length=1)
+
+
+class TokenResponse(BaseModel):
+    tokenLast4: str
+    tokenRedacted: bool = True
+
+
+@router.put("/settings/token", response_model=TokenResponse)
+def put_settings_token(body: TokenPutRequest) -> TokenResponse:
+    """Write the broker token to ~/.hermes/secrets/tinkoff_token (mode 0600).
+
+    The token never lives in the settings table — it stays in a separate
+    secret file the worker reads on each invocation. Frontend calls this
+    before PUT /api/settings so the next worker run uses the new token.
+    """
+    with tracer.start_as_current_span("settings.token.put") as span:
+        token = body.token.strip()
+        if not token:
+            raise HTTPException(status_code=400, detail={"error": "empty_token"})
+        token_file = _token_file()
+        # Lazy atomic write: tmp file in same dir → rename → chmod.
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = token_file.with_suffix(".tmp")
+        try:
+            tmp.write_text(token + "\n", encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, token_file)
+            os.chmod(token_file, 0o600)
+        except OSError as exc:
+            logger.error(
+                "settings.token.write_failed",
+                error=str(exc),
+                correlation_id=correlation_id(),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "token_write_failed", "message": str(exc)},
+            ) from exc
+        span.set_attribute("settings.token_last4", token[-4:])
+        logger.info(
+            "settings.token.put",
+            token_last4=token[-4:],
+            correlation_id=correlation_id(),
+        )
+        return TokenResponse(tokenLast4=token[-4:], tokenRedacted=True)
 
 
 # SQLite path injected via app state — set in main.py lifespan

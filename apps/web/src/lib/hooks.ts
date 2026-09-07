@@ -144,3 +144,17 @@ export function useDeleteSettings() {
     },
   });
 }
+
+export function useSaveToken() {
+  const qc = useQueryClient();
+  return useMutation<{ tokenLast4: string; tokenRedacted: boolean }, Error, { token: string }>({
+    mutationFn: (body) =>
+      api<{ tokenLast4: string; tokenRedacted: boolean }>('/settings/token', {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+}

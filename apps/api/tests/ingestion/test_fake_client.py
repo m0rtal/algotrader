@@ -101,3 +101,22 @@ async def test_thread_safe_preload():
     assert result[0]["ticker"] == "X"
     loaded.append(result)
     assert len(loaded) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_accounts_returns_storage_snapshot():
+    """get_accounts returns the configured account list and records the call."""
+    client = InMemoryTinkoffClient()
+    result = await client.get_accounts()
+    # Storage has no set_accounts API, so list is always empty on default client.
+    assert result == []
+    # But the call is recorded.
+    assert client.call_count("get_accounts") == 1
+
+
+@pytest.mark.asyncio
+async def test_get_accounts_empty_returns_empty_list():
+    """get_accounts on empty client returns []."""
+    client = InMemoryTinkoffClient()
+    result = await client.get_accounts()
+    assert result == []
