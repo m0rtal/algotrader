@@ -7,6 +7,7 @@ import {
   kpis,
   logs,
   model,
+  persist as persistSettings,
   pipeline,
   portfolio,
   regime,
@@ -30,13 +31,19 @@ export const handlers = [
   http.get('/api/logs', () => HttpResponse.json(logs)),
 
   // ─── Settings ──────────────────────────────────────────────────────
-  http.get('/api/settings', () =>
-    HttpResponse.json({
-      values: settingsStore.values,
+  http.get('/api/settings', () => {
+    // Return a fresh wrapper on every call so TanStack Query detects a
+    // new object reference after the broker token is updated. Returning
+    // the same mutable object would leave stale tokenLast4 in the cache.
+    return HttpResponse.json({
+      values: {
+        ...settingsStore.values,
+        broker: { ...settingsStore.values.broker },
+      },
       version: settingsStore.version,
-      updatedAt: '2026-09-06T19:34:00+03:00',
-    }),
-  ),
+      updatedAt: new Date().toISOString(),
+    });
+  }),
   http.put('/api/settings', async ({ request }) => {
     let body: unknown;
     try {
@@ -77,6 +84,7 @@ export const handlers = [
       .slice(0, 19)
       .replace('T', ' ')
       .replace(/[-:]/g, '-')}`;
+    persistSettings(settingsStore.values);
     return HttpResponse.json({
       values: settingsStore.values,
       version: settingsStore.version,
@@ -84,6 +92,45 @@ export const handlers = [
     });
   }),
   http.delete('/api/settings', () => new HttpResponse(null, { status: 204 })),
+
+  // ─── Broker token ──────────────────────────────────────────────────
+  // MSW dev fallback: in production the frontend reads VITE_API_BASE_URL
+  // and proxies to the real FastAPI backend. The dev path (no env) needs
+  // a working mock or the "Save token" button fails with 404.
+  http.put('/api/settings/token', async ({ request }) => {
+    let body: { token?: unknown };
+    try {
+      body = (await request.json()) as { token?: unknown };
+    } catch {
+      return HttpResponse.json({ error: 'invalid json' }, { status: 400 });
+    }
+    const token = typeof body.token === 'string' ? body.token.trim() : '';
+    if (!token) {
+      return HttpResponse.json({ error: 'token is required' }, { status: 400 });
+    }
+    // Mutate in-place AND return a new wrapper so TanStack Query sees a
+    // different object reference and re-renders. Without this the cached
+    // settings query may keep returning the previous tokenLast4 even
+    // after invalidation (TanStack uses Object.is by default).
+    settingsStore.values.broker = {
+      ...settingsStore.values.broker,
+      tokenLast4: token.slice(-4),
+      tokenRedacted: true,
+    };
+    // MSW worker is a service worker — its module-level state is lost on
+    // hard reload. Persist to localStorage so dev-mode state survives a
+    // page refresh; production hits the real backend instead.
+    persistSettings(settingsStore.values);
+    settingsStore.version = `v1-${new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace('T', ' ')
+      .replace(/[-:]/g, '-')}`;
+    return HttpResponse.json({
+      tokenLast4: token.slice(-4),
+      tokenRedacted: true,
+    });
+  }),
 
   http.get('/api/bars/:symbol', ({ params }) => {
     const symbol = String(params.symbol).toUpperCase();
