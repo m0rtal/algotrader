@@ -17,6 +17,25 @@ import {
   trades,
 } from './data';
 
+// Backfill state is held in localStorage so the UI sees a single
+// source-of-truth across navigation (start → status → stop).
+const BACKFILL_KEY = 'algotrader.mock_backfill_state';
+const readBackfillState = (): Record<string, unknown> => {
+  try {
+    const raw = localStorage.getItem(BACKFILL_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+};
+const writeBackfillState = (state: Record<string, unknown>) => {
+  try {
+    localStorage.setItem(BACKFILL_KEY, JSON.stringify(state));
+  } catch {
+    /* ignore quota / disabled storage */
+  }
+};
+
 export const handlers = [
   http.get('/api/kpis', () => HttpResponse.json(kpis)),
   http.get('/api/signals', () => HttpResponse.json(signals)),
@@ -161,4 +180,50 @@ export const handlers = [
       bars,
     });
   }),
+
+  // Backfill controls — match real backend routes (`/api/admin/backfill/*`)
+  // so dev-mode UI doesn't 404.
+  http.post('/api/admin/backfill/start', async ({ request }) => {
+    const body = (await request.json().catch(() => ({}))) as {
+      history_years?: number;
+    };
+    writeBackfillState({
+      state: 'backfilling',
+      run_id: Math.floor(Math.random() * 100000),
+      tickers_total: tickers.length,
+      tickers_done: 0,
+      total_bars: 0,
+      last_run: null,
+      started_at: new Date().toISOString(),
+      history_years: body.history_years ?? 1,
+    });
+    return HttpResponse.json({ run_id: Math.floor(Math.random() * 100000), state: 'started' }, { status: 202 });
+  }),
+
+  http.post('/api/admin/backfill/stop', () => {
+    writeBackfillState({ ...readBackfillState(), state: 'idle' });
+    return HttpResponse.json({ state: 'stopping' });
+  }),
+
+  http.get('/api/admin/backfill/status', () => {
+    const stored = readBackfillState();
+    return HttpResponse.json({
+      state: 'idle',
+      run_id: null,
+      tickers_done: 0,
+      tickers_total: 0,
+      total_bars: 0,
+      ...stored,
+    });
+  }),
+
+  http.get('/api/admin/backfill/events', () =>
+    // MSW doesn't easily stream SSE; return an empty event stream that
+    // closes immediately. The UI's useQuery status polling is the
+    // primary progress channel.
+    new HttpResponse(
+      'event: done\ndata: {}\n\n',
+      { headers: { 'content-type': 'text/event-stream' } },
+    ),
+  ),
 ];

@@ -13,6 +13,7 @@ be paired with a test that exercises a real faked instrument/candle.
 """
 from __future__ import annotations
 
+import datetime
 from datetime import date
 from typing import Any
 
@@ -80,11 +81,17 @@ def _future_to_dict(f: Any) -> dict:
 
 
 def _option_to_dict(o: Any) -> dict:
+    # t-tech SDK Option has `uid` + `position_uid`, not `figi`.
+    # Map to the same downstream shape so the rest of the pipeline
+    # (instruments table, universe filtering) stays unchanged.
+    figi = getattr(o, "figi", None) or getattr(o, "uid", None) or getattr(o, "position_uid", None)
+    ticker = getattr(o, "ticker", None) or figi
+    name = getattr(o, "name", None) or ticker
     return {
-        "ticker": o.ticker,
-        "figi": o.figi,
+        "ticker": ticker,
+        "figi": figi,
         "class": "option",
-        "name": o.name,
+        "name": name,
         "currency": "RUB",
         "lot_size": 1,
         "isin": None,
@@ -102,17 +109,94 @@ def _acct_to_dict(a: Any) -> dict:
 
 
 def _candle_to_dict(c: Any) -> dict:
-    o = c.open
-    h = c.high
-    l = c.low
-    cl = c.close
+    """Convert one gRPC candle (or pre-converted dict) to a parquet row.
+
+    The new SDK's services (`MarketDataService.get_candles()` and friends)
+    return already-decoded dataclass objects — but `candle.time` is no
+    longer a nested google.type.Date; it's a top-level field. We accept
+    either shape (raw gRPC or pre-decoded dataclass / dict) so the
+    helper is robust against future SDK refactors.
+
+    Drops candles whose date is today or later — those are the
+    in-progress live bar that Tinkoff occasionally returns even with
+    is_complete=True. The on-disk `last_bar_ts` should always be
+    strictly < today.
+    """
+    # Time field: dict-style or gRPC-style.
+    # Fast path: t-tech SDK hands back {"ts": "YYYY-MM-DD", ...} directly.
+    if isinstance(c, dict) and c.get("ts"):
+        try:
+            a_date = date.fromisoformat(c["ts"][:10])
+        except (TypeError, ValueError):
+            a_date = None
+        if a_date and a_date < date.today():
+            def _maybe_num(x: Any) -> float:
+                if isinstance(x, (int, float)):
+                    return float(x)
+                if isinstance(x, dict):
+                    return float(x.get("units", 0)) + float(x.get("nano", 0)) / 1e9
+                return float(x) if x is not None else 0.0
+
+            return {
+                "ts": a_date.isoformat(),
+                "open": _maybe_num(c.get("open")),
+                "high": _maybe_num(c.get("high")),
+                "low": _maybe_num(c.get("low")),
+                "close": _maybe_num(c.get("close")),
+                "volume": int(c.get("volume") or 0),
+            }
+        # Today or future — drop.
+        return None  # type: ignore[return-value]
+
+    yr = mo = dy = None
+    if isinstance(c, dict):
+        t = c.get("time") or c.get("time_") or {}
+        if isinstance(t, dict):
+            yr, mo, dy = t.get("year", 1970), t.get("month", 1), t.get("day", 1)
+        else:
+            yr = getattr(t, "year", 1970)
+            mo = getattr(t, "month", 1)
+            dy = getattr(t, "day", 1)
+        o = c.get("open", c.get("o", 0)) or 0
+        h = c.get("high", c.get("h", 0)) or 0
+        l = c.get("low", c.get("l", 0)) or 0
+        cl = c.get("close", c.get("c", 0)) or 0
+        volume = c.get("volume", c.get("v", 0)) or 0
+    else:
+        t = c.time
+        o = c.open
+        h = c.high
+        l = c.low
+        cl = c.close
+        volume = getattr(c, "volume", 0)
+        yr = getattr(t, "year", 1970)
+        mo = getattr(t, "month", 1)
+        dy = getattr(t, "day", 1)
+
+    try:
+        a_date = date(yr, mo, dy)
+    except (TypeError, ValueError):
+        return None  # type: ignore[return-value]
+    if a_date >= date.today():
+        return None  # type: ignore[return-value]
+
+    def _q(quotation: Any) -> float:
+        if quotation is None:
+            return 0.0
+        # gRPC MoneyValue/Quotation object or dict
+        if isinstance(quotation, dict):
+            return float(quotation.get("units", 0)) + float(quotation.get("nano", 0)) / 1e9
+        units = getattr(quotation, "units", 0)
+        nano = getattr(quotation, "nano", 0)
+        return float(units) + float(nano) / 1e9
+
     return {
-        "ts": _to_iso_date(c.time),
-        "open": _quotation(o.units, o.nano) if o else 0.0,
-        "high": _quotation(h.units, h.nano) if h else 0.0,
-        "low": _quotation(l.units, l.nano) if l else 0.0,
-        "close": _quotation(cl.units, cl.nano) if cl else 0.0,
-        "volume": getattr(c, "volume", 0),
+        "ts": a_date.isoformat(),
+        "open": _q(o),
+        "high": _q(h),
+        "low": _q(l),
+        "close": _q(cl),
+        "volume": volume,
     }
 
 
@@ -123,13 +207,13 @@ def _to_iso_date(d: Any) -> str:
     return str(d)
 
 
-def _to_iso(d: date | str) -> str:
-    """Convert date or ISO string to YYYY-MM-DD.
+def _to_datetime(d: datetime.date | str) -> datetime.datetime:
+    """Convert a date or ISO date string to a timezone-naive datetime.
 
-    Public for `real_client.py`: it calls this when building
-    `GetCandlesRequest(from_=..., to=...)` so the wrapper can accept either
-    a `datetime.date` or an already-formatted ISO string from upstream code.
+    The t-tech-investments SDK's `get_candles(from_=..., to=...)` accepts
+    datetime objects (not ISO strings) for these fields; passing a string
+    makes it call `.timestamp()` on the str and explode.
     """
     if isinstance(d, str):
-        return d
-    return d.isoformat()
+        return datetime.datetime.fromisoformat(d)
+    return datetime.datetime(d.year, d.month, d.day)

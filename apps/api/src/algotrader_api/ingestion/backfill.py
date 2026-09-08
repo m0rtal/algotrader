@@ -310,11 +310,37 @@ class BackfillRunner:
         # is_complete is True. The on-disk `last_bar_ts` should always
         # be strictly < today.
         today_ = date.today()
-        closed = [
-            c for c in closed
-            if getattr(c.time, "year", None) is not None
-            and date(c.time.year, c.time.month, c.time.day) < today_
-        ]
+
+        def _candle_date(c: Any) -> date | None:
+            """Extract the candle's date regardless of SDK shape.
+
+            Handles three shapes:
+              1. t-tech SDK flat dict: {"ts": "YYYY-MM-DD", ...}
+              2. Legacy gRPC-shaped dict: {"time": {"year":..., "month":..., "day":...}, ...}
+              3. Native gRPC object: c.time.{year, month, day}
+            """
+            if isinstance(c, dict):
+                if c.get("ts"):
+                    try:
+                        return date.fromisoformat(c["ts"][:10])
+                    except (TypeError, ValueError):
+                        return None
+                t = c.get("time") or c.get("time_") or {}
+                if isinstance(t, dict):
+                    y, m, d = t.get("year"), t.get("month"), t.get("day")
+                else:
+                    y, m, d = getattr(t, "year", None), getattr(t, "month", None), getattr(t, "day", None)
+            else:
+                t = getattr(c, "time", None)
+                y, m, d = getattr(t, "year", None), getattr(t, "month", None), getattr(t, "day", None)
+            if not (y and m and d):
+                return None
+            try:
+                return date(y, m, d)
+            except (TypeError, ValueError):
+                return None
+
+        closed = [c for c in closed if (dt := _candle_date(c)) and dt < today_]
 
         written = self._write_bars(figi=figi, candles=closed)
         if written > 0:
@@ -377,7 +403,8 @@ class BackfillRunner:
 
     def _upsert_instrument(self, row: dict) -> None:
         figi = row.get("figi")
-        if not figi:
+        ticker = row.get("ticker")
+        if not figi or not ticker:
             return
         # Schema requires NOT NULL on `name` and a few other fields. Tests
         # use minimal fakes; production rows from Tinkoff always have
@@ -386,19 +413,20 @@ class BackfillRunner:
         name = row.get("name") or ""
         currency = row.get("currency") or ""
         lot_size = row.get("lot_size") or 0
+        # INSERT OR REPLACE handles conflicts on the `ticker` PRIMARY KEY
+        # (the canonical row identity). The `figi` UNIQUE constraint is
+        # updated via the figi column too. We don't use INSERT ... ON
+        # CONFLICT(figi) because in production there are rare cases
+        # where the same figi appears under multiple class rows, and we
+        # prefer to keep the ticker as the canonical primary key.
         con = sqlite3.connect(self.db_path)
         try:
             con.execute(
-                "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(figi) DO UPDATE SET "
-                "ticker = excluded.ticker, "
-                "class = excluded.class, "
-                "name = excluded.name, "
-                "currency = excluded.currency, "
-                "lot_size = excluded.lot_size",
+                "INSERT OR REPLACE INTO instruments "
+                "(ticker, figi, class, name, currency, lot_size) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    row.get("ticker"),
+                    ticker,
                     figi,
                     row.get("class"),
                     name,
@@ -471,26 +499,27 @@ class BackfillRunner:
     def _extract_last_bar_ts(self, candles: list) -> str | None:
         """ISO date string of the most recent candle, or None if empty.
 
-        Defensive against candle-like objects missing the `time` field —
-        we wrap the `hasattr` in try/except so a single malformed object
-        can't blow up the runner.
+        Defensive against candle-like objects missing the `time` field
+        and against the SDK returning dicts instead of gRPC objects.
         """
         if not candles:
             return None
-        # Filter to candles that have a usable `time` attribute.
-        def _has_time(c: Any) -> bool:
+        dates: list[date] = []
+        for c in candles:
             try:
-                _ = c.time.year
-                return True
-            except AttributeError:
-                return False
-        latest = max(
-            (c.time for c in candles if _has_time(c)),
-            key=lambda t: (t.year, t.month, t.day),
-            default=None,
-        )
-        if latest is None:
+                t = c.time if not isinstance(c, dict) else c.get("time")
+                if isinstance(t, dict):
+                    y, m, d = t.get("year"), t.get("month"), t.get("day")
+                else:
+                    y, m, d = t.year, t.month, t.day
+                if not (y and m and d):
+                    continue
+                dates.append(date(y, m, d))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        if not dates:
             return None
+        latest = max(dates)
         return f"{latest.year:04d}-{latest.month:02d}-{latest.day:02d}"
 
     # ─── event/log ───────────────────────────────────────────────────

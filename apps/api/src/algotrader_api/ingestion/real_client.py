@@ -9,13 +9,22 @@ Wrapper responsibilities are kept narrow on purpose:
   underscores — pip's standard normalisation).
 - Map our Protocol's `target="sandbox"|"production"` string to the SDK's
   gRPC host constants `INVEST_GRPC_API_SANDBOX` / `INVEST_GRPC_API`.
-- Lazy-construct `AsyncClient` on the first async call (token is sensitive,
-  no need to open a channel at import time).
+- Lazy-open the gRPC channel via `await AsyncClient.__aenter__()`; the
+  return value is an `AsyncServices` object which exposes `.users`,
+  `.instruments`, `.market_data` etc. — that's the object we route
+  every RPC through.
 - Hand every RPC call through with explicit request objects (the new SDK
   uses `GetAccountsRequest()` etc., not kwargs).
 - Convert each gRPC response to plain dicts via `real_client_convert.py`
   so downstream `universe.upsert_instruments` and `bars.run_bars_phase`
   don't depend on the SDK type hierarchy.
+
+Why the __aenter__ dance: `AsyncClient(token, target=...)` only stores
+config; it doesn't open the gRPC channel until you call `__aenter__()`
+on it, and the return value is `AsyncServices`, not the client itself.
+Trying to call `client.instruments.shares(...)` directly raises
+`AttributeError` because the bare AsyncClient has no service attributes
+— they're added during `__aenter__` by `services.Services(...)`.
 """
 from __future__ import annotations
 
@@ -32,14 +41,14 @@ from .real_client_convert import (
     _future_to_dict,
     _option_to_dict,
     _share_to_dict,
-    _to_iso,
+    _to_datetime,
 )
 
 logger = get_logger("algotrader_api.ingestion.real_client")
 
 
 class RealTinkoffClient:
-    """Wraps t_tech.invest.AsyncClient with our Protocol interface."""
+    """Wraps t_tech.invest.AsyncClient + AsyncServices with our Protocol interface."""
 
     def __init__(self, *, token: str, target: str = "sandbox") -> None:
         try:
@@ -56,18 +65,30 @@ class RealTinkoffClient:
             raise ValueError(f"unknown target: {target} (use 'sandbox' or 'production')")
         self._target = target_constant
         self._token = token
-        self._client: Any = None  # AsyncClient, opened lazily on first async call
+        # AsyncClient is the entrypoint; constructor just stores config.
+        # `__aenter__()` returns AsyncServices which has `.users`,
+        # `.instruments`, `.market_data`. We cache it for the lifetime
+        # of the wrapper; aclose() closes the channel.
+        self._client: Any = None
+        self._services: Any = None
 
     async def _ensure(self) -> Any:
-        if self._client is None:
+        """Open the AsyncClient and cache the resulting AsyncServices."""
+        if self._services is None:
             AsyncClient = getattr(self._sdk, "AsyncClient")
             self._client = AsyncClient(self._token, target=self._target)
-        return self._client
+            self._services = await self._client.__aenter__()
+        return self._services
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.__aexit__(None, None, None)
+            self._client = None
+            self._services = None
 
     async def get_accounts(self) -> list[dict]:
-        client = await self._ensure()
-        request_cls = getattr(self._sdk, "GetAccountsRequest")
-        response = await client.users.get_accounts(request_cls())
+        services = await self._ensure()
+        response = await services.users.get_accounts()
         return [_acct_to_dict(a) for a in response.accounts]
 
     async def _instruments(
@@ -78,22 +99,19 @@ class RealTinkoffClient:
     ) -> list[dict]:
         """Shared body for get_shares/bonds/etfs/futures/options.
 
-        The new SDK exposes a single `instruments.<method>` per asset class
-        and discriminates with `InstrumentType.{SHARES,BONDS,...}` on the
-        `InstrumentsRequest`. Each wrapper sets the right
-        `instrument_type` enum and runs the gRPC call.
+        Each method on the new SDK's `InstrumentsService` (e.g. `shares()`)
+        returns only that asset class — there's no `instrument_type`
+        discriminator on `InstrumentsRequest`. So we just pass
+        `instrument_status=INSTRUMENT_STATUS_BASE` and let the SDK
+        return the right slice. The `instrument_type_attr` argument is
+        kept for interface symmetry / future-proofing but ignored.
         """
-        client = await self._ensure()
-        request_cls = getattr(self._sdk, "InstrumentsRequest")
+        services = await self._ensure()
         instrument_status = getattr(
             self._sdk.InstrumentStatus, "INSTRUMENT_STATUS_BASE"
         )
-        instrument_type = getattr(self._sdk.InstrumentType, instrument_type_attr)
-        response = await getattr(client.instruments, method_name)(
-            request_cls(
-                instrument_status=instrument_status,
-                instrument_type=instrument_type,
-            )
+        response = await getattr(services.instruments, method_name)(
+            instrument_status=instrument_status,
         )
         return [converter(i) for i in response.instruments]
 
@@ -114,7 +132,7 @@ class RealTinkoffClient:
 
     async def get_futures(self) -> list[dict]:
         return await self._instruments(
-            "futures", "INSTRUMENT_TYPE_FUTURE", _future_to_dict
+            "futures", "INSTRUMENT_TYPE_FUTURES", _future_to_dict
         )
 
     async def get_options(self) -> list[dict]:
@@ -130,22 +148,16 @@ class RealTinkoffClient:
         date_to: str | date,
         interval: str = "CANDLE_INTERVAL_DAY",
     ) -> list[dict]:
-        client = await self._ensure()
-        request_cls = getattr(self._sdk, "GetCandlesRequest")
+        services = await self._ensure()
         CandleInterval = getattr(self._sdk, "CandleInterval")
         interval_enum = getattr(CandleInterval, interval, CandleInterval.CANDLE_INTERVAL_DAY)
 
-        response = await client.market_data.get_candles(
-            request_cls(
-                instrument_id=figi,
-                from_=_to_iso(date_from),
-                to=_to_iso(date_to),
-                interval=interval_enum,
-            )
+        # SDK expects datetime objects for from_/to, not ISO strings.
+        # Our Protocol accepts both for ergonomics.
+        response = await services.market_data.get_candles(
+            instrument_id=figi,
+            from_=_to_datetime(date_from),
+            to=_to_datetime(date_to),
+            interval=interval_enum,
         )
         return [_candle_to_dict(c) for c in response.candles]
-
-    async def aclose(self) -> None:
-        if self._client is not None:
-            await self._client.close()
-            self._client = None

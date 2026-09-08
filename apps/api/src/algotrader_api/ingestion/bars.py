@@ -190,31 +190,15 @@ async def run_bars_phase(
 
 
 def _candle_to_row(c: Any) -> dict:
-    """Convert a single gRPC candle (with is_complete flag) to a parquet row.
+    """Convert a single gRPC candle (or pre-converted dict) to a parquet row.
 
     Drops candles whose date is today or later — those are the
     in-progress live bar that Tinkoff occasionally returns with
     is_complete=True. The runner's defensive guard plus this helper's
     filter keeps parquet strictly historical.
     """
-    from datetime import date as _date
-
-    o = c.open
-    h = c.high
-    l = c.low
-    cl = c.close
-    t = c.time
-    a_date = _date(t.year, t.month, t.day)
-    if a_date >= _date.today():
-        return None  # type: ignore[return-value]
-    return {
-        "ts": _date(t.year, t.month, t.day).isoformat(),
-        "open": o.units + o.nano / 1_000_000_000,
-        "high": h.units + h.nano / 1_000_000_000,
-        "low": l.units + l.nano / 1_000_000_000,
-        "close": cl.units + cl.nano / 1_000_000_000,
-        "volume": getattr(c, "volume", 0),
-    }
+    from .real_client_convert import _candle_to_dict as _to_row
+    return _to_row(c)
 
 
 def append_bars(*, path: str, candles: list) -> int:
