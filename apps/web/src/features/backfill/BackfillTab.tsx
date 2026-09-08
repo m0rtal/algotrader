@@ -195,8 +195,8 @@ export function BackfillTab() {
             <p className="text-[var(--muted-foreground)]">Waiting for events…</p>
           )}
           {[...events].reverse().map((ev, i) => (
-            <div key={`${ev.ts}-${i}`} className="flex gap-2">
-              <span className="text-[var(--muted-foreground)] shrink-0">{ev.ts.slice(11, 19)}</span>
+            <div key={`${ev.ts ?? i}-${i}`} className="flex gap-2">
+              <span className="text-[var(--muted-foreground)] shrink-0">{(ev.ts ?? '').slice(11, 19)}</span>
               <span
                 className={
                   ev.type === 'error' || ev.type === 'done'
