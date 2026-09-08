@@ -114,8 +114,11 @@ async def _run_phases(run_id: int, db_path: str) -> None:
     # when a real broker token is present. This is the path used in dev/test
     # where the tinkoff-investments SDK isn't installed.
     use_fake = os.environ.get("ALGOTRADER_INGEST_FAKE") == "1"
+    target = _resolve_target_from_settings(settings.sqlite_path)
     try:
-        client = client_mod.make_client(sqlite_path=db_path, use_fake=use_fake)
+        client = client_mod.make_client(
+            sqlite_path=db_path, use_fake=use_fake, target=target
+        )
     except RuntimeError as e:
         logger.error("admin.client.failed", error=str(e))
         pipeline_mod.end_phase(db_path, run_id, status="err", detail=str(e))
@@ -165,3 +168,26 @@ def _now_iso() -> str:
     from datetime import datetime
 
     return datetime.now().isoformat()
+
+
+def _resolve_target_from_settings(sqlite_path: str) -> str | None:
+    """Read BrokerSettings.environment from the app's settings table.
+
+    Returns None when the row is missing or malformed, signalling to
+    `make_client()` that it should fall back to its env-var or default
+    resolution.
+    """
+    try:
+        import json as _json
+        from ..db.sqlite import execute as _exec
+        rows = _exec(sqlite_path, "SELECT value FROM settings WHERE key = 'main'", ())
+        if not rows:
+            return None
+        blob = _json.loads(rows[0]["value"])
+        broker = blob.get("broker", {}) if isinstance(blob, dict) else {}
+        env_name = broker.get("environment")
+        if env_name in ("sandbox", "production"):
+            return env_name
+    except Exception:
+        return None
+    return None

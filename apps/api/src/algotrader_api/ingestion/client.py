@@ -8,6 +8,7 @@ The broker token lives in the application SQLite database (secrets table)
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Protocol, runtime_checkable
 
@@ -71,6 +72,7 @@ def make_client(
     *,
     use_fake: bool | None = None,
     sqlite_path: str | None = None,
+    target: str | None = None,
 ) -> TinkoffClient:
     """Factory: pick real or fake Tinkoff client.
 
@@ -80,6 +82,12 @@ def make_client(
     - use_fake=None → ALGOTRADER_INGEST_FAKE=1 → fake, else real
 
     RealTinkoffClient reads the token from `db.secrets` via load_broker_token().
+
+    Target resolution order (only relevant for real client):
+    1. Explicit `target` argument wins.
+    2. ALGOTRADER_TINKOFF_TARGET env var.
+    3. BrokerSettings.environment (set via Settings → Broker).
+    4. "sandbox" — safe default. Live orders require an explicit flip.
     """
     if use_fake is None:
         use_fake = os.environ.get("ALGOTRADER_INGEST_FAKE") == "1"
@@ -94,5 +102,27 @@ def make_client(
             "Tinkoff broker token not set. Save it via Settings → Broker → "
             "Токен, or set ALGOTRADER_INGEST_FAKE=1 for dev mode."
         )
-    logger.info("tinkoff.client.real")
-    return RealTinkoffClient(token=token)
+    if target is None:
+        target = os.environ.get("ALGOTRADER_TINKOFF_TARGET")
+    if target is None:
+        try:
+            from ..db.sqlite import execute as _exec
+            from ..config import get_settings
+            settings = get_settings()
+            rows = _exec(
+                settings.sqlite_path,
+                "SELECT value FROM settings WHERE key = 'main'",
+                (),
+            )
+            if rows:
+                blob = json.loads(rows[0]["value"])
+                broker = blob.get("broker", {}) if isinstance(blob, dict) else {}
+                env_name = broker.get("environment")
+                if env_name in ("sandbox", "production"):
+                    target = env_name
+        except Exception:
+            target = None
+    if target is None:
+        target = "sandbox"
+    logger.info("tinkoff.client.real", target=target)
+    return RealTinkoffClient(token=token, target=target)

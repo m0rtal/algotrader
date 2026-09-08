@@ -1,13 +1,6 @@
-# data-fetch Specification
+# data-fetch Specification (delta)
 
-## Purpose
-
-This spec describes the real-time data ingestion layer for MOEX data via the
-Tinkoff Invest API (T-Invest). The wrapper layer translates the SDK's gRPC
-API into plain Python dicts so downstream code (universe discovery, bar
-fetch, regime detection) doesn't depend on the SDK type hierarchy.
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: SDK Source
 

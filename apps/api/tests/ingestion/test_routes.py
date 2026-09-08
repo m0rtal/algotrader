@@ -315,3 +315,52 @@ def test_admin_fetch_with_fetch_disabled_via_env_var(data_dir, monkeypatch):
         assert r.json()["detail"]["error"] == "fetch_disabled"
     sqlitedb.close_all()
     duck.close()
+
+
+def test_resolve_target_returns_sandbox_when_no_settings(data_dir):
+    """No settings row → helper returns None, make_client falls back to default."""
+    from algotrader_api.routes.admin import _resolve_target_from_settings
+    assert _resolve_target_from_settings(f"{data_dir}/state.db") is None
+
+
+def test_resolve_target_reads_broker_environment(data_dir):
+    """BrokerSettings.environment=sandbox → helper returns 'sandbox'."""
+    import json
+    from pathlib import Path
+    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.routes.admin import _resolve_target_from_settings
+
+    sqlitedb.close_all()
+    duck.close()
+    db_file = f"{data_dir}/state.db"
+    # Run migrations so the settings table exists.
+    migrations_dir = str(Path(__file__).resolve().parents[2] / "src/algotrader_api/db/migrations")
+    sqlitedb.run_migrations(db_file, migrations_dir)
+    sqlitedb.execute(
+        db_file,
+        "INSERT INTO settings (key, value, version, updated_at) VALUES (?, ?, ?, ?)",
+        ("main", json.dumps({"broker": {"environment": "production"}}), "v1", "2026-09-08"),
+    )
+    sqlitedb.close_all()
+    assert _resolve_target_from_settings(db_file) == "production"
+
+
+def test_resolve_target_returns_none_for_invalid_env(data_dir):
+    """An environment outside the enum → helper returns None (no leak)."""
+    import json
+    from pathlib import Path
+    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.routes.admin import _resolve_target_from_settings
+
+    sqlitedb.close_all()
+    duck.close()
+    db_file = f"{data_dir}/state.db"
+    migrations_dir = str(Path(__file__).resolve().parents[2] / "src/algotrader_api/db/migrations")
+    sqlitedb.run_migrations(db_file, migrations_dir)
+    sqlitedb.execute(
+        db_file,
+        "INSERT INTO settings (key, value, version, updated_at) VALUES (?, ?, ?, ?)",
+        ("main", json.dumps({"broker": {"environment": "staging"}}), "v1", "2026-09-08"),
+    )
+    sqlitedb.close_all()
+    assert _resolve_target_from_settings(db_file) is None

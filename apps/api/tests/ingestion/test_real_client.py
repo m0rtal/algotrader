@@ -1,14 +1,15 @@
-"""Tests for real_client — gRPC → dict converters via mock SDK objects.
+"""Tests for the gRPC → dict converters used by RealTinkoffClient.
 
-Since the real tinkoff-investments SDK is not installed in CI, we test the
-data shape converters with mock objects that have the same attributes the
-SDK's generated types would have.
+Converters live in `real_client_convert.py` now (separated from the wrapper
+to keep the wrapper file focused on target dispatch). The wrapper itself
+is covered by the mocked SDK tests below — see test_real_client.py for the
+SDK-shape tests and test_real_sandbox.py for the gated sandbox integration.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from algotrader_api.ingestion.real_client import (
+from algotrader_api.ingestion.real_client_convert import (
     _acct_to_dict,
     _bond_to_dict,
     _candle_to_dict,
@@ -175,7 +176,7 @@ def test_candle_to_dict_handles_none_quotations():
 
 
 def test_real_client_init_raises_on_missing_sdk(monkeypatch):
-    """If tinkoff.invest cannot be imported, RealTinkoffClient raises RuntimeError."""
+    """If t_tech.invest cannot be imported, RealTinkoffClient raises RuntimeError."""
     import builtins
     from algotrader_api.ingestion import real_client
 
@@ -183,12 +184,12 @@ def test_real_client_init_raises_on_missing_sdk(monkeypatch):
     original_import = builtins.__import__
 
     def fake_import(name, *args, **kwargs):
-        if name == "tinkoff.invest" or name.startswith("tinkoff.invest"):
+        if name == "t_tech.invest" or name.startswith("t_tech.invest"):
             raise ImportError("simulated missing SDK")
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    with __import__("pytest").raises(RuntimeError, match="tinkoff-investments SDK not installed"):
+    with __import__("pytest").raises(RuntimeError, match="t-tech-investments SDK not installed"):
         real_client.RealTinkoffClient(token="t.fake")
 
 
@@ -200,7 +201,7 @@ def test_real_client_aclose_is_safe_without_open():
     try:
         client = real_client.RealTinkoffClient(token="t.fake")
     except RuntimeError:
-        __import__("pytest").skip("tinkoff-investments SDK not installed")
+        __import__("pytest").skip("t-tech-investments SDK not installed")
     # Should not raise even if _client is None
     import asyncio
 

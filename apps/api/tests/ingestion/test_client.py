@@ -89,7 +89,7 @@ def test_make_client_returns_real_when_token_in_db(tmp_path):
         MockClient.return_value = "mocked-instance"
         c = make_client(use_fake=False, sqlite_path=db)
     assert c == "mocked-instance"
-    MockClient.assert_called_once_with(token="t.real.ABCD")
+    MockClient.assert_called_once_with(token="t.real.ABCD", target="sandbox")
 
 
 def test_make_client_uses_env_var_for_fake_flag(monkeypatch):
@@ -114,7 +114,7 @@ def test_set_secret_then_load_via_factory(tmp_path):
         MockClient.return_value = "mocked"
         c = make_client(use_fake=False, sqlite_path=db)
     assert c == "mocked"
-    MockClient.assert_called_once_with(token="t.written.1234")
+    MockClient.assert_called_once_with(token="t.written.1234", target="sandbox")
 
 
 def test_load_broker_token_handles_db_error(tmp_path, monkeypatch):
@@ -123,3 +123,22 @@ def test_load_broker_token_handles_db_error(tmp_path, monkeypatch):
     db.write_text("not a sqlite db")
     with patch("algotrader_api.ingestion.client.get_broker_token", side_effect=sqlite3.DatabaseError("corrupt")):
         assert load_broker_token(str(db)) is None
+
+
+def test_make_client_passes_explicit_target(tmp_path):
+    """Explicit target arg wins and is forwarded to RealTinkoffClient."""
+    db = _seed_db(tmp_path, value="t.real.token")
+    with patch("algotrader_api.ingestion.real_client.RealTinkoffClient") as MockClient:
+        MockClient.return_value = "ok"
+        c = make_client(use_fake=False, sqlite_path=db, target="production")
+    assert c == "ok"
+    MockClient.assert_called_once_with(token="t.real.token", target="production")
+
+
+def test_make_client_default_target_is_sandbox(tmp_path):
+    """No target arg, no env override → defaults to sandbox (safe)."""
+    db = _seed_db(tmp_path, value="t.real.token")
+    with patch("algotrader_api.ingestion.real_client.RealTinkoffClient") as MockClient:
+        MockClient.return_value = "ok"
+        make_client(use_fake=False, sqlite_path=db)
+    assert MockClient.call_args.kwargs["target"] == "sandbox"
