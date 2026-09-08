@@ -142,16 +142,92 @@ async def run_worker(mode: str) -> int:
     return rc
 
 
+def run_backfill() -> int:
+    """Run the persistent backfill lifecycle once and exit.
+
+    Designed for the systemd-timer mode: 02:00 MSK daily. Reads the
+    broker token from the app's own SQLite secrets table (never env,
+    never file), runs the runner with default settings, exits 0 on
+    success or non-zero on failure (for systemd to retry).
+
+    Live SSE is unnecessary here — systemd captures stdout/stderr via
+    journald, and operator UI uses the HTTP /api/admin/backfill/status
+    endpoint on the API server.
+    """
+    from algotrader_api.ingestion.client import make_client
+    from algotrader_api.ingestion.backfill import BackfillRunner
+    from algotrader_api.db.secrets import get_broker_token
+
+    settings = get_settings()
+    db_path = settings.sqlite_path
+    bars_dir = settings.bars_dir
+
+    token = get_broker_token(db_path)
+    if not token:
+        logger.error("worker.backfill.no_token")
+        return 2  # distinct exit code so systemd can alert
+
+    try:
+        client = make_client(sqlite_path=db_path, use_fake=False)
+    except RuntimeError as e:
+        logger.error("worker.backfill.client_init_failed", error=str(e))
+        return 3
+
+    events: list = []
+
+    async def collect(ev):
+        events.append(ev)
+        # Mirror to journald so operators see live progress without the UI.
+        logger.info(
+            "worker.backfill.event",
+            type=ev.type,
+            run_id=ev.run_id,
+            payload=ev.payload,
+        )
+
+    runner = BackfillRunner(
+        client=client,
+        db_path=db_path,
+        bars_dir=bars_dir,
+        event_sink=collect,
+    )
+
+    async def _drive() -> int:
+        try:
+            await runner.run()
+        except Exception as e:
+            logger.error("worker.backfill.runner_failed", error=str(e))
+            return 1
+        # Final event tells us how it went.
+        done = next((e for e in reversed(events) if e.type == "done"), None)
+        status = (done.payload.get("status") if done else "unknown") if done else "unknown"
+        tickers_done = done.payload.get("tickers_done", 0) if done else 0
+        logger.info(
+            "worker.backfill.complete",
+            status=status,
+            tickers_done=tickers_done,
+        )
+        return 0 if status == "ok" else 1
+
+    return asyncio.run(_drive())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="algotrader data-fetch worker")
     parser.add_argument(
         "mode",
         nargs="?",
         default="scheduled",
-        choices=["scheduled", "manual"],
-        help="Invocation mode",
+        choices=["scheduled", "manual", "backfill"],
+        help=(
+            "Invocation mode. 'scheduled'/'manual' are one-shot fetch flows; "
+            "'backfill' runs the persistent universe + historical backfill "
+            "lifecycle (systemd-timer driven)."
+        ),
     )
     args = parser.parse_args()
+    if args.mode == "backfill":
+        return run_backfill()
     return asyncio.run(run_worker(args.mode))
 
 

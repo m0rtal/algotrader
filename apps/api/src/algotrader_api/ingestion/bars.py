@@ -184,3 +184,55 @@ async def run_bars_phase(
 
     logger.info("bars.phase.done", total_rows=total_rows, rate_limit_hits=rate_limit_hits)
     return total_rows, rate_limit_hits
+
+
+# ─── backfill runner support ────────────────────────────────────────
+
+
+def _candle_to_row(c: Any) -> dict:
+    """Convert a single gRPC candle (with is_complete flag) to a parquet row.
+
+    Drops candles whose date is today or later — those are the
+    in-progress live bar that Tinkoff occasionally returns with
+    is_complete=True. The runner's defensive guard plus this helper's
+    filter keeps parquet strictly historical.
+    """
+    from datetime import date as _date
+
+    o = c.open
+    h = c.high
+    l = c.low
+    cl = c.close
+    t = c.time
+    a_date = _date(t.year, t.month, t.day)
+    if a_date >= _date.today():
+        return None  # type: ignore[return-value]
+    return {
+        "ts": _date(t.year, t.month, t.day).isoformat(),
+        "open": o.units + o.nano / 1_000_000_000,
+        "high": h.units + h.nano / 1_000_000_000,
+        "low": l.units + l.nano / 1_000_000_000,
+        "close": cl.units + cl.nano / 1_000_000_000,
+        "volume": getattr(c, "volume", 0),
+    }
+
+
+def append_bars(*, path: str, candles: list) -> int:
+    """Append candles to a per-ticker parquet file. Returns rows written.
+
+    The runner calls this once per ticker after filtering by
+    `is_closed_candle`. Deduplicates by `ts` via the underlying
+    `_atomic_write_parquet` (CREATE TABLE ... UNION ALL).
+    """
+    rows: list[dict] = []
+    for c in candles:
+        row = _candle_to_row(c)
+        if row is not None:
+            rows.append(row)
+    if not rows:
+        return 0
+    bar_file = Path(path)
+    # Use the FIGI-style filename; the existing bars.py helpers key on
+    # ticker though, so the runner passes paths already named after FIGI.
+    _atomic_write_parquet(bar_file=bar_file, new_rows=rows, ticker=bar_file.stem)
+    return len(rows)

@@ -4,6 +4,7 @@ import { TradesTab } from '@features/trades/TradesTab';
 import { PortfolioTab } from '@features/portfolio/PortfolioTab';
 import { BacktestTab } from '@features/backtest/BacktestTab';
 import { StorageTab } from '@features/storage/StorageTab';
+import { BackfillTab } from '@features/backfill/BackfillTab';
 import { Topbar } from '@components/layout/Topbar';
 import { KPIStr } from '@components/layout/KPIStr';
 import { Sidebar } from '@components/layout/Sidebar';
@@ -17,6 +18,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: 'portfolio', label: 'Портфель' },
   { id: 'backtest', label: 'Бэктест' },
   { id: 'storage', label: 'Бары' },
+  { id: 'backfill', label: 'Бэкфил' },
 ];
 
 export function Dashboard() {
@@ -56,6 +58,7 @@ export function Dashboard() {
             {active === 'portfolio' && <PortfolioTab />}
             {active === 'backtest' && <BacktestTab />}
             {active === 'storage' && <StorageTab />}
+            {active === 'backfill' && <BackfillTab />}
           </div>
         </main>
         {/* Right rail: full-height on mobile (below main); fixed column on desktop */}

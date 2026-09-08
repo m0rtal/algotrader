@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type TabId = 'signals' | 'trades' | 'portfolio' | 'backtest' | 'storage';
+export type TabId = 'signals' | 'trades' | 'portfolio' | 'backtest' | 'storage' | 'backfill';
 
 interface UiState {
   activeTab: TabId;

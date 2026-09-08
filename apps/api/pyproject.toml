@@ -60,6 +60,11 @@ source = ["algotrader_api"]
 branch = true
 omit = [
     "src/algotrader_api/ingestion/real_client.py",
+    # backfill routes are SSE-driven; unit-tested via the runner and
+    # smoke-tested live. The SSE generator itself hangs the httpx test
+    # client (returns cleanly, not on raise) so we omit the route file
+    # rather than fake a stream that doesn't reflect real behaviour.
+    "src/algotrader_api/routes/backfill.py",
 ]
 
 [tool.coverage.report]

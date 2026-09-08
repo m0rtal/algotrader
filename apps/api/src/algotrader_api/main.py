@@ -114,6 +114,8 @@ def create_app() -> FastAPI:
     app.include_router(bars.router)
     app.include_router(pipeline_route.router)
     app.include_router(admin.router)
+    from .routes.backfill import router as backfill_router
+    app.include_router(backfill_router)
 
     # OpenTelemetry FastAPI instrumentation
     FastAPIInstrumentor.instrument_app(app)

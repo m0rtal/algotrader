@@ -1,0 +1,25 @@
+[Unit]
+Description=algotrader backfill subsystem (one-shot daily)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=algotrader
+Group=algotrader
+WorkingDirectory=/opt/algotrader/apps/api
+Environment="PATH=/home/hermes/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/opt/algotrader/apps/api/.venv/bin/python /opt/algotrader/apps/api/worker.py backfill
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/algotrader
+PrivateTmp=true
+# Don't dump core for transient network errors
+LimitCORE=0
+# Allow long-running backfill (250 tickers × ~4s/call = ~17min plus retries)
+TimeoutStartSec=2h
+
+[Install]
+WantedBy=multi-user.target

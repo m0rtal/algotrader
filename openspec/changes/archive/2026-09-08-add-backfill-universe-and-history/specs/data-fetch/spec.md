@@ -1,12 +1,6 @@
-# data-fetch Specification
+# data-fetch Specification (delta)
 
-## Purpose
-
-This spec covers the data ingestion layer: universe discovery from the
-Tinkoff sandbox and historical daily bars with rate limiting, persistent
-progress state, and operator-visible logs.
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: Universe + History Backfill
 

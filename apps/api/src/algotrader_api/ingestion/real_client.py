@@ -80,11 +80,11 @@ class RealTinkoffClient:
 
         The new SDK exposes a single `instruments.<method>` per asset class
         and discriminates with `InstrumentType.{SHARES,BONDS,...}` on the
-        `GetInstrumentsRequest`. Each wrapper sets the right
+        `InstrumentsRequest`. Each wrapper sets the right
         `instrument_type` enum and runs the gRPC call.
         """
         client = await self._ensure()
-        request_cls = getattr(self._sdk, "GetInstrumentsRequest")
+        request_cls = getattr(self._sdk, "InstrumentsRequest")
         instrument_status = getattr(
             self._sdk.InstrumentStatus, "INSTRUMENT_STATUS_BASE"
         )

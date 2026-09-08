@@ -1,0 +1,11 @@
+[Unit]
+Description=algotrader daily backfill timer (02:00 MSK)
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 Europe/Moscow
+Persistent=true
+RandomizedDelaySec=300
+Unit=algotrader-backfill.service
+
+[Install]
+WantedBy=timers.target
