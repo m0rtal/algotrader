@@ -99,6 +99,38 @@ def test_make_client_uses_env_var_for_fake_flag(monkeypatch):
     assert isinstance(c, InMemoryTinkoffClient)
 
 
+def test_make_client_uses_explicit_target(tmp_path):
+    """Explicit target arg wins over env and Settings."""
+    db = _seed_db(tmp_path, value="t.real.ABCD")
+    with patch("algotrader_api.ingestion.real_client.RealTinkoffClient") as MockClient:
+        MockClient.return_value = "ok"
+        c = make_client(use_fake=False, sqlite_path=db, target="production")
+    assert c == "ok"
+    MockClient.assert_called_once_with(token="t.real.ABCD", target="production")
+
+
+def test_make_client_uses_target_env_var(tmp_path, monkeypatch):
+    """ALGOTRADER_TINKOFF_TARGET wins when explicit target is None."""
+    monkeypatch.setenv("ALGOTRADER_TINKOFF_TARGET", "production")
+    db = _seed_db(tmp_path, value="t.real.ABCD")
+    with patch("algotrader_api.ingestion.real_client.RealTinkoffClient") as MockClient:
+        MockClient.return_value = "ok"
+        c = make_client(use_fake=False, sqlite_path=db)
+    MockClient.assert_called_once_with(token="t.real.ABCD", target="production")
+
+
+def test_make_client_falls_back_to_sandbox_when_settings_lookup_fails(tmp_path, monkeypatch):
+    """If Settings blob is unreadable, target stays at the sandbox default."""
+    monkeypatch.delenv("ALGOTRADER_TINKOFF_TARGET", raising=False)
+    db = _seed_db(tmp_path, value="t.real.ABCD")
+    # Patch db.sqlite.execute so the settings read blows up.
+    with patch("algotrader_api.ingestion.real_client.RealTinkoffClient") as MockClient, \
+         patch("algotrader_api.db.sqlite.execute", side_effect=RuntimeError("broken")):
+        MockClient.return_value = "ok"
+        c = make_client(use_fake=False, sqlite_path=db)
+    MockClient.assert_called_once_with(token="t.real.ABCD", target="sandbox")
+
+
 def test_tinkoff_client_protocol_accepts_fake():
     """Protocol runtime check — fake implements all required methods."""
     from algotrader_api.ingestion.fake_client import InMemoryTinkoffClient

@@ -47,3 +47,18 @@ def test_health_degraded_when_duckdb_broken(data_dir, monkeypatch):
     body = r.json()
     assert body["status"] == "degraded"
     assert "simulated duckdb failure" in body["duckdb"]
+
+
+def test_health_degraded_when_sqlite_broken(client, monkeypatch):
+    """When sqlite.execute raises, status flips to degraded."""
+    from algotrader_api.routes import health
+
+    def broken_execute(*a, **k):
+        raise RuntimeError("sqlite locked")
+
+    monkeypatch.setattr(health.sqlite, "execute", broken_execute)
+    r = client.get("/health")
+    assert r.status_code == 503
+    body = r.json()
+    assert body["status"] == "degraded"
+    assert "sqlite" in body["sqlite"]

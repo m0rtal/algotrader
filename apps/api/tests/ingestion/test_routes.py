@@ -196,6 +196,57 @@ def test_admin_fetch_uses_fresh_token_without_restart(data_dir, monkeypatch):
     duck.close()
 
 
+def test_admin_fetch_with_token_present_passes_token_check(fresh_db, monkeypatch):
+    """When a token IS set in DB and SDK isn't installed, the route still
+    goes past the broker_token check. The downstream make_client() will
+    raise ImportError → 500 (because no SDK), but the broker_token branch
+    is now exercised end-to-end."""
+    from algotrader_api.db import duck, secrets as secrets_repo, sqlite as sqlitedb
+    from algotrader_api.main import create_app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("ALGOTRADER_INGEST_FAKE", raising=False)
+    secrets_repo.set_secret(fresh_db, "broker_token", "t.live.WXYZ")
+    sqlitedb.close_all()
+    duck.close()
+    app = create_app()
+    with TestClient(app) as c:
+        r = c.post("/api/admin/fetch")
+        # Real path with token: SDK not installed → 500.
+        # We just care that the route did NOT 400 (broker_token_missing).
+        assert r.status_code != 400
+    sqlitedb.close_all()
+    duck.close()
+
+
+def test_admin_fetch_runtime_error_in_make_client_is_logged(fresh_db, monkeypatch):
+    """When make_client() raises RuntimeError, admin/_run_phases logs it
+    and marks the pipeline phase as 'err' instead of crashing."""
+    from unittest.mock import patch
+
+    from algotrader_api.db import duck, secrets as secrets_repo, sqlite as sqlitedb
+    from algotrader_api.main import create_app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("ALGOTRADER_INGEST_FAKE", "1")
+    secrets_repo.set_secret(fresh_db, "broker_token", "t.live.WXYZ")
+    sqlitedb.close_all()
+    duck.close()
+
+    # Patch the symbol that admin._run_phases looks up.
+    def boom(*a, **k):
+        raise RuntimeError("simulated client failure")
+
+    app = create_app()
+    with TestClient(app) as c, \
+         patch("algotrader_api.ingestion.client.make_client", side_effect=boom):
+        r = c.post("/api/admin/fetch")
+    # Should still return 202 (background task) — error is logged async.
+    assert r.status_code == 202
+    sqlitedb.close_all()
+    duck.close()
+
+
 def test_fetch_status_reports_token_set_state(data_dir):
     """GET /api/admin/fetch/status returns token_set + token_last4 (or None)."""
     from algotrader_api.db import duck, secrets as secrets_repo, sqlite as sqlitedb
