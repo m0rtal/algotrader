@@ -85,49 +85,55 @@ describe('BackfillTab', () => {
     MockEventSource.instances = [];
   });
 
-  it('renders idle state with controls', async () => {
+  it('renders idle state with scheduler-mode hint', async () => {
     const Wrapper = makeWrapper();
     render(<BackfillTab />, { wrapper: Wrapper });
     await waitFor(() => {
-      expect(screen.getByText(/Start backfill/i)).toBeInTheDocument();
+      expect(screen.getByText(/02:00 MSK scheduler/i)).toBeInTheDocument();
     });
     await waitFor(() => {
       expect(screen.getByText(/idle/i)).toBeInTheDocument();
     });
   });
 
-  it('renders Stop button as disabled when idle', () => {
+  it('renders Stop current run button as disabled when idle', () => {
     const Wrapper = makeWrapper();
     render(<BackfillTab />, { wrapper: Wrapper });
-    const stopBtn = screen.queryByRole('button', { name: /^Stop$/i });
+    const stopBtn = screen.queryByRole('button', { name: /Stop current run/i });
     expect(stopBtn).toBeInTheDocument();
     expect(stopBtn).toBeDisabled();
   });
 
-  it('opens start dialog when clicking start, then sends mutation on confirm', async () => {
+  it('shows scheduler-mode hint text on the backfill tab', async () => {
     const Wrapper = makeWrapper();
     render(<BackfillTab />, { wrapper: Wrapper });
-    await waitFor(() => screen.getByText(/Start backfill/i));
-    fireEvent.click(screen.getByRole('button', { name: /Start backfill/i }));
-    await waitFor(() => screen.getByText(/Start backfill\?/i));
-    // Dialog has a separate "Start" button to confirm.
-    const dialogBtn = screen.getAllByRole('button', { name: /^Start$/i });
-    fireEvent.click(dialogBtn[dialogBtn.length - 1]!);
+    await waitFor(() => screen.getByText(/02:00 MSK scheduler/i));
+  });
+
+  it('triggers reset mutation on confirm', async () => {
+    const Wrapper = makeWrapper();
+    render(<BackfillTab />, { wrapper: Wrapper });
+    await waitFor(() => screen.getByText(/Reset metadata/i));
+    fireEvent.click(screen.getByText(/Reset metadata/i));
+    await waitFor(() => screen.getByText(/Force full re-backfill/i));
+    const confirmBtns = screen.getAllByRole('button', { name: /Reset metadata/i });
+    // The second one is inside the dialog.
+    fireEvent.click(confirmBtns[confirmBtns.length - 1]!);
+    // Dialog closes, no error toast.
     await waitFor(() => {
-      const stored = localStorage.getItem('algotrader.mock_backfill_state');
-      expect(stored).not.toBeNull();
+      expect(screen.queryByText(/Force full re-backfill/i)).not.toBeInTheDocument();
     });
   });
 
-  it('closes start dialog on cancel', async () => {
+  it('opens reset-metadata dialog and cancels', async () => {
     const Wrapper = makeWrapper();
     render(<BackfillTab />, { wrapper: Wrapper });
-    await waitFor(() => screen.getByText(/Start backfill/i));
-    fireEvent.click(screen.getByText(/Start backfill/i));
-    await waitFor(() => screen.getByText(/Start backfill\?/i));
-    fireEvent.click(screen.getByText(/Cancel/i));
+    await waitFor(() => screen.getByText(/Reset metadata/i));
+    fireEvent.click(screen.getByText(/Reset metadata/i));
+    await waitFor(() => screen.getByText(/Force full re-backfill/i));
+    fireEvent.click(screen.getByText(/^Cancel$/i));
     await waitFor(() => {
-      expect(screen.queryByText(/Start backfill\?/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Force full re-backfill/i)).not.toBeInTheDocument();
     });
   });
 
@@ -141,7 +147,7 @@ describe('BackfillTab', () => {
     es.dispatch('log', { type: 'info', message: 'test message' });
   });
 
-  it('shows stop button and error state when backfilling', async () => {
+  it('shows Stop button enabled when backfilling', async () => {
     localStorage.setItem(
       'algotrader.mock_backfill_state',
       JSON.stringify({
@@ -157,6 +163,23 @@ describe('BackfillTab', () => {
     render(<BackfillTab />, { wrapper: Wrapper });
     await waitFor(() => {
       expect(screen.getByText(/Stop\b/)).toBeInTheDocument();
+    });
+  });
+
+  it('shows Stop button when status.state is discovering', async () => {
+    localStorage.setItem(
+      'algotrader.mock_backfill_state',
+      JSON.stringify({
+        state: 'discovering', run_id: 1, tickers_total: 10, tickers_done: 0,
+        total_bars: 0, last_run: null,
+      }),
+    );
+    const Wrapper = makeWrapper();
+    render(<BackfillTab />, { wrapper: Wrapper });
+    await waitFor(() => {
+      const stopBtn = screen.queryByText(/Stop current run/i);
+      expect(stopBtn).toBeTruthy();
+      expect((stopBtn as HTMLButtonElement).disabled).toBe(false);
     });
   });
 
@@ -177,16 +200,6 @@ describe('BackfillTab', () => {
     await waitFor(() => {
       expect(screen.getByText(/stopping/i)).toBeInTheDocument();
     });
-  });
-
-  it('toggles history years input', async () => {
-    const Wrapper = makeWrapper();
-    render(<BackfillTab />, { wrapper: Wrapper });
-    await waitFor(() => screen.getByText(/Start backfill/i));
-    fireEvent.click(screen.getByRole('button', { name: /Start backfill/i }));
-    const input = (await screen.findByLabelText(/History \(years\)/i)) as HTMLInputElement;
-    fireEvent.change(input, { target: { value: '5' } });
-    expect(input.value).toBe('5');
   });
 
   it('renders discovered and done states without error', async () => {
@@ -239,17 +252,15 @@ describe('BackfillTab', () => {
     );
     const Wrapper = makeWrapper();
     render(<BackfillTab />, { wrapper: Wrapper });
-    // Wait until the status query has settled with our seeded state,
-    // at which point the Stop button becomes enabled.
     await waitFor(
       () => {
-        const btn = screen.queryByText(/Stop\b/) as HTMLButtonElement | null;
+        const btn = screen.queryByText(/Stop current run/i) as HTMLButtonElement | null;
         expect(btn).toBeTruthy();
         expect(btn!.disabled).toBe(false);
       },
       { timeout: 3000 },
     );
-    fireEvent.click(screen.getByText(/Stop\b/));
+    fireEvent.click(screen.getByText(/Stop current run/i));
     await waitFor(
       () => {
         const stored = localStorage.getItem('algotrader.mock_backfill_state');
@@ -257,26 +268,6 @@ describe('BackfillTab', () => {
       },
       { timeout: 3000 },
     );
-  });
-
-  it('renders error message when start mutation fails', async () => {
-    // Override start endpoint with one that returns 500.
-    const { server } = await import('../../mocks/server');
-    const { http, HttpResponse } = await import('msw');
-    server.use(
-      http.post('/api/admin/backfill/start', () =>
-        new HttpResponse('boom', { status: 500 }),
-      ),
-    );
-    const Wrapper = makeWrapper();
-    render(<BackfillTab />, { wrapper: Wrapper });
-    await waitFor(() => screen.getByText(/Start backfill/i));
-    fireEvent.click(screen.getByRole('button', { name: /Start backfill/i }));
-    const dialogBtn = screen.getAllByRole('button', { name: /^Start$/i });
-    fireEvent.click(dialogBtn[dialogBtn.length - 1]!);
-    await waitFor(() => {
-      expect(screen.getByText(/500/i)).toBeInTheDocument();
-    });
   });
 
   it('renders "Last activity" line when last_run provided', async () => {

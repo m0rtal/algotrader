@@ -270,3 +270,107 @@ def _last_run_summary(sqlite_path: str) -> dict | None:
         }
     except sqlite3.Error:
         return None
+
+
+# ─── read-only status helpers ──────────────────────────────────────
+
+
+def _pending_count(sqlite_path: str, *, incremental_threshold_days: int = 2) -> dict:
+    """Count tickers that the next scheduler run would actually fetch.
+
+    Mirrors `decide_strategy` from ingestion/backfill.py:
+      - No metadata row → "full" (new ticker).
+      - last_run_status == 'error' → "full" (force retry).
+      - last_bar_ts older than threshold → "incremental".
+      - last_bar_ts within threshold AND last_run_status == 'ok' → "skip".
+
+    Returns breakdown so the UI can render the scheduler plan.
+    """
+    from datetime import date as _date
+
+    if not Path(sqlite_path).exists():
+        return {"new": 0, "stale": 0, "up_to_date": 0, "error": 0, "total": 0}
+
+    today = _date.today()
+    counts = {"new": 0, "stale": 0, "up_to_date": 0, "error": 0, "total": 0}
+    try:
+        rows = _exec(
+            sqlite_path,
+            "SELECT i.figi, m.last_bar_ts, m.last_run_status "
+            "FROM instruments i "
+            "LEFT JOIN instrument_metadata m ON i.figi = m.figi "
+            "WHERE i.class IN ('share', 'etf')",
+            (),
+        )
+    except sqlite3.Error:
+        return counts
+
+    for row in rows:
+        last_bar_ts = row["last_bar_ts"]
+        last_status = row["last_run_status"]
+        counts["total"] += 1
+        if last_bar_ts is None or last_status == "error":
+            counts["new" if last_status != "error" else "error"] += 1
+            continue
+        try:
+            last_dt = _date.fromisoformat(last_bar_ts)
+        except (TypeError, ValueError):
+            counts["new"] += 1
+            continue
+        days_since = (today - last_dt).days
+        if days_since > incremental_threshold_days:
+            counts["stale"] += 1
+        else:
+            counts["up_to_date"] += 1
+    return counts
+
+
+@router.get("/backfill/pending")
+async def backfill_pending() -> dict:
+    """Per-class breakdown of what the next scheduled run would fetch."""
+    settings = get_settings()
+    return _pending_count(
+        settings.sqlite_path,
+        incremental_threshold_days=_settings_incremental_threshold(),
+    )
+
+
+@router.post("/backfill/force-reset")
+async def backfill_force_reset() -> dict:
+    """Wipe all `instrument_metadata` rows so the next run does a full backfill.
+
+    This is the only manual override the operator should ever need:
+    - New ticker appears in the universe → scheduler catches it
+      automatically (no metadata row → 'full').
+    - Existing ticker missed a day → scheduler catches it next run
+      (`days_since > threshold` → 'incremental').
+    - Schema changed (e.g. corporate action restated the series) →
+      operator clicks "Reset metadata" and the next run re-fetches
+      the full history_years for everyone.
+    """
+    settings = get_settings()
+    db_path = settings.sqlite_path
+    if not Path(db_path).exists():
+        raise HTTPException(status_code=503, detail={"error": "no_db"})
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.execute("DELETE FROM instrument_metadata")
+        deleted = cur.rowcount
+        con.commit()
+        con.close()
+    except sqlite3.Error as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "metadata_reset_failed", "message": str(e)},
+        )
+    logger.warning("backfill.force_reset", deleted=deleted)
+    return {"deleted_rows": deleted, "next_run": "full backfill of all instruments"}
+
+
+def _settings_incremental_threshold() -> int:
+    """Read incremental_threshold_days from Settings if exposed, else 2."""
+    try:
+        s = get_settings()
+        return int(getattr(s, "incremental_threshold_days", 2))
+    except Exception:
+        return 2

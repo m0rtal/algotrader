@@ -21,20 +21,6 @@ export function useBackfillStatus() {
   });
 }
 
-export function useStartBackfill() {
-  const qc = useQueryClient();
-  return useMutation<{ run_id: number }, Error, { history_years?: number } | void>({
-    mutationFn: (body) =>
-      api<{ run_id: number }>('/admin/backfill/start', {
-        method: 'POST',
-        body: JSON.stringify(body ?? {}),
-      }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['backfill-status'] });
-    },
-  });
-}
-
 export function useStopBackfill() {
   const qc = useQueryClient();
   return useMutation<unknown, Error, void>({
@@ -44,6 +30,29 @@ export function useStopBackfill() {
     },
   });
 }
+
+export function usePendingCount(refetchInterval = 60_000) {
+  return useQuery<{ new: number; stale: number; up_to_date: number; error: number; total: number }>({
+    queryKey: ['backfill-pending'],
+    queryFn: () => api<any>('/admin/backfill/pending'),
+    refetchInterval,
+  });
+}
+
+export function useForceReset() {
+  const qc = useQueryClient();
+  return useMutation<{ deleted_rows: number }, Error, void>({
+    mutationFn: () => api<{ deleted_rows: number }>('/admin/backfill/force-reset', {
+      method: 'POST',
+      body: '{}',
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['backfill-pending'] });
+      qc.invalidateQueries({ queryKey: ['backfill-status'] });
+    },
+  });
+}
+
 
 type BackfillEvent = {
   type: string;
@@ -122,11 +131,11 @@ export function useBackfillEvents() {
 
 export function BackfillTab() {
   const status = useBackfillStatus();
-  const start = useStartBackfill();
+  const pending = usePendingCount();
+  const reset = useForceReset();
   const stop = useStopBackfill();
   const { events, connected } = useBackfillEvents();
-  const [showStartDialog, setShowStartDialog] = useState(false);
-  const [historyYears, setHistoryYears] = useState(5);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
 
   const running =
     status.data?.state === 'running' ||
@@ -161,23 +170,38 @@ export function BackfillTab() {
             <p className="text-xs text-[var(--muted-foreground)] mt-1">{pct}% complete</p>
           </div>
         )}
-        <div className="mt-4 flex gap-2">
+        <div className="mt-4 flex flex-wrap items-center gap-2">
+          <p className="text-sm text-[var(--muted-foreground)]">
+            {running
+              ? 'Backfill in progress — the daily 02:00 MSK scheduler is the primary trigger.'
+              : pending.data && (pending.data.new + pending.data.stale + pending.data.error) > 0
+                ? `${pending.data.new + pending.data.stale + pending.data.error} tickers pending — the daily 02:00 MSK scheduler will fetch them.`
+                : 'All tickers are up to date. Daily 02:00 MSK scheduler is the primary trigger.'}
+          </p>
+        </div>
+        <div className="mt-3 grid grid-cols-4 gap-2 text-xs">
+          <Stat label="New tickers" value={String(pending.data?.new ?? 0)} />
+          <Stat label="Stale (>2 days)" value={String(pending.data?.stale ?? 0)} />
+          <Stat label="Up to date" value={String(pending.data?.up_to_date ?? 0)} />
+          <Stat label="Errored" value={String(pending.data?.error ?? 0)} />
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
           <button
-            disabled={running || start.isPending}
-            onClick={() => setShowStartDialog(true)}
-            className="rounded bg-[var(--accent)] px-3 py-1.5 text-sm disabled:opacity-50"
-          >
-            Start backfill
-          </button>
-          <button
-            disabled={!running || stop.isPending}
+            disabled={!running}
             onClick={() => stop.mutate()}
             className="rounded border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
           >
-            Stop
+            Stop current run
           </button>
-          {start.isError && (
-            <p className="text-sm text-red-400 self-center">{(start.error as Error).message}</p>
+          <button
+            disabled={reset.isPending}
+            onClick={() => setShowResetConfirm(true)}
+            className="rounded border border-[var(--border)] px-3 py-1.5 text-sm text-red-400 disabled:opacity-50"
+          >
+            Reset metadata (force full re-fetch)
+          </button>
+          {reset.isError && (
+            <p className="text-sm text-red-400 self-center">{reset.error.message}</p>
           )}
         </div>
       </section>
@@ -214,41 +238,34 @@ export function BackfillTab() {
         </div>
       </section>
 
-      {/* Confirm dialog */}
-      {showStartDialog && (
+      {/* Reset metadata confirmation dialog */}
+      {showResetConfirm && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-[var(--card)] border border-[var(--border)] rounded-lg p-6 max-w-md">
-            <h3 className="text-lg font-semibold mb-2">Start backfill?</h3>
+            <h3 className="text-lg font-semibold mb-2">Force full re-backfill?</h3>
             <p className="text-sm text-[var(--muted-foreground)] mb-4">
-              Will fetch up to N years of daily bars for every MOEX instrument from the broker
-              sandbox. Rate-limited at 14 req/min; 250 tickers take ~17 minutes.
+              This wipes every <code className="text-xs">instrument_metadata</code> row, so the next
+              scheduled run (and any subsequent manual trigger) will re-fetch the full
+              history for all {pending.data?.total ?? '?'} instruments. Use this only after a
+              corporate action that restated the series, or if you suspect on-disk bars are
+              corrupt. Routine maintenance is automatic — the daily 02:00 MSK scheduler
+              catches new tickers and stale ones without manual intervention.
             </p>
-            <label className="block text-sm mb-2">
-              History (years):
-              <input
-                type="number"
-                min={1}
-                max={10}
-                value={historyYears}
-                onChange={(e) => setHistoryYears(Number(e.target.value))}
-                className="ml-2 w-16 rounded border border-[var(--border)] bg-[var(--background)] px-2 py-1"
-              />
-            </label>
             <div className="flex justify-end gap-2">
               <button
-                onClick={() => setShowStartDialog(false)}
+                onClick={() => setShowResetConfirm(false)}
                 className="rounded border border-[var(--border)] px-3 py-1.5 text-sm"
               >
                 Cancel
               </button>
               <button
                 onClick={() => {
-                  start.mutate({ history_years: historyYears });
-                  setShowStartDialog(false);
+                  reset.mutate();
+                  setShowResetConfirm(false);
                 }}
-                className="rounded bg-[var(--accent)] px-3 py-1.5 text-sm"
+                className="rounded bg-red-500 px-3 py-1.5 text-sm text-white"
               >
-                Start
+                Reset metadata
               </button>
             </div>
           </div>

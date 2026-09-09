@@ -395,3 +395,211 @@ def test_last_run_summary_returns_none_when_query_raises(data_dir, monkeypatch):
     monkeypatch.setattr(routes_bf, "_exec", boom)
     out = _last_run_summary(db)
     assert out is None
+
+
+def test_pending_count_returns_zero_when_no_db(tmp_path):
+    """When state.db doesn't exist, pending = zeros."""
+    from algotrader_api.routes.backfill import _pending_count
+
+    out = _pending_count(str(tmp_path / "nope.db"))
+    assert out == {"new": 0, "stale": 0, "up_to_date": 0, "error": 0, "total": 0}
+
+
+def test_pending_count_classifies_tickers(tmp_path):
+    """Ticker with no metadata → 'new'; recent ok → 'up_to_date'; old → 'stale'."""
+    import sqlite3
+    from datetime import date, timedelta
+
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(str(db))
+    con.execute(
+        """CREATE TABLE instruments (
+            figi TEXT PRIMARY KEY, class TEXT
+        )"""
+    )
+    con.execute(
+        """CREATE TABLE instrument_metadata (
+            figi TEXT PRIMARY KEY,
+            last_bar_ts TEXT,
+            last_run_at TEXT,
+            total_bars INTEGER,
+            last_run_status TEXT,
+            last_error TEXT
+        )"""
+    )
+    today = date.today()
+    yesterday = (today - timedelta(days=1)).isoformat()
+    week_ago = (today - timedelta(days=10)).isoformat()
+    # 1) New ticker (no metadata)
+    con.execute("INSERT INTO instruments VALUES ('BBG001', 'share')")
+    # 2) Up-to-date ticker (yesterday, ok)
+    con.execute("INSERT INTO instruments VALUES ('BBG002', 'share')")
+    con.execute(
+        "INSERT INTO instrument_metadata VALUES ('BBG002', ?, ?, 252, 'ok', NULL)",
+        (yesterday, today.isoformat()),
+    )
+    # 3) Stale ticker (week ago, ok)
+    con.execute("INSERT INTO instruments VALUES ('BBG003', 'share')")
+    con.execute(
+        "INSERT INTO instrument_metadata VALUES ('BBG003', ?, ?, 252, 'ok', NULL)",
+        (week_ago, today.isoformat()),
+    )
+    # 4) Error ticker
+    con.execute("INSERT INTO instruments VALUES ('BBG004', 'share')")
+    con.execute(
+        "INSERT INTO instrument_metadata VALUES ('BBG004', NULL, ?, 0, 'error', 'fail')",
+        (today.isoformat(),),
+    )
+    con.commit()
+    con.close()
+
+    from algotrader_api.routes.backfill import _pending_count
+
+    out = _pending_count(str(db), incremental_threshold_days=2)
+    assert out["total"] == 4
+    assert out["new"] == 1
+    assert out["up_to_date"] == 1
+    assert out["stale"] == 1
+    assert out["error"] == 1
+
+
+def test_pending_endpoint_returns_breakdown(data_dir, fresh_db):
+    """GET /backfill/pending returns the per-class counts as JSON."""
+    import sqlite3
+
+    db = f"{data_dir}/state.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO instruments (figi, class, name, currency, lot_size) "
+        "VALUES ('BBG001', 'share', 'Test', 'RUB', 1)"
+    )
+    con.commit()
+    con.close()
+
+    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.main import create_app
+    from fastapi.testclient import TestClient
+
+    sqlitedb.close_all()
+    duck.close()
+    app = create_app()
+    with TestClient(app) as c:
+        r = c.get("/api/admin/backfill/pending")
+    assert r.status_code == 200
+    body = r.json()
+    assert "new" in body and "total" in body
+    assert body["total"] >= 1
+    assert body["new"] >= 1
+    sqlitedb.close_all()
+    duck.close()
+
+
+def test_force_reset_clears_metadata(data_dir):
+    """POST /backfill/force-reset wipes instrument_metadata rows."""
+    import sqlite3
+
+    db = f"{data_dir}/state.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO instrument_metadata (figi, last_bar_ts, last_run_status) "
+        "VALUES ('BBG001', '2026-01-01', 'ok')"
+    )
+    con.commit()
+    con.close()
+
+    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.main import create_app
+    from fastapi.testclient import TestClient
+
+    sqlitedb.close_all()
+    duck.close()
+    app = create_app()
+    with TestClient(app) as c:
+        r = c.post("/api/admin/backfill/force-reset")
+    assert r.status_code == 200
+    assert r.json()["deleted_rows"] == 1
+    # Verify the row is gone.
+    con = sqlite3.connect(db)
+    n = con.execute("SELECT COUNT(*) FROM instrument_metadata").fetchone()[0]
+    con.close()
+    assert n == 0
+    sqlitedb.close_all()
+    duck.close()
+
+
+def test_force_reset_succeeds_when_no_metadata_rows(data_dir):
+    """POST /backfill/force-reset returns 0 deleted when metadata is empty."""
+    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.main import create_app
+    from fastapi.testclient import TestClient
+
+    sqlitedb.close_all()
+    duck.close()
+    app = create_app()
+    with TestClient(app) as c:
+        r = c.post("/api/admin/backfill/force-reset")
+    assert r.status_code == 200
+    assert r.json()["deleted_rows"] == 0
+    sqlitedb.close_all()
+    duck.close()
+
+
+def test_pending_count_handles_garbage_date_string(data_dir, fresh_db):
+    """last_bar_ts is unparseable → counted as 'new' (force re-fetch)."""
+    import sqlite3
+    from datetime import date
+
+    db = f"{data_dir}/state.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO instruments (figi, class, name, currency, lot_size) "
+        "VALUES ('BBG001', 'share', 'Test', 'RUB', 1)"
+    )
+    con.execute(
+        "INSERT INTO instrument_metadata (figi, last_bar_ts, last_run_status) "
+        "VALUES ('BBG001', 'not a date', 'ok')"
+    )
+    con.commit()
+    con.close()
+
+    from algotrader_api.routes.backfill import _pending_count
+
+    out = _pending_count(db, incremental_threshold_days=2)
+    assert out["new"] == 1
+    assert out["total"] == 1
+
+
+def test_pending_count_handles_sqlite_error(tmp_path, monkeypatch):
+    """If _exec raises sqlite3.Error, return zeros (don't crash)."""
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    monkeypatch.setattr("algotrader_api.routes.backfill._exec",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            sqlite3.Error("simulated query failure")
+                        ))
+    from algotrader_api.routes.backfill import _pending_count
+
+    out = _pending_count(str(db))
+    assert out == {"new": 0, "stale": 0, "up_to_date": 0, "error": 0, "total": 0}
+
+
+def test_settings_incremental_threshold_returns_default_when_missing(monkeypatch):
+    """When the field is not on Settings, return 2."""
+    from algotrader_api.routes.backfill import _settings_incremental_threshold
+
+    class _NoSettings:
+        pass
+
+    monkeypatch.setattr("algotrader_api.routes.backfill.get_settings", lambda: _NoSettings())
+    assert _settings_incremental_threshold() == 2
+
+
+def test_settings_incremental_threshold_returns_default_when_settings_raises(monkeypatch):
+    """When get_settings() raises, fall back to 2."""
+    from algotrader_api.routes.backfill import _settings_incremental_threshold
+
+    def boom():
+        raise RuntimeError("boom")
+    monkeypatch.setattr("algotrader_api.routes.backfill.get_settings", boom)
+    assert _settings_incremental_threshold() == 2

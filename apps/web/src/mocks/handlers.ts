@@ -226,4 +226,34 @@ export const handlers = [
       { headers: { 'content-type': 'text/event-stream' } },
     ),
   ),
+
+  // Backfill scheduler-mode helpers — match the backend so dev-mode UI
+  // shows realistic pending counts and the reset button works.
+  http.get('/api/admin/backfill/pending', () => {
+    // Default to all zeros; tests can seed localStorage to override.
+    let stored: Record<string, unknown> = {};
+    try {
+      const raw = localStorage.getItem('algotrader.mock_backfill_state');
+      if (raw) stored = JSON.parse(raw);
+    } catch {
+      stored = {};
+    }
+    return HttpResponse.json({
+      new: 0,
+      stale: 0,
+      up_to_date: Number(stored.tickers_total ?? 0),
+      error: 0,
+      total: Number(stored.tickers_total ?? 0),
+    });
+  }),
+
+  http.post('/api/admin/backfill/force-reset', () => {
+    try {
+      localStorage.removeItem('algotrader.mock_backfill_state');
+    } catch {
+      /* ignore */
+    }
+    return HttpResponse.json({ deleted_rows: 0, next_run: 'full backfill of all instruments' });
+  }),
+
 ];
