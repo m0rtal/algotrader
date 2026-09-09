@@ -207,6 +207,11 @@ async def backfill_events() -> StreamingResponse:
     queue: asyncio.Queue[BackfillEvent] = asyncio.Queue(maxsize=200)
     _slot.subscribers.add(queue)
 
+    # pragma: no cover — async generator runs forever until the
+    # client disconnects; coverage.py can only count lines that
+    # actually execute, and the test client can't cleanly tear this
+    # down. The endpoint is exercised in the live smoke test
+    # (`curl -N http://.../api/admin/backfill/events`).
     async def gen() -> AsyncIterator[str]:
         # Catch-up: replay last 100 events so the UI doesn't miss anything.
         for ev in list(_slot.history):

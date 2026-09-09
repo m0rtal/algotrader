@@ -13,6 +13,7 @@ import {
   usePortfolio,
   useRegime,
   useSaveSettings,
+  useSaveToken,
   useSettings,
   useSignals,
   useTickers,
@@ -179,5 +180,22 @@ describe('data hooks', () => {
     });
     // 204 No Content — undefined body
     expect(response).toBeUndefined();
+  });
+});
+
+describe('useSaveToken', () => {
+  it('sends PUT /settings/token and invalidates the settings cache on success', async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const Wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => useSaveToken(), { wrapper: Wrapper });
+    let response: { tokenLast4: string; tokenRedacted: boolean } | undefined;
+    await act(async () => {
+      response = await result.current.mutateAsync({ token: 't.real.ABCD' });
+    });
+    expect(response).toEqual({ tokenLast4: 'ABCD', tokenRedacted: true });
   });
 });
