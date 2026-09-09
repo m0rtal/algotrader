@@ -153,24 +153,29 @@ async def test_sandbox_get_candles_returns_ohlcv_rows():
 
 
 @pytest.mark.asyncio
-async def test_sandbox_token_in_db_is_used_by_real_client():
-    """End-to-end: write a known (but bogus) token to DB, watch the wrapper reject.
+async def test_sandbox_token_in_db_is_used_by_real_client(tmp_path, monkeypatch):
+    """End-to-end: write a token to a private DB, watch the wrapper pick it up.
 
-    We can't use the real token here without leaking it into logs; instead,
-    write a token, construct a client, and assert it doesn't raise on
-    construction. The token value is the SDK's problem; the wrapper just
-    forwards it.
+    We don't actually call the network here — we just verify the wrapper
+    constructs successfully when the token is whatever's in the DB. The
+    sandbox tests above exercise the real network path.
+
+    Uses a tmp_path-scoped DB so this test never touches the application's
+    state.db (which holds the user's real token).
     """
-    from algotrader_api.config import get_settings
-    from algotrader_api.db.secrets import set_secret as _set
+    import sqlite3
+
+    from algotrader_api.db.secrets import get_broker_token
     from algotrader_api.ingestion.real_client import RealTinkoffClient
 
-    # We don't actually call the network here — we just verify the wrapper
-    # constructs successfully when the token is whatever's in the DB. The
-    # sandbox tests above exercise the real network path.
-    db = get_settings().sqlite_path
-    _set(db, "broker_token", "t.synthetic.check")
-    from algotrader_api.db.secrets import get_broker_token
+    db = str(tmp_path / "state.db")
+    # Direct: just create the secrets table (skip migrations — we
+    # only need the secrets row for this test).
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE IF NOT EXISTS secrets (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT INTO secrets (key, value) VALUES (?, ?)", ("broker_token", "t.synthetic.check"))
+    con.commit()
+    con.close()
 
     token = get_broker_token(db)
     assert token == "t.synthetic.check"
