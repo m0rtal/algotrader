@@ -9,7 +9,6 @@ import { Topbar } from '@components/layout/Topbar';
 import { KPIStr } from '@components/layout/KPIStr';
 import { Sidebar } from '@components/layout/Sidebar';
 import { RightRail } from '@components/layout/RightRail';
-import { LogStrip } from '@components/layout/LogStrip';
 import { TickerDrilldown } from '@components/charts/TickerDrilldown';
 
 const TABS: { id: TabId; label: string }[] = [
@@ -52,7 +51,7 @@ export function Dashboard() {
               </button>
             ))}
           </div>
-          <div className="flex-1 overflow-y-auto overflow-x-hidden min-h-0">
+          <div className="flex-1 overflow-y-auto overflow-x-hidden min-h-0 pb-10">
             {active === 'signals' && <SignalsTab />}
             {active === 'trades' && <TradesTab />}
             {active === 'portfolio' && <PortfolioTab />}
@@ -66,7 +65,6 @@ export function Dashboard() {
           <RightRail />
         </aside>
       </div>
-      <LogStrip />
       <TickerDrilldown />
     </div>
   );

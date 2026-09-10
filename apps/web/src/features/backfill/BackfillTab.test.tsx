@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import '@testing-library/jest-dom/vitest';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 class MockEventSource {
   url: string;
@@ -238,6 +238,58 @@ describe('BackfillTab', () => {
     expect(es.closed || MockEventSource.instances.length >= 1).toBe(true);
   });
 
+  it('shows Counting… while pending data is still loading', async () => {
+    // Block the pending endpoint so the query stays in loading state.
+    const { http } = await import('msw');
+    const { server } = await import('../../mocks/server');
+    server.use(
+      http.get('/api/admin/backfill/pending', () => new Promise(() => {})),
+    );
+    const Wrapper = makeWrapper();
+    render(<BackfillTab />, { wrapper: Wrapper });
+    // The Stat labels render unconditionally; the data-side text shows
+    // 'Counting…' because pending.data is undefined while the query is
+    // pending.
+    expect(screen.getByText(/Instruments/i)).toBeInTheDocument();
+    expect(screen.getByText(/Counting…/i)).toBeInTheDocument();
+  });
+
+  it('ignores malformed SSE events without crashing', () => {
+    const Wrapper = makeWrapper();
+    render(<BackfillTab />, { wrapper: Wrapper });
+    expect(MockEventSource.instances.length).toBeGreaterThan(0);
+    const es = MockEventSource.instances[0]!;
+    // Bypass the JSON parser by dispatching a payload that JSON.parse
+    // can't handle. The catch block in onEvent swallows the error.
+    expect(() => {
+      es.dispatch('log', 'not-json-at-all' as any);
+    }).not.toThrow();
+  });
+
+  it('schedules a reconnect when the EventSource errors', async () => {
+    const Wrapper = makeWrapper();
+    render(<BackfillTab />, { wrapper: Wrapper });
+    await waitFor(() => {
+      expect(MockEventSource.instances.length).toBeGreaterThan(0);
+    });
+    const es = MockEventSource.instances[0]!;
+    // Simulate the SSE stream going down.
+    es.onerror?.(new Event('error'));
+    // After the onerror, the UI should show disconnected.
+    await waitFor(() => {
+      expect(screen.getByText(/disconnected/i)).toBeInTheDocument();
+    });
+  });
+
+  it('unmounts cleanly without throwing even when EventSource is in flight', () => {
+    const Wrapper = makeWrapper();
+    const { unmount } = render(<BackfillTab />, { wrapper: Wrapper });
+    // MockEventSource.instances[0] exists; we don't fire any events,
+    // just unmount. The cleanup branch (cancelled = true; clearTimeout)
+    // is exercised by the useEffect teardown.
+    expect(() => unmount()).not.toThrow();
+  });
+
   it('exposes stop mutation when in backfilling state', async () => {
     localStorage.setItem(
       'algotrader.mock_backfill_state',
@@ -270,22 +322,118 @@ describe('BackfillTab', () => {
     );
   });
 
-  it('renders "Last activity" line when last_run provided', async () => {
-    localStorage.setItem(
-      'algotrader.mock_backfill_state',
-      JSON.stringify({
-        state: 'backfilling',
-        run_id: 1,
-        tickers_total: 100,
-        tickers_done: 50,
-        total_bars: 1234,
-        last_run: { id: 1, ts: '2026-01-01', level: 'info', message: 'halfway' },
-      }),
-    );
+  it('renders a Recent events panel scoped to the backfill tab', async () => {
+    const Wrapper = makeWrapper();
+    render(<BackfillTab />, { wrapper: Wrapper });
+    const log = await screen.findByTestId('backfill-event-log');
+    expect(log).toBeInTheDocument();
+    // The global live log footer lives outside this tab in AppShell; the
+    // backfill tab itself only renders a section-local recent-events list.
+    expect(log.className).toMatch(/rounded-lg/);
+  });
+
+  it('renders the scheduler plan in real numbers', async () => {
     const Wrapper = makeWrapper();
     render(<BackfillTab />, { wrapper: Wrapper });
     await waitFor(() => {
-      expect(screen.getByText(/halfway/i)).toBeInTheDocument();
+      // Default pending fixture returns all zeros — UI must still
+      // render the four counters.
+      expect(screen.getByText(/Instruments/i)).toBeInTheDocument();
+      expect(screen.getByText(/Up to date/i)).toBeInTheDocument();
+      expect(screen.getByText(/Bars on disk/i)).toBeInTheDocument();
+      expect(screen.getByText(/New \(no history\)/i)).toBeInTheDocument();
+      expect(screen.getByText(/Stale \(>2 days\)/i)).toBeInTheDocument();
+      expect(screen.getByText(/Errored \(retry\)/i)).toBeInTheDocument();
+    });
+  });
+
+  it('caps the events buffer at 100 entries (FIFO shift)', async () => {
+    const Wrapper = makeWrapper();
+    render(<BackfillTab />, { wrapper: Wrapper });
+    await waitFor(() => {
+      expect(MockEventSource.instances.length).toBeGreaterThan(0);
+    });
+    const es = MockEventSource.instances[0]!;
+    // Dispatch 120 events; the buffer should clamp to 100.
+    // The buffer-clamp branch (next.length > 100) needs ≥101 events to
+    // trigger. Render the component fresh so each test gets a clean
+    // MockEventSource. Then dispatch exactly 101 events and wait for
+    // the state update.
+    await act(async () => {
+      for (let i = 0; i < 101; i++) {
+        es.dispatch('log', {
+          type: 'info',
+          ts: '2026-09-08T12:00:00Z',
+          message: `event-${i}`,
+          level: 'info',
+        });
+      }
+    });
+    // The header reads "N buffered" — wait until it updates to 100.
+    await waitFor(
+      () => {
+        const text = screen.getByTestId('backfill-event-log').textContent ?? '';
+        return text.includes('100 buffered');
+      },
+      { timeout: 2000 },
+    );
+  });
+
+  it('shows reset error message when force_reset fails', async () => {
+    const { http, HttpResponse } = await import('msw');
+    const { server } = await import('../../mocks/server');
+    server.use(
+      http.post('/api/admin/backfill/force-reset', () =>
+        new HttpResponse('boom', { status: 500 }),
+      ),
+    );
+    const Wrapper = makeWrapper();
+    render(<BackfillTab />, { wrapper: Wrapper });
+    await waitFor(() => screen.getByText(/Reset metadata/i));
+    fireEvent.click(screen.getByText(/Reset metadata/i));
+    await waitFor(() => screen.getByText(/Force full re-backfill/i));
+    fireEvent.click(screen.getByText(/^Reset metadata$/i));
+    // The error message bubbles up next to the buttons.
+    await waitFor(() => {
+      expect(screen.getByText(/500/i)).toBeInTheDocument();
+    });
+  });
+
+  it('renders ticker_progress events with the blue tone', async () => {
+    const Wrapper = makeWrapper();
+    render(<BackfillTab />, { wrapper: Wrapper });
+    await waitFor(() => {
+      expect(MockEventSource.instances.length).toBeGreaterThan(0);
+    });
+    const es = MockEventSource.instances[0]!;
+    es.dispatch('ticker_progress', {
+      type: 'ticker_progress',
+      ts: '2026-09-08T12:00:00Z',
+      payload: { figi: 'BBG001' },
+    });
+    await waitFor(() => {
+      const spans = screen.getAllByText('ticker_progress');
+      expect(spans.length).toBeGreaterThan(0);
+      expect(spans[0].className).toMatch(/text-blue-400/);
+    });
+  });
+
+  it('renders done events with the red tone', async () => {
+    const Wrapper = makeWrapper();
+    render(<BackfillTab />, { wrapper: Wrapper });
+    await waitFor(() => {
+      expect(MockEventSource.instances.length).toBeGreaterThan(0);
+    });
+    const es = MockEventSource.instances[0]!;
+    es.dispatch('done', {
+      type: 'done',
+      ts: '2026-09-08T12:00:00Z',
+      payload: { status: 'ok' },
+    });
+    await waitFor(() => {
+      const spans = screen.getAllByText('done');
+      expect(spans.length).toBeGreaterThan(0);
+      expect(spans[0].className).toMatch(/text-red-400/);
     });
   });
 

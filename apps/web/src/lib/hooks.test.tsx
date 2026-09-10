@@ -183,6 +183,33 @@ describe('data hooks', () => {
   });
 });
 
+describe('useSettings — 404 fallback (defensive default)', () => {
+  it('returns DEFAULT_SETTINGS when /settings responds 404', async () => {
+    const { http, HttpResponse } = await import('msw');
+    const { server } = await import('../mocks/server');
+    // Override the default /settings handler with a 404.
+    server.use(
+      http.get('/api/settings', () =>
+        new HttpResponse('not found', { status: 404 }),
+      ),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const { result } = renderHook(() => useSettings(), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    // Wait until the query settles (isError stays false because the
+    // hook swallows the 404 and returns DEFAULT_SETTINGS).
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.isError).toBe(false);
+    expect(result.current.data).toBeDefined();
+    expect(result.current.data?.values).toBeDefined();
+  });
+});
+
 describe('useSaveToken', () => {
   it('sends PUT /settings/token and invalidates the settings cache on success', async () => {
     const client = new QueryClient({

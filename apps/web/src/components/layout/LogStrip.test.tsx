@@ -50,4 +50,34 @@ describe('LogStrip', () => {
       expect(container.querySelectorAll('.text-green').length).toBeGreaterThan(0);
     });
   });
+
+  it('renders the err-tone class on error log entries', async () => {
+    const Wrapper = makeWrapper();
+    const { container } = render(
+      <Wrapper>
+        <LogStrip />
+      </Wrapper>,
+    );
+    await waitFor(() => {
+      expect(container.querySelector('.text-red')).toBeTruthy();
+    });
+  });
+
+  it('renders nothing while the logs query is still loading', async () => {
+    // Force the query to never resolve; the strip should return null
+    // instead of an empty container.
+    const { http } = await import('msw');
+    const { server } = await import('../../mocks/server');
+    server.use(
+      http.get('/api/logs', () => new Promise(() => {})),
+    );
+    const Wrapper = makeWrapper();
+    const { container } = render(
+      <Wrapper>
+        <LogStrip />
+      </Wrapper>,
+    );
+    // The query is in flight → data is undefined → component returns null.
+    expect(container.firstChild).toBeNull();
+  });
 });

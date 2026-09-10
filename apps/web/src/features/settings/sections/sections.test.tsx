@@ -466,6 +466,70 @@ describe('RiskSection', () => {
     expect(handleChange).toHaveBeenCalledWith({ maxDrawdownPct: 25 });
   });
 
+  it('shows validation error for position size below minimum', () => {
+    const bad: RiskSettings = { ...risk, maxPositionSizePct: 0 };
+    render(
+      <RiskSection
+        values={bad}
+        onChange={() => {}}
+        onSave={() => {}}
+        saving={false}
+        dirty={false}
+      />,
+    );
+    expect(screen.getByText(/Минимум 1%/)).toBeInTheDocument();
+  });
+
+  it('shows validation error for position size above maximum', () => {
+    const bad: RiskSettings = { ...risk, maxPositionSizePct: 999 };
+    render(
+      <RiskSection
+        values={bad}
+        onChange={() => {}}
+        onSave={() => {}}
+        saving={false}
+        dirty={false}
+      />,
+    );
+    expect(screen.getByText(/Максимум 100%/)).toBeInTheDocument();
+  });
+
+  it('shows validation error for kill switch threshold below minimum', () => {
+    const enabled: RiskSettings = {
+      ...risk,
+      killSwitchEnabled: true,
+      killSwitchThresholdPct: -1,
+    };
+    render(
+      <RiskSection
+        values={enabled}
+        onChange={() => {}}
+        onSave={() => {}}
+        saving={false}
+        dirty={false}
+      />,
+    );
+    expect(screen.getByText(/Минимум 1%/)).toBeInTheDocument();
+  });
+
+  it('shows validation error for kill switch threshold above maximum', () => {
+    const enabled: RiskSettings = {
+      ...risk,
+      killSwitchEnabled: true,
+      killSwitchThresholdPct: 999,
+    };
+    render(
+      <RiskSection
+        values={enabled}
+        onChange={() => {}}
+        onSave={() => {}}
+        saving={false}
+        dirty={false}
+      />,
+    );
+    expect(screen.getByText(/Максимум 50%/)).toBeInTheDocument();
+  });
+
   it('shows validation error for out-of-range drawdown', () => {
     const bad: RiskSettings = { ...risk, maxDrawdownPct: 100 };
     render(

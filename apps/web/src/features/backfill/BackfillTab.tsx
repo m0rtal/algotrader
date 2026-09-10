@@ -150,42 +150,59 @@ export function BackfillTab() {
 
   return (
     <div className="flex flex-col gap-6 p-6">
-      {/* Status */}
-      <section className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4">
-        <h2 className="text-lg font-semibold mb-3">Backfill</h2>
-        <div className="grid grid-cols-4 gap-4 text-sm">
-          <Stat label="State" value={status.data?.state ?? '…'} />
-          <Stat
-            label="Tickers"
-            value={status.data ? `${status.data.tickers_done} / ${status.data.tickers_total}` : '…'}
-          />
-          <Stat label="Bars written" value={String(status.data?.total_bars ?? 0)} />
-          <Stat label="Last run" value={status.data?.last_run?.message ?? '—'} />
+      {/* Top: data + scheduler plan */}
+      <section className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4 space-y-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold">Backfill</h2>
+          <span className="text-xs text-[var(--muted-foreground)]">
+            Daily 02:00 MSK scheduler
+          </span>
         </div>
+
+        <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
+          <Stat label="Instruments" value={String(pending.data?.total ?? '…')} />
+          <Stat label="Up to date" value={String(pending.data?.up_to_date ?? 0)} />
+          <Stat label="Bars on disk" value={String(status.data?.total_bars ?? 0)} />
+          <Stat label="State" value={status.data?.state ?? '…'} />
+        </div>
+
+        <div>
+          <h3 className="text-sm font-medium mb-2">Next run will fetch</h3>
+          {pending.data && (pending.data.new + pending.data.stale + pending.data.error) === 0 ? (
+            <p className="text-sm text-green-400">
+              All {pending.data.total} tickers are up to date. The scheduler has nothing to do.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-[var(--muted-foreground)] mb-2">
+                {pending.data
+                  ? `${pending.data.new + pending.data.stale + pending.data.error} of ${pending.data.total} tickers need attention.`
+                  : 'Counting…'}
+              </p>
+              <div className="grid grid-cols-3 gap-2 text-xs">
+                <Stat label="New (no history)" value={String(pending.data?.new ?? 0)} />
+                <Stat label="Stale (>2 days)" value={String(pending.data?.stale ?? 0)} />
+                <Stat label="Errored (retry)" value={String(pending.data?.error ?? 0)} />
+              </div>
+            </>
+          )}
+        </div>
+
         {status.data && status.data.tickers_total > 0 && (
-          <div className="mt-3">
+          <div>
+            <div className="flex items-center justify-between text-xs text-[var(--muted-foreground)] mb-1">
+              <span>Active run</span>
+              <span>
+                {status.data.tickers_done} / {status.data.tickers_total} tickers ({pct}%)
+              </span>
+            </div>
             <div className="h-2 w-full rounded bg-[var(--muted)] overflow-hidden">
               <div className="h-2 bg-[var(--accent)] transition-all" style={{ width: `${pct}%` }} />
             </div>
-            <p className="text-xs text-[var(--muted-foreground)] mt-1">{pct}% complete</p>
           </div>
         )}
-        <div className="mt-4 flex flex-wrap items-center gap-2">
-          <p className="text-sm text-[var(--muted-foreground)]">
-            {running
-              ? 'Backfill in progress — the daily 02:00 MSK scheduler is the primary trigger.'
-              : pending.data && (pending.data.new + pending.data.stale + pending.data.error) > 0
-                ? `${pending.data.new + pending.data.stale + pending.data.error} tickers pending — the daily 02:00 MSK scheduler will fetch them.`
-                : 'All tickers are up to date. Daily 02:00 MSK scheduler is the primary trigger.'}
-          </p>
-        </div>
-        <div className="mt-3 grid grid-cols-4 gap-2 text-xs">
-          <Stat label="New tickers" value={String(pending.data?.new ?? 0)} />
-          <Stat label="Stale (>2 days)" value={String(pending.data?.stale ?? 0)} />
-          <Stat label="Up to date" value={String(pending.data?.up_to_date ?? 0)} />
-          <Stat label="Errored" value={String(pending.data?.error ?? 0)} />
-        </div>
-        <div className="mt-4 flex flex-wrap gap-2">
+
+        <div className="flex flex-wrap gap-2">
           <button
             disabled={!running}
             onClick={() => stop.mutate()}
@@ -206,37 +223,52 @@ export function BackfillTab() {
         </div>
       </section>
 
-      {/* Logs */}
-      <section className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4">
+      {/* Events — the global LogStrip at the bottom of the viewport
+          already shows recent system events including this tab's
+          backfill run logs (see AppShell for the footer mounting). */}
+      <div
+        data-testid="backfill-event-log"
+        className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4"
+      >
         <div className="flex items-center justify-between mb-3">
-          <h2 className="text-lg font-semibold">Logs</h2>
+          <h2 className="text-lg font-semibold">Recent events</h2>
           <span className={'text-xs ' + (connected ? 'text-green-400' : 'text-zinc-500')}>
-            {connected ? '● connected' : '○ disconnected'}
+            {connected ? '● live (SSE)' : '○ disconnected'}
           </span>
         </div>
-        <div className="font-mono text-xs max-h-96 overflow-y-auto bg-[var(--background)] rounded p-3 space-y-1">
+        <div
+          data-testid="event-log-list"
+          className="font-mono text-xs max-h-96 overflow-y-auto bg-[var(--background)] rounded p-3 space-y-1"
+        >
           {events.length === 0 && (
-            <p className="text-[var(--muted-foreground)]">Waiting for events…</p>
+            <p className="text-[var(--muted-foreground)]">
+              Waiting for events from the next scheduler run… The global log
+              footer at the bottom of every page shows system-wide activity.
+            </p>
           )}
           {[...events].reverse().map((ev, i) => (
             <div key={`${ev.ts ?? i}-${i}`} className="flex gap-2">
-              <span className="text-[var(--muted-foreground)] shrink-0">{(ev.ts ?? '').slice(11, 19)}</span>
+              <span className="text-[var(--muted-foreground)] shrink-0 font-mono w-14">
+                {(ev.ts ?? '').slice(11, 19)}
+              </span>
               <span
                 className={
                   ev.type === 'error' || ev.type === 'done'
-                    ? 'text-red-400'
+                    ? 'text-red-400 shrink-0 w-32'
                     : ev.type === 'ticker_progress'
-                      ? 'text-blue-400'
-                      : 'text-zinc-300'
+                      ? 'text-blue-400 shrink-0 w-32'
+                      : 'text-zinc-300 shrink-0 w-32'
                 }
               >
                 {ev.type}
               </span>
-              <span className="truncate">{JSON.stringify(ev.payload).slice(0, 200)}</span>
+              <span className="truncate">
+                {JSON.stringify(ev.payload ?? {}).slice(0, 200)}
+              </span>
             </div>
           ))}
         </div>
-      </section>
+      </div>
 
       {/* Reset metadata confirmation dialog */}
       {showResetConfirm && (

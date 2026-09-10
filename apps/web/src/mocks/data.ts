@@ -735,6 +735,7 @@ export const logs = [
     text: 'broker.py · dry-run (sandbox) · 12 orders queued',
   },
   { ts: '19:34:25', tone: 'ok' as const, text: 'pipeline ok · next run 2026-09-07 19:30 МСК' },
+  { ts: '19:34:30', tone: 'err' as const, text: 'broker.py · rejected: insufficient margin' },
 ] as const;
 
 // ─── Settings (mock) ──────────────────────────────────────────────
