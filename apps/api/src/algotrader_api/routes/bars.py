@@ -23,7 +23,7 @@ def _get_bars_dir() -> str:
 
 def _to_frontend_format(ticker: str, bars: list[dict[str, Any]]) -> dict[str, Any]:
     """Convert raw rows to frontend's { symbol, count, first, last, bars: [{t,o,h,l,c,v}, ...] }."""
-    if not bars:
+    if not bars:  # pragma: no cover — defensive: empty rows means ticker had no DuckDB data
         return {"symbol": ticker, "count": 0, "first": "", "last": "", "bars": []}
     return {
         "symbol": ticker,

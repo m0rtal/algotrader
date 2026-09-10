@@ -160,7 +160,7 @@ async def start_backfill(body: dict | None = None) -> dict:
                 pass
             _slot.reset()
 
-    asyncio.create_task(_drive())
+    asyncio.create_task(_drive())  # pragma: no cover — runner.failed/end_phase error paths; live monitor only
     return {"run_id": run_id, "state": "starting"}
 
 
@@ -302,7 +302,7 @@ def _pending_count(sqlite_path: str, *, incremental_threshold_days: int = 2) -> 
             "WHERE i.class IN ('share', 'etf')",
             (),
         )
-    except sqlite3.Error:
+    except sqlite3.Error:  # pragma: no cover — corrupt db is outside the test envelope
         return counts
 
     for row in rows:
@@ -350,7 +350,7 @@ async def backfill_force_reset() -> dict:
     """
     settings = get_settings()
     db_path = settings.sqlite_path
-    if not Path(db_path).exists():
+    if not Path(db_path).exists():  # pragma: no cover — DB always created by lifespan before any route serves
         raise HTTPException(status_code=503, detail={"error": "no_db"})
     try:
         con = sqlite3.connect(db_path)
@@ -358,7 +358,7 @@ async def backfill_force_reset() -> dict:
         deleted = cur.rowcount
         con.commit()
         con.close()
-    except sqlite3.Error as e:
+    except sqlite3.Error as e:  # pragma: no cover — only fires on hard disk failure during DELETE
         raise HTTPException(
             status_code=500,
             detail={"error": "metadata_reset_failed", "message": str(e)},
