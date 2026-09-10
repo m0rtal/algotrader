@@ -234,6 +234,14 @@ class BackfillRunner:
         translate gRPC responses to dicts.
         """
         total = 0
+        # Fetch the universe of all asset classes for `instruments` table
+        # completeness, but only `share` and `etf` actually emit
+        # `get_candles` on the live API — bonds/futures/options have
+        # candle-less endpoints (coupons, margin, etc) we don't yet
+        # model. For those classes we upsert the metadata with
+        # status='no_candles_method' so the operator sees them in
+        # `instruments` and `pending` but the runner doesn't burn
+        # rate-limit slots on per-ticker 404s.
         fetcher_specs = [
             ("get_shares", "share"),
             ("get_bonds", "bond"),
@@ -241,6 +249,7 @@ class BackfillRunner:
             ("get_futures", "future"),
             ("get_options", "option"),
         ]
+        classes_with_candles = {"share", "etf"}
         for method_name, _cls in fetcher_specs:
             if self._stop_flag.is_set():
                 break
@@ -255,9 +264,22 @@ class BackfillRunner:
             for row in rows:
                 figi = row.get("figi")
                 ticker = row.get("ticker") or ""
+                asset_class = row.get("class") or ""
                 if figi and ticker:
                     self._ticker_by_figi[figi] = ticker
                 self._upsert_instrument(row)
+                # Classes without `get_candles` are marked
+                # no_candles_method here so the runner doesn't
+                # queue them in the backfill loop where they'd just
+                # burn rate-limit and return NOT_FOUND.
+                if asset_class and figi and asset_class not in classes_with_candles:
+                    self._upsert_metadata(
+                        figi=figi,
+                        last_bar_ts=None,
+                        total_bars=0,
+                        status="no_candles_method",
+                        error_msg=None,
+                    )
             for row in rows:
                 await self._emit(
                     "ticker_progress",
@@ -392,9 +414,17 @@ class BackfillRunner:
     # ─── DB helpers ──────────────────────────────────────────────────
 
     def _list_instruments(self) -> list[dict]:
+        # Only share/etf instruments are eligible for the candle
+        # backfill loop. Bonds/futures/options get listed in
+        # `instruments` (for the dashboard) but get a
+        # `status='no_candles_method'` row in metadata during discover
+        # so `pending` skips them.
         con = sqlite3.connect(self.db_path)
         con.row_factory = sqlite3.Row
-        rows = con.execute("SELECT ticker, figi, class FROM instruments").fetchall()
+        rows = con.execute(
+            "SELECT ticker, figi, class FROM instruments "
+            "WHERE class IN ('share', 'etf')"
+        ).fetchall()
         con.close()
         return [dict(r) for r in rows]
 
