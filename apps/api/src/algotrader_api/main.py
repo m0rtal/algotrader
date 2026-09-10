@@ -81,6 +81,7 @@ def create_app() -> FastAPI:
         health.set_bars_dir(settings.bars_dir)
         bars.set_bars_dir(settings.bars_dir)
         data_reads.set_bars_dir(settings.bars_dir)
+        data_reads.set_sqlite_path(settings.sqlite_path)
 
         logger.info("service.start", host=settings.api_host, port=settings.api_port)
         yield

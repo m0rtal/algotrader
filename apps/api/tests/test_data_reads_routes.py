@@ -45,8 +45,54 @@ def test_backtest_folds_empty(client: TestClient) -> None:
     assert client.get("/api/backtest/folds").json() == []
 
 
-def test_logs_empty(client: TestClient) -> None:
-    assert client.get("/api/logs").json() == []
+def test_logs_returns_recent_from_ingestion_logs(client: TestClient, data_dir: str) -> None:
+    """LogStrip reads the recent operational events from ingestion_logs.
+
+    Seeds three rows covering the three level paths (error/info/unknown)
+    so the mapping branch in get_logs is covered.
+    """
+    import sqlite3
+
+    db_path = f"{data_dir}/state.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS ingestion_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            run_id INTEGER NOT NULL,
+            level TEXT NOT NULL,
+            figi TEXT,
+            message TEXT NOT NULL
+        );
+        """
+    )
+    rows = [
+        ("2026-09-10T14:32:11.000000+00:00", 1, "error", "BBG000BKPL53", "fetch failed: 5xx"),
+        ("2026-09-10T14:33:00.000000+00:00", 1, "info", "BBG000F02T51", "fetched 180 bars"),
+        ("2026-09-10T14:34:00.000000+00:00", 1, "debug", None, "noop"),
+    ]
+    conn.executemany(
+        "INSERT INTO ingestion_logs (ts, run_id, level, figi, message) VALUES (?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+    body = client.get("/api/logs").json()
+    assert isinstance(body, list)
+    assert len(body) == 3
+    by_text = {r["text"].split(" ", 1)[0]: r for r in body}
+    # timestamp cropped to HH:MM:SS
+    err = next(r for r in body if r["tone"] == "err")
+    assert err["ts"] == "14:32:11"
+    info = next(r for r in body if r["tone"] == "ok")
+    assert info["tone"] == "ok"
+    flat = next(r for r in body if r["tone"] == "flat")
+    assert flat["tone"] == "flat"
+    # figi prefix appears in text, figi-less rows have just the message
+    assert any("BBG000BKPL53" in r["text"] for r in body)
+    assert any(r["text"] == "noop" for r in body)
 
 
 def test_tickers_returns_per_ticker_summary_from_duckdb(client: TestClient) -> None:
