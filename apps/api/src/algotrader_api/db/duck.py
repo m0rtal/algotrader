@@ -93,3 +93,22 @@ def count_bars(bars_dir: str) -> int:
         n = rows[0][0] if rows else 0
         span.set_attribute("db.row_count", n)
         return n
+
+
+def query_ticker_overview(bars_dir: str) -> list[dict[str, Any]]:
+    """Per-ticker summary: distinct count of bars + first/last timestamp.
+
+    Powers the Bars tab (StorageTab) — returns one row per ticker with
+    enough metadata for the UI to render a useful summary without a
+    separate name/sector table (those are still todo upstream).
+    """
+    conn = get_connection(bars_dir)
+    sql = (
+        "SELECT ticker, COUNT(*) AS bars, MIN(ts) AS first_ts, MAX(ts) AS last_ts "
+        "FROM bars GROUP BY ticker ORDER BY ticker"
+    )
+    with instrument_db_query(db_system="duckdb", statement=sql) as span:
+        rows = conn.execute(sql).fetchall()
+        cols = [d[0] for d in conn.execute(sql).description]
+        span.set_attribute("db.row_count", len(rows))
+        return [dict(zip(cols, r)) for r in rows]
