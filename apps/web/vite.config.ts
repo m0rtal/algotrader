@@ -21,5 +21,19 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    // Proxy same-origin so MSW passthrough isn't needed for /api in dev:
+    // the SW-initiated fetch from a page at 192.168.1.101:5173 to
+    // http://127.0.0.1:8000 trips browser CORS for service workers —
+    // route /api/* through Vite and MSW can stop intercepting them.
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/health': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+    },
   },
 });

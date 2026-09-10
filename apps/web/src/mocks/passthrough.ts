@@ -5,7 +5,12 @@
 // endpoint name — never hardcoded mock data. The UI sees real data when
 // the backend is up and an honest "no data" signal when it isn't.
 
-const LIVE_BASE = 'http://127.0.0.1:8000/api';
+// In dev, fetch /api/* on the same origin and let Vite proxy them to
+// the backend at http://127.0.0.1:8000. Same-origin avoids the CORS
+// trip a service-worker-initiated cross-origin fetch would otherwise
+// trigger (browser blocks it before our 503 fallback can react).
+const is_dev = typeof import.meta !== 'undefined' && import.meta.env?.DEV;
+const LIVE_BASE = is_dev ? '/api' : 'http://127.0.0.1:8000/api';
 
 /**
  * Forward the request to the live backend. On error return a
@@ -23,7 +28,7 @@ const LIVE_BASE = 'http://127.0.0.1:8000/api';
 export async function passthrough(
   endpoint: string,
   request?: Request,
-  timeoutMs = 1500,
+  timeoutMs = 5000,
 ): Promise<Response> {
   // DEV = vite dev mode (browser). In test mode (vitest+msw/node) the
   // passthrough is a no-op — calling fetch() from inside a MSW node
@@ -32,10 +37,10 @@ export async function passthrough(
   // server.use(). PROD is a static build where MSW is not loaded.
   /* v8 ignore next */
   if (!import.meta.env.DEV) {
-    return new Response(
-      JSON.stringify({ error: 'msw_disabled_in_test_or_prod' }),
-      { status: 503, headers: { 'content-type': 'application/json' } },
-    );
+    return new Response(JSON.stringify({ error: 'msw_disabled_in_test_or_prod' }), {
+      status: 503,
+      headers: { 'content-type': 'application/json' },
+    });
   }
 
   const url = request ? new URL(request.url) : null;
@@ -61,8 +66,7 @@ export async function passthrough(
       return new Response(text, {
         status: live.status,
         headers: {
-          'content-type':
-            live.headers.get('content-type') ?? 'application/json',
+          'content-type': live.headers.get('content-type') ?? 'application/json',
         },
       });
     }
