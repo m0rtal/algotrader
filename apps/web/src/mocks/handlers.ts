@@ -1,5 +1,6 @@
 import { http, HttpResponse } from 'msw';
 import { SettingsSchema } from '@algotrader/shared';
+import { passthrough } from './passthrough';
 import {
   barsByTicker,
   features,
@@ -37,17 +38,21 @@ const writeBackfillState = (state: Record<string, unknown>) => {
 };
 
 export const handlers = [
-  http.get('/api/kpis', () => HttpResponse.json(kpis)),
-  http.get('/api/signals', () => HttpResponse.json(signals)),
-  http.get('/api/trades', () => HttpResponse.json(trades)),
-  http.get('/api/portfolio', () => HttpResponse.json(portfolio)),
-  http.get('/api/regime', () => HttpResponse.json(regime)),
-  http.get('/api/model', () => HttpResponse.json(model)),
-  http.get('/api/model/features', () => HttpResponse.json(features)),
-  http.get('/api/pipeline', () => HttpResponse.json(pipeline)),
-  http.get('/api/backtest/folds', () => HttpResponse.json(folds)),
-  http.get('/api/tickers', () => HttpResponse.json(tickers)),
-  http.get('/api/logs', () => HttpResponse.json(logs)),
+  // Simple GET endpoints — try the live backend first, fall back to the
+  // hardcoded mock when the backend is offline / blocked / wrong port.
+  // The UI shows real data whenever the backend is up, stable mocks
+  // otherwise; no toggle, no per-user flag, no per-tab reload.
+  http.get('/api/kpis', () => passthrough('kpis', HttpResponse.json(kpis))),
+  http.get('/api/signals', () => passthrough('signals', HttpResponse.json(signals))),
+  http.get('/api/trades', () => passthrough('trades', HttpResponse.json(trades))),
+  http.get('/api/portfolio', () => passthrough('portfolio', HttpResponse.json(portfolio))),
+  http.get('/api/regime', () => passthrough('regime', HttpResponse.json(regime))),
+  http.get('/api/model', () => passthrough('model', HttpResponse.json(model))),
+  http.get('/api/model/features', () => passthrough('model/features', HttpResponse.json(features))),
+  http.get('/api/pipeline', () => passthrough('pipeline', HttpResponse.json(pipeline))),
+  http.get('/api/backtest/folds', () => passthrough('backtest/folds', HttpResponse.json(folds))),
+  http.get('/api/tickers', () => passthrough('tickers', HttpResponse.json(tickers))),
+  http.get('/api/logs', () => passthrough('logs', HttpResponse.json(logs))),
 
   // ─── Settings ──────────────────────────────────────────────────────
   http.get('/api/settings', () => {

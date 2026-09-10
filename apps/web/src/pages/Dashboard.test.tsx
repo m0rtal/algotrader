@@ -27,15 +27,7 @@ function makeWrapper() {
 }
 
 describe('Dashboard', () => {
-  beforeEach(() => {
-    // Force MSW mode regardless of any prior test writing
-    // `algotrader.apiMode='live'` to localStorage. Otherwise Dashboard
-    // routes real HTTP traffic to http://127.0.0.1:8000 (which is down
-    // in CI) and Storage tab hangs on Загрузка… forever.
-    localStorage.clear();
-  });
-
-  it('renders the 5 tab buttons', async () => {
+it('renders the 5 tab buttons', async () => {
     const Wrapper = makeWrapper();
     render(
       <Wrapper>
