@@ -16,16 +16,21 @@ export function LogStrip() {
     refetchInterval: 5_000,
   });
   if (!data) return null;
+  const empty = data.length === 0;
   return (
     <div
       data-testid="global-log-strip"
-      className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-surface/95 backdrop-blur px-4 py-1.5 mono text-[11px] text-text-muted flex flex-wrap gap-x-4 gap-y-0.5"
+      className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-surface/95 backdrop-blur px-4 py-1.5 mono text-[11px] text-text-muted max-h-16 overflow-hidden flex flex-col gap-0.5"
     >
-      {data.map((l, i) => (
-        <span key={i} className={toneClass(l.tone)}>
-          [{l.ts}] {l.text}
-        </span>
-      ))}
+      {empty ? (
+        <span className="text-text-dim">— Нет событий —</span>
+      ) : (
+        data.slice(0, 4).map((l, i) => (
+          <span key={i} className={`whitespace-nowrap ${toneClass(l.tone)}`}>
+            [{l.ts}] {l.text}
+          </span>
+        ))
+      )}
     </div>
   );
 }
