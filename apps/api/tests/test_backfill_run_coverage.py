@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -35,11 +36,12 @@ def _seed_instruments_and_metadata(db_path: Path) -> None:
         ("SBER", "BBG001", "share", "Sber", "RUB", 1),
     )
     # Pre-populate metadata so decide_strategy returns "skip".
+    # Use today's date so the test is robust to the wall clock.
+    today = date.today()
     con.execute(
         "INSERT INTO instrument_metadata (figi, last_bar_ts, total_bars, last_run_status) "
-        "VALUES (?, '2026-09-08', 252, 'ok')"
-    ,
-        ("BBG001",),
+        "VALUES (?, ?, 252, 'ok')",
+        ("BBG001", today.isoformat()),
     )
     con.commit()
     con.close()

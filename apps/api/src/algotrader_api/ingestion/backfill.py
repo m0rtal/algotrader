@@ -306,21 +306,48 @@ class BackfillRunner:
         as `ticker_progress` events with `status='error'`; the runner
         continues to the next ticker.
         """
-        try:
-            raw_candles = await self.client.get_candles(
-                figi=figi,
-                date_from=from_,
-                date_to=to,
-                interval="CANDLE_INTERVAL_DAY",
-            )
-        except Exception as e:  # noqa: BLE001 — defensive
-            await self._log("error", figi=figi, message=f"get_candles: {e}")
+        # Tinkoff's live API rejects (INVALID_ARGUMENT 30014) requests longer
+        # than ~7 days for the day interval. Walk the [from_, to] window in
+        # 7-day chunks; a single-chunk call behaves like the old flow.
+        all_candles: list = []
+        chunk_days = 7
+        cur = from_
+        chunks_attempted = 0
+        chunks_failed = 0
+        last_chunk_error: str | None = None
+        while cur <= to:
+            chunk_end = min(cur + timedelta(days=chunk_days - 1), to)
+            chunks_attempted += 1
+            try:
+                chunk = await self.client.get_candles(
+                    figi=figi,
+                    date_from=cur,
+                    date_to=chunk_end,
+                    interval="CANDLE_INTERVAL_DAY",
+                )
+                all_candles.extend(chunk)
+            except Exception as e:  # noqa: BLE001
+                chunks_failed += 1
+                last_chunk_error = str(e)
+                await self._log(
+                    "warn",
+                    figi=figi,
+                    message=f"chunk {cur}..{chunk_end}: {e}",
+                )
+            cur = chunk_end + timedelta(days=1)
+        # Treat as failure only when every chunk failed. If at least
+        # one chunk returned bars we proceed; partial historic data is
+        # still useful and the failure was likely the tail of the
+        # window.
+        if chunks_failed > 0 and chunks_failed == chunks_attempted:
+            err_msg = last_chunk_error or "all_chunks_failed"
+            await self._log("error", figi=figi, message=f"get_candles: {err_msg}")
             self._upsert_metadata(
                 figi=figi,
                 last_bar_ts=None,
                 total_bars=0,
                 status="error",
-                error_msg=str(e)[:200],
+                error_msg=err_msg[:200],
             )
             await self._emit(
                 "ticker_progress",
@@ -328,8 +355,16 @@ class BackfillRunner:
                     "figi": figi,
                     "status": "error",
                     "bars_written": 0,
-                    "error": str(e)[:200],
+                    "error": err_msg[:200],
                 },
+            )
+            return 0
+        raw_candles = all_candles
+        if not raw_candles:
+            await self._log(
+                "warn",
+                figi=figi,
+                message=f"no candles in {from_}..{to}",
             )
             return 0
 
@@ -414,17 +449,9 @@ class BackfillRunner:
     # ─── DB helpers ──────────────────────────────────────────────────
 
     def _list_instruments(self) -> list[dict]:
-        # Only share/etf instruments are eligible for the candle
-        # backfill loop. Bonds/futures/options get listed in
-        # `instruments` (for the dashboard) but get a
-        # `status='no_candles_method'` row in metadata during discover
-        # so `pending` skips them.
         con = sqlite3.connect(self.db_path)
         con.row_factory = sqlite3.Row
-        rows = con.execute(
-            "SELECT ticker, figi, class FROM instruments "
-            "WHERE class IN ('share', 'etf')"
-        ).fetchall()
+        rows = con.execute("SELECT ticker, figi, class FROM instruments").fetchall()
         con.close()
         return [dict(r) for r in rows]
 

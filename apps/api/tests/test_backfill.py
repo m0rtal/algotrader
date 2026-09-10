@@ -179,6 +179,9 @@ async def test_backfill_one_filters_closed_candles(tmp_path):
         is_complete=False,
     )
     client = MagicMock()
+    # The chunked runner calls get_candles once per ~7-day window. For
+    # June 1..30 that is five chunks; return the same [closed, open_bar]
+    # fixture so behaviour is observable across every chunk.
     client.get_candles = AsyncMock(return_value=[closed, open_bar])
 
     events = []
@@ -197,13 +200,14 @@ async def test_backfill_one_filters_closed_candles(tmp_path):
         from_=date(2024, 6, 1),
         to=date(2024, 6, 30),
     )
-    assert written == 1
+    # 5 chunks × 1 closed bar = 5 closed candles persisted.
+    assert written == 5
     parquet = bars_dir / "BBG004730N88.parquet"
     assert parquet.exists()
     progress_events = [ev for ev in events if ev.type == "ticker_progress"]
     assert len(progress_events) == 1
     assert progress_events[0].payload["status"] == "ok"
-    assert progress_events[0].payload["bars_written"] == 1
+    assert progress_events[0].payload["bars_written"] == 5
 
 
 @pytest.mark.asyncio
@@ -242,7 +246,10 @@ async def test_backfill_one_updates_instrument_metadata(tmp_path):
     con.close()
     assert row is not None
     assert row[0] == "2024-12-31"
-    assert row[1] == 1
+    # 53 chunks × 1 closed candle (all stamped 2024-12-31 by the fixture) — append_bars
+    # writes whatever it gets so the persisted candle count equals the
+    # number of chunks performed.
+    assert row[1] == 53
     assert row[2] == "ok"
 
 
