@@ -120,6 +120,9 @@ class BackfillRunner:
     state: BackfillState = BackfillState.IDLE
     _stop_flag: threading.Event = field(default_factory=threading.Event)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    # figi → ticker map populated during discover_universe; used to
+    # render human-readable figi as ticker in log messages.
+    _ticker_by_figi: dict[str, str] = field(default_factory=dict)
     tickers_done: int = 0
     tickers_total: int = 0
     total_bars: int = 0
@@ -250,6 +253,10 @@ class BackfillRunner:
                 continue
             total += len(rows)
             for row in rows:
+                figi = row.get("figi")
+                ticker = row.get("ticker") or ""
+                if figi and ticker:
+                    self._ticker_by_figi[figi] = ticker
                 self._upsert_instrument(row)
             for row in rows:
                 await self._emit(
@@ -501,17 +508,34 @@ class BackfillRunner:
 
         Defensive against candle-like objects missing the `time` field
         and against the SDK returning dicts instead of gRPC objects.
+        Newer t-tech SDK pre-converts candles to {"ts": "YYYY-MM-DD", ...}
+        dicts — try that fast-path first before going through `time.*`.
         """
         if not candles:
             return None
         dates: list[date] = []
         for c in candles:
             try:
-                t = c.time if not isinstance(c, dict) else c.get("time")
+                if isinstance(c, dict):
+                    # Fast-path: SDK pre-converted ("ts": "YYYY-MM-DD...").
+                    ts = c.get("ts")
+                    if isinstance(ts, str):
+                        try:
+                            d = date.fromisoformat(ts[:10])
+                        except ValueError:
+                            d = None
+                        if d:
+                            dates.append(d)
+                            continue
+                    t = c.get("time") or c.get("time_") or {}
+                else:
+                    t = getattr(c, "time", None)
                 if isinstance(t, dict):
                     y, m, d = t.get("year"), t.get("month"), t.get("day")
+                elif t is not None:
+                    y, m, d = getattr(t, "year", None), getattr(t, "month", None), getattr(t, "day", None)
                 else:
-                    y, m, d = t.year, t.month, t.day
+                    y, m, d = None, None, None
                 if not (y and m and d):
                     continue
                 dates.append(date(y, m, d))
@@ -542,12 +566,15 @@ class BackfillRunner:
         self, level: str, *, figi: str | None = None, message: str
     ) -> None:
         ts = datetime.now(timezone.utc).isoformat()
+        # Resolve ticker prefix when we have it; falls back to figi.
+        ticker = self._ticker_by_figi.get(figi) if figi else None
+        display = f"{ticker}/{figi}" if ticker and figi else (figi or "")
         con = sqlite3.connect(self.db_path)
         try:
             con.execute(
                 "INSERT INTO ingestion_logs (ts, run_id, level, figi, message) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (ts, self.run_id, level, figi, message),
+                (ts, self.run_id, level, display, message),
             )
             con.commit()
         finally:
