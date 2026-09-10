@@ -27,13 +27,35 @@ def get_secret(sqlite_path: str, key: str) -> str | None:
 
 
 def set_secret(sqlite_path: str, key: str, value: str) -> None:
-    """Insert or update a secret. Stores an updated_at timestamp."""
+    """Insert or update a secret. Stores an updated_at timestamp.
+
+    Logs the write to `ingestion_logs` (operator-visible event stream)
+    with last-4 only — full value never travels through the log.
+    """
     execute(
         sqlite_path,
         "INSERT INTO secrets (key, value, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         (key, value, _now_iso()),
     )
+    try:
+        # Best-effort audit trail. The ingestion_logs schema is created
+        # by an early migration; on a fresh test DB this table may not
+        # exist yet, so swallow the failure.
+        execute(
+            sqlite_path,
+            "INSERT INTO ingestion_logs (ts, run_id, level, figi, message) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                _now_iso(),
+                0,
+                "info",
+                "",
+                f"secrets.write key={key} last4={value[-4:]}",
+            ),
+        )
+    except Exception:
+        pass
 
 
 def get_broker_token(sqlite_path: str) -> str | None:
