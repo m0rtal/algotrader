@@ -143,27 +143,41 @@ def get_logs(limit: int = 50) -> list:
 def get_tickers() -> list:
     """Per-ticker metadata for the Bars tab.
 
-    Reads from DuckDB (bars view across all backfilled parquet files).
-    Returns one row per ticker with `symbol`, `bars` count, first/last
-    dates. `name`, `sector`, `price`, `fileSize`, `gaps` are placeholder
-    0 / '' because we do not yet join instrument metadata (it's an open
-    follow-up: a name map / sector classifier would belong here once the
-    portfolio team needs them). Returning the real shape keeps the UI
-    populated so the operator can see "what is in DuckDB right now".
+    Reads ticker counts from DuckDB (bars view across all backfilled
+    parquet files) and enriches with instrument metadata from SQLite
+    `instruments` table (name, sector, currency, lot_size). Tickers
+    with bars but no instruments row still surface — they just show
+    placeholder name/sector (which is exactly the legacy / partial
+    backfill case). `price`, `fileSize`, `gaps` are placeholder until
+    upstream metrics land.
     """
     bars_dir = _get_bars_dir()
-    return [
-        {
-            "symbol": r["ticker"],
-            "name": "",
-            "sector": "",
-            "price": 0,
-            "bars": int(r["bars"]),
-            "firstDate": str(r["first_ts"]),
-            "lastDate": str(r["last_ts"]),
-            "fileSize": 0,
-            "gaps": 0,
-        }
-        for r in duck.query_ticker_overview(bars_dir)
-        if r["ticker"] is not None
-    ]
+    overview = duck.query_ticker_overview(bars_dir)
+    by_ticker = {
+        r["ticker"]: r for r in sqlite_exec(
+            _get_sqlite_path(),
+            "SELECT ticker, name, sector, currency, lot_size FROM instruments",
+            (),
+        ) if r["ticker"]
+    }
+    out: list[dict] = []
+    for r in overview:
+        if r["ticker"] is None:
+            continue
+        meta = by_ticker.get(r["ticker"])
+        out.append(
+            {
+                "symbol": r["ticker"],
+                "name": meta["name"] if meta else "",
+                "sector": meta["sector"] if meta and meta["sector"] else "",
+                "price": 0,
+                "bars": int(r["bars"]),
+                "firstDate": str(r["first_ts"]),
+                "lastDate": str(r["last_ts"]),
+                "fileSize": 0,
+                "gaps": 0,
+                "currency": meta["currency"] if meta and meta["currency"] else "",
+                "lotSize": int(meta["lot_size"]) if meta and meta["lot_size"] else 0,
+            }
+        )
+    return out
