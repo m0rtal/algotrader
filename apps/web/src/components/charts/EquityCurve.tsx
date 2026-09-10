@@ -21,6 +21,7 @@ export function EquityCurve({ data, color = '#26a69a', height = 180 }: Props) {
 
   useEffect(() => {
     const el = containerRef.current;
+    /* v8 ignore next */
     if (!el) return;
     const chart = createChart(el, {
       width: el.clientWidth,

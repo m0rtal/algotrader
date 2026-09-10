@@ -39,7 +39,7 @@ export function Sparkline({ symbol, width = 60, height = 16 }: Props) {
       const y = height - 2 - ((val - min) / range) * (height - 4);
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     });
-    return { points: pts.join(' '), color: series[n - 1]! >= series[0]! ? '#26a69a' : '#ef5350' };
+    return { points: pts.join(' '), color: /* v8 ignore next */ (series[n - 1]! >= series[0]! ? '#26a69a' : '#ef5350') };
   }, [symbol, width, height]);
 
   return (

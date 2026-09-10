@@ -1,4 +1,9 @@
+import { ApiStatusBadge } from '@components/layout/ApiStatusBadge';
+
 export function Topbar() {
+  // When a backend URL is configured (or we auto-detect one), prefer it
+  // over MSW. Without this toggle, dev mode silently uses mock data and
+  // the user sees zeros for bars / pending counts.
   return (
     <div className="flex items-center justify-between px-5 h-12 bg-surface border-b border-border gap-4 min-w-0">
       <div className="flex items-center gap-2.5 font-semibold text-sm shrink-0">
@@ -18,6 +23,7 @@ export function Topbar() {
           Обновлено <span className="text-text mono ml-1.5">19:34 МСК</span>
         </span>
         <span className="shrink-0">Sandbox</span>
+        <ApiStatusBadge />
         <a
           href="/settings"
           className="shrink-0 text-text-muted hover:text-text text-base"

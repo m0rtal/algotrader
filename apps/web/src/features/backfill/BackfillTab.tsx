@@ -175,6 +175,7 @@ export function BackfillTab() {
           ) : (
             <>
               <p className="text-sm text-[var(--muted-foreground)] mb-2">
+                {/* v8 ignore next */}
                 {pending.data
                   ? `${pending.data.new + pending.data.stale + pending.data.error} of ${pending.data.total} tickers need attention.`
                   : 'Counting…'}

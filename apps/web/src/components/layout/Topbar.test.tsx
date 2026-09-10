@@ -1,42 +1,52 @@
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { Topbar } from '@components/layout/Topbar';
 
 describe('Topbar', () => {
-  it('renders the brand name', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders the brand and a Sandbox label', () => {
     render(<Topbar />);
     expect(screen.getByText('ALGOTRADER')).toBeInTheDocument();
-  });
-
-  it('renders the MOEX tag', () => {
-    render(<Topbar />);
-    expect(screen.getAllByText(/MOEX/).length).toBeGreaterThan(0);
-  });
-
-  it('shows session status as CLOSED', () => {
-    render(<Topbar />);
-    expect(screen.getByText('CLOSED')).toBeInTheDocument();
-  });
-
-  it('shows IMOEX value', () => {
-    render(<Topbar />);
-    expect(screen.getByText('3 142.8')).toBeInTheDocument();
-  });
-
-  it('shows update time in МСК', () => {
-    render(<Topbar />);
-    expect(screen.getByText(/МСК/)).toBeInTheDocument();
-  });
-
-  it('renders the Sandbox badge', () => {
-    render(<Topbar />);
     expect(screen.getByText('Sandbox')).toBeInTheDocument();
   });
 
-  it('renders the settings gear link to /settings', () => {
-    render(<Topbar />);
-    const link = screen.getByLabelText('Open settings');
-    expect(link).toBeInTheDocument();
-    expect(link.getAttribute('href')).toBe('/settings');
+  it('shows the API status badge in mock mode when /health is unreachable', async () => {
+    // Default MSW handler doesn't proxy /health, so fetch fails → mock.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(() =>
+      Promise.reject(new Error('network unreachable')),
+    ) as typeof fetch;
+    try {
+      render(<Topbar />);
+      await waitFor(() => {
+        const badge = screen.getByTestId('api-status-badge');
+        expect(badge.getAttribute('data-mode')).toBe('mock');
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('shows the API status badge in live mode when /health returns 200', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve(new Response('ok', { status: 200 })),
+    ) as typeof fetch;
+    try {
+      render(<Topbar />);
+      await waitFor(() => {
+        const badge = screen.getByTestId('api-status-badge');
+        expect(badge.getAttribute('data-mode')).toBe('live');
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

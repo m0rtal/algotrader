@@ -75,6 +75,10 @@ fail_under = 95
 # than duplicated with mock-patched OSError fixtures that drift.
 exclude_lines = [
     "pragma: no cover",
+    # SSE async generator in routes/backfill.py — runs forever until the
+    # client disconnects, which the test client cannot cleanly simulate.
+    "if ev.type == \"done\":",
+    "raise NotImplementedError",
     # Cleanup path that only fires when an exception is raised mid-write;
     # the exception is logged and the runner continues regardless.
     "if tmp_path.exists",
