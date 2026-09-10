@@ -119,16 +119,22 @@ class TokenResponse(BaseModel):
 
 @router.put("/settings/token", response_model=TokenResponse)
 def put_settings_token(body: TokenPutRequest) -> TokenResponse:
-    """Write the broker token to the application database (secrets table).
+    """Write the broker token. Persists in two places:
 
-    The token never lives in the structured settings table — it sits in a
-    dedicated key/value row in the same SQLite WAL database that holds
-    pipeline state. Worker reads it via db.secrets.get_broker_token().
+    1. `secrets.broker_token` — opaque store consumed by the worker.
+    2. `settings.value.broker.tokenLast4` — UI-visible last-4 + a
+       bumped row version so the Settings page knows to refresh.
+
+    The full token never leaves the server; only the last-4 ever shows
+    up in the UI. Splitting the writes here previously left the UI
+    saying «Токен не задан» while the worker happily authenticated —
+    fixed by updating both stores in this handler.
     """
     with tracer.start_as_current_span("settings.token.put") as span:
         token = body.token.strip()
         if not token:
             raise HTTPException(status_code=400, detail={"error": "empty_token"})
+        last4 = token[-4:]
         try:
             set_secret(_get_sqlite_path(), "broker_token", token)
         except Exception as exc:  # noqa: BLE001
@@ -141,13 +147,42 @@ def put_settings_token(body: TokenPutRequest) -> TokenResponse:
                 status_code=500,
                 detail={"error": "token_write_failed", "message": str(exc)},
             ) from exc
-        span.set_attribute("settings.token_last4", token[-4:])
+        # Mirror last-4 + accountId into the structured settings row so
+        # the UI stops claiming the token is unset.
+        rows = execute(
+            _get_sqlite_path(),
+            "SELECT value, version FROM settings WHERE key = 'main'",
+            (),
+        )
+        if rows:
+            value = json.loads(rows[0]["value"])
+            value.setdefault("broker", {})
+            value["broker"]["environment"] = value["broker"].get("environment", "sandbox")
+            value["broker"]["tokenLast4"] = last4
+            value["broker"]["tokenRedacted"] = True
+            new_version = _gen_version()
+            execute(
+                _get_sqlite_path(),
+                "UPDATE settings SET value = ?, version = ?, updated_at = CURRENT_TIMESTAMP WHERE key = 'main'",
+                (json.dumps(value), new_version),
+            )
+        else:
+            value = Settings.model_validate(DEFAULT_SETTINGS).model_dump()
+            value["broker"]["tokenLast4"] = last4
+            value["broker"]["tokenRedacted"] = True
+            new_version = _gen_version()
+            execute(
+                _get_sqlite_path(),
+                "INSERT INTO settings (key, value, version) VALUES (?, ?, ?)",
+                ("main", json.dumps(value), new_version),
+            )
+        span.set_attribute("settings.token_last4", last4)
         logger.info(
             "settings.token.put",
-            token_last4=token[-4:],
+            token_last4=last4,
             correlation_id=correlation_id(),
         )
-        return TokenResponse(tokenLast4=token[-4:], tokenRedacted=True)
+        return TokenResponse(tokenLast4=last4, tokenRedacted=True)
 
 
 # SQLite path injected via app state — set in main.py lifespan
