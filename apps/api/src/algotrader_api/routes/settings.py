@@ -118,7 +118,7 @@ class TokenResponse(BaseModel):
 
 
 @router.put("/settings/token", response_model=TokenResponse)
-def put_settings_token(body: TokenPutRequest) -> TokenResponse:
+def put_settings_token(request: Request, body: TokenPutRequest) -> TokenResponse:
     """Write the broker token. Persists in two places:
 
     1. `secrets.broker_token` — opaque store consumed by the worker.
@@ -147,6 +147,26 @@ def put_settings_token(body: TokenPutRequest) -> TokenResponse:
                 status_code=500,
                 detail={"error": "token_write_failed", "message": str(exc)},
             ) from exc
+        # Audit: write a structured ingestion_logs row carrying client IP
+        # and user-agent so the operator can find the source of stray
+        # writes (e.g. another dev process overwriting a real token).
+        client_ip = request.client.host if request.client else "unknown"
+        ua = request.headers.get("user-agent", "unknown")
+        try:
+            execute(
+                _get_sqlite_path(),
+                "INSERT INTO ingestion_logs (ts, run_id, level, figi, message) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    _now_iso(),
+                    0,
+                    "info",
+                    "",
+                    f"settings.token.put last4={last4} ip={client_ip} ua={ua[:80]}",
+                ),
+            )
+        except Exception:
+            pass
         # Mirror last-4 + accountId into the structured settings row so
         # the UI stops claiming the token is unset.
         rows = execute(
