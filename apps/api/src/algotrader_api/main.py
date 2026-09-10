@@ -15,7 +15,7 @@ from .observability.correlation import CorrelationMiddleware
 from .observability.logging import get_logger, setup_logging
 from .observability.middleware import LatencyMiddleware
 from .observability.tracing import setup_tracing, shutdown_tracing
-from .routes import admin, bars, health, pipeline as pipeline_route, settings as settings_route
+from .routes import admin, bars, data_reads, health, pipeline as pipeline_route, settings as settings_route, signals as signals_route
 from .seed import seed_bars, should_seed_synth
 
 logger = get_logger("algotrader_api.main")
@@ -80,6 +80,7 @@ def create_app() -> FastAPI:
         health.set_sqlite_path(settings.sqlite_path)
         health.set_bars_dir(settings.bars_dir)
         bars.set_bars_dir(settings.bars_dir)
+        data_reads.set_bars_dir(settings.bars_dir)
 
         logger.info("service.start", host=settings.api_host, port=settings.api_port)
         yield
@@ -113,6 +114,8 @@ def create_app() -> FastAPI:
     app.include_router(settings_route.router)
     app.include_router(bars.router)
     app.include_router(pipeline_route.router)
+    app.include_router(signals_route.router)
+    app.include_router(data_reads.router)
     app.include_router(admin.router)
     from .routes.backfill import router as backfill_router
     app.include_router(backfill_router)
