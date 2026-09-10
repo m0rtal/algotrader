@@ -1,8 +1,10 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor } from '@testing-library/react';
+import { http, HttpResponse } from 'msw';
 import type { ReactNode } from 'react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { PortfolioTab } from '@features/portfolio/PortfolioTab';
+import { server } from '../../mocks/server';
 
 function makeWrapper() {
   const client = new QueryClient({
@@ -13,7 +15,29 @@ function makeWrapper() {
   );
 }
 
+const samplePortfolio = {
+  cash: 100000,
+  invested: 1124380,
+  total: 1224380,
+  longCount: 2,
+  shortCount: 1,
+  grossExposure: 1.05,
+  netExposure: 0.95,
+  positions: [
+    { symbol: 'SBER', side: 'long', qty: 10, avgPrice: 300, price: 312.4, value: 3124, weight: 0.0026, pnl: 124 },
+    { symbol: 'GAZP', side: 'long', qty: 20, avgPrice: 120, price: 128.65, value: 2573, weight: 0.0021, pnl: 173 },
+    { symbol: 'YNDX', side: 'short', qty: 5, avgPrice: 4500, price: 4218, value: 21090, weight: 0.0172, pnl: 1410 },
+  ],
+};
+
 describe('PortfolioTab', () => {
+  beforeEach(() => {
+    server.use(
+      http.get('/api/portfolio', () => HttpResponse.json(samplePortfolio)),
+    );
+  });
+  afterEach(() => server.resetHandlers());
+
   it('renders the summary cards', async () => {
     const Wrapper = makeWrapper();
     render(
@@ -66,7 +90,6 @@ describe('PortfolioTab', () => {
       </Wrapper>,
     );
     await waitFor(() => {
-      // weight bars use .bg-accent
       expect(container.querySelectorAll('.bg-accent').length).toBeGreaterThan(0);
     });
   });

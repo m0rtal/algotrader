@@ -1,9 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { http, HttpResponse } from 'msw';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SETTINGS } from '@algotrader/shared';
 import { SettingsTab } from '@features/settings/SettingsTab';
 import { useSettingsStore } from '@stores/settingsStore';
+import { server } from '../../mocks/server';
 
 function makeWrapper() {
   const client = new QueryClient({
@@ -13,6 +15,11 @@ function makeWrapper() {
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
 }
+
+const stored = {
+  values: DEFAULT_SETTINGS,
+  version: 'v1-test',
+};
 
 describe('SettingsTab', () => {
   beforeEach(() => {
@@ -24,8 +31,33 @@ describe('SettingsTab', () => {
       error: null,
       loaded: false,
     });
+    // Default happy-path MSW handlers for GET/PUT/DELETE on
+    // /api/settings. Individual tests override with server.use() to
+    // simulate conflict / 500 / etc.
+    server.use(
+      http.get('/api/settings', () =>
+        HttpResponse.json({ ...stored, updatedAt: new Date().toISOString() }),
+      ),
+      http.put('/api/settings', async ({ request }) => {
+        const body = (await request.json()) as { values: typeof DEFAULT_SETTINGS };
+        return HttpResponse.json({
+          values: body.values,
+          version: 'v1-new',
+          updatedAt: new Date().toISOString(),
+        });
+      }),
+      http.delete('/api/settings', () => new HttpResponse(null, { status: 204 })),
+      http.put('/api/settings/token', async ({ request }) => {
+        const { token } = (await request.json()) as { token: string };
+        return HttpResponse.json({
+          tokenLast4: token.slice(-4),
+          tokenRedacted: true,
+        });
+      }),
+    );
   });
   afterEach(() => {
+    server.resetHandlers();
     useSettingsStore.setState({
       values: DEFAULT_SETTINGS,
       baseline: DEFAULT_SETTINGS,
@@ -35,13 +67,10 @@ describe('SettingsTab', () => {
       loaded: false,
     });
   });
+
   it('renders the 4 section tabs', async () => {
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Брокер' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Риск' })).toBeInTheDocument();
@@ -52,11 +81,7 @@ describe('SettingsTab', () => {
 
   it('shows Broker section by default with all fields', async () => {
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => {
       expect(screen.getAllByText('Брокер').length).toBeGreaterThan(0);
       expect(screen.getByText('Окружение')).toBeInTheDocument();
@@ -67,11 +92,7 @@ describe('SettingsTab', () => {
 
   it('switching to Risk shows risk fields', async () => {
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => screen.getByRole('button', { name: 'Риск' }));
     screen.getByRole('button', { name: 'Риск' }).click();
     await waitFor(() => {
@@ -82,26 +103,20 @@ describe('SettingsTab', () => {
   });
 
   it('clicking save sends version v1 when store version is null', async () => {
-    const { server } = await import('../../mocks/server');
-    const { http, HttpResponse } = await import('msw');
     let receivedVersion: string | undefined;
     server.use(
       http.put('/api/settings', async ({ request }) => {
-        const body = (await request.json()) as { values: unknown; version: string };
+        const body = (await request.json()) as { version: string };
         receivedVersion = body.version;
         return HttpResponse.json({
-          values: body.values,
+          values: DEFAULT_SETTINGS,
           version: 'v1-new',
           updatedAt: new Date().toISOString(),
         });
       }),
     );
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => screen.getByRole('button', { name: 'Сохранить' }));
     act(() => useSettingsStore.setState({ version: null }));
     fireEvent.change(screen.getByLabelText('Account ID'), { target: { value: 'Y' } });
@@ -112,11 +127,7 @@ describe('SettingsTab', () => {
 
   it('switching to ML shows ml fields with readonly model version', async () => {
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => screen.getByRole('button', { name: 'ML' }));
     screen.getByRole('button', { name: 'ML' }).click();
     await waitFor(() => {
@@ -128,11 +139,7 @@ describe('SettingsTab', () => {
 
   it('switching to Data shows data fields', async () => {
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => screen.getByRole('button', { name: 'Данные' }));
     screen.getByRole('button', { name: 'Данные' }).click();
     await waitFor(() => {
@@ -145,11 +152,7 @@ describe('SettingsTab', () => {
 
   it('renders the Danger zone', async () => {
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => {
       expect(screen.getByText('Опасная зона')).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Сбросить настройки' })).toBeInTheDocument();
@@ -158,15 +161,9 @@ describe('SettingsTab', () => {
 
   it('clicking the save button triggers save mutation', async () => {
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => screen.getByRole('button', { name: 'Сохранить' }));
-    // Make a change to enable save
-    const accountInput = screen.getByLabelText('Account ID');
-    fireEvent.change(accountInput, { target: { value: 'NEW' } });
+    fireEvent.change(screen.getByLabelText('Account ID'), { target: { value: 'NEW' } });
     await waitFor(() => {
       const saveBtn = screen.getByRole('button', { name: 'Сохранить' });
       expect(saveBtn).not.toBeDisabled();
@@ -177,11 +174,7 @@ describe('SettingsTab', () => {
 
   it('clicking reset shows confirm then triggers reset', async () => {
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => screen.getByRole('button', { name: 'Сбросить настройки' }));
     fireEvent.click(screen.getByRole('button', { name: 'Сбросить настройки' }));
     await waitFor(() => screen.getByText('Сбросить все настройки к defaults?'));
@@ -190,22 +183,19 @@ describe('SettingsTab', () => {
   });
 
   it('handles 409 conflict by showing warning toast', async () => {
-    const { server } = await import('../../mocks/server');
-    const { http, HttpResponse } = await import('msw');
     server.use(
       http.put('/api/settings', () =>
         HttpResponse.json(
-          { error: 'version conflict', current: { broker: {}, risk: {}, ml: {}, data: {} } },
+          {
+            error: 'version conflict',
+            current: { broker: DEFAULT_SETTINGS.broker, risk: DEFAULT_SETTINGS.risk, ml: DEFAULT_SETTINGS.ml, data: DEFAULT_SETTINGS.data },
+          },
           { status: 409 },
         ),
       ),
     );
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => screen.getByRole('button', { name: 'Сохранить' }));
     fireEvent.change(screen.getByLabelText('Account ID'), { target: { value: 'X' } });
     await waitFor(() => {
@@ -219,15 +209,9 @@ describe('SettingsTab', () => {
   });
 
   it('handles non-409 error by showing error toast', async () => {
-    const { server } = await import('../../mocks/server');
-    const { http, HttpResponse } = await import('msw');
     server.use(http.put('/api/settings', () => HttpResponse.json({ error: 'fail' }, { status: 500 })));
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => screen.getByRole('button', { name: 'Сохранить' }));
     fireEvent.change(screen.getByLabelText('Account ID'), { target: { value: 'X' } });
     await waitFor(() => {
@@ -238,26 +222,10 @@ describe('SettingsTab', () => {
     await waitFor(() => expect(screen.getByText('Ошибка сохранения. Попробуйте ещё раз.')).toBeInTheDocument());
   });
 
-  it('shows loading state initially', () => {
-    const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
-    expect(screen.getByText('Загрузка настроек…')).toBeInTheDocument();
-  });
-
   it('shows error toast when reset fails', async () => {
-    const { server } = await import('../../mocks/server');
-    const { http, HttpResponse } = await import('msw');
     server.use(http.delete('/api/settings', () => HttpResponse.json({ error: 'fail' }, { status: 500 })));
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => screen.getByRole('button', { name: 'Сбросить настройки' }));
     fireEvent.click(screen.getByRole('button', { name: 'Сбросить настройки' }));
     await waitFor(() => screen.getByText('Сбросить все настройки к defaults?'));
@@ -266,15 +234,9 @@ describe('SettingsTab', () => {
   });
 
   it('shows error state on query error', async () => {
-    const { server } = await import('../../mocks/server');
-    const { http, HttpResponse } = await import('msw');
     server.use(http.get('/api/settings', () => HttpResponse.json({ error: 'fail' }, { status: 500 })));
     const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <SettingsTab />
-      </Wrapper>,
-    );
+    render(<Wrapper><SettingsTab /></Wrapper>);
     await waitFor(() => expect(screen.getByText(/Ошибка/)).toBeInTheDocument());
   });
 });

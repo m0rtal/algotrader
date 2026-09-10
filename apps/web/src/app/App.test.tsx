@@ -1,7 +1,10 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
+import { http, HttpResponse } from 'msw';
 import { describe, expect, it } from 'vitest';
 import { App } from './App';
 import { Providers } from './providers';
+import { queryClient } from '@lib/queryClient';
+import { server } from '../mocks/server';
 
 describe('App', () => {
   it('renders without crashing', () => {
@@ -15,14 +18,23 @@ describe('App', () => {
   });
 
   it('renders the global log strip footer on every route', async () => {
+    server.use(
+      http.get('/api/logs', () => HttpResponse.json([])),
+    );
+    // The App uses a shared QueryClient singleton. Earlier tests in this
+    // file may have left a failed/pending query for ['logs'] cached with
+    // a long staleTime; clear it so our MSW handler actually fires.
+    queryClient.clear();
     render(<App />);
     // LogStrip fetches /api/logs through MSW; the strip should mount
     // at the App root so it shows up on both Dashboard and Settings.
     const strip = await screen.findByTestId('global-log-strip');
     expect(strip).toBeInTheDocument();
     // Fixed bottom positioning keeps the footer pinned to viewport.
-    expect(strip.className).toMatch(/fixed/);
-    expect(strip.className).toMatch(/bottom-0/);
+    await waitFor(() => {
+      expect(strip.className).toMatch(/fixed/);
+      expect(strip.className).toMatch(/bottom-0/);
+    });
   });
 });
 

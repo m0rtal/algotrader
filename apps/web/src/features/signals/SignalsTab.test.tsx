@@ -1,9 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { http, HttpResponse } from 'msw';
 import type { ReactNode } from 'react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SignalsTab } from '@features/signals/SignalsTab';
 import { useUiStore } from '@stores/uiStore';
+import { server } from '../../mocks/server';
 
 const seriesMock = { setData: vi.fn() };
 const chartMock = {
@@ -12,12 +14,21 @@ const chartMock = {
   applyOptions: vi.fn(),
   timeScale: () => ({ fitContent: vi.fn() }),
 };
-// vi.mock must be at the top before imports
-import { vi } from 'vitest';
 vi.mock('lightweight-charts', () => ({
   createChart: vi.fn(() => chartMock),
   AreaSeries: function AreaSeries() {},
 }));
+
+// Test fixtures for the MSW handlers. Tests install these via
+// server.use() — the dev MSW handlers remain strict passthroughs that
+// hit the real backend. This file intentionally does NOT mock @lib/api
+// globally; that happens in src/test/setup.ts so other test files can
+// opt-in per-test.
+const sampleSignals = [
+  { symbol: 'SBER', side: 'long', price: 312.4, forecast5d: 0.028, confidence: 0.72, strength: 0.6, regime: 'trend', volume: 5200, updatedAt: '2026-09-10T19:34:00Z' },
+  { symbol: 'GAZP', side: 'short', price: 128.65, forecast5d: -0.019, confidence: 0.64, strength: 0.55, regime: 'range', volume: 8100, updatedAt: '2026-09-10T19:34:00Z' },
+  { symbol: 'YNDX', side: 'hold', price: 4218, forecast5d: 0.034, confidence: 0.81, strength: 0.8, regime: 'trend', volume: 1200, updatedAt: '2026-09-10T19:34:00Z' },
+];
 
 function makeWrapper() {
   const client = new QueryClient({
@@ -29,6 +40,15 @@ function makeWrapper() {
 }
 
 describe('SignalsTab', () => {
+  beforeEach(() => {
+    server.use(
+      http.get('/api/signals', () => HttpResponse.json(sampleSignals)),
+    );
+  });
+  afterEach(() => {
+    server.resetHandlers();
+  });
+
   it('renders the table header', async () => {
     const Wrapper = makeWrapper();
     render(
@@ -98,23 +118,18 @@ describe('SignalsTab', () => {
   });
 
   it('shows loading state when query is pending', () => {
-    // The query starts in pending state because the response never resolves.
-    // We achieve this by NOT setting up MSW for this endpoint, so the request
-    // hangs in 'pending' (with onUnhandledRequest: 'bypass' in test setup).
+    // The mock api() is reset between tests, so api('/signals') resolves
+    // with undefined → TanStack Query stays in pending state.
     const Wrapper = makeWrapper();
     render(
       <Wrapper>
         <SignalsTab />
       </Wrapper>,
     );
-    // The component returns the loading div while isLoading is true.
-    // Since MSW doesn't respond, the query stays pending.
     expect(screen.getByText('Загрузка…')).toBeInTheDocument();
   });
 
   it('shows error state when query fails', async () => {
-    const { server } = await import('../../mocks/server');
-    const { http, HttpResponse } = await import('msw');
     server.use(http.get('/api/signals', () => new HttpResponse(null, { status: 500 })));
     const Wrapper = makeWrapper();
     render(
@@ -128,8 +143,6 @@ describe('SignalsTab', () => {
   });
 
   it('shows empty state when signal list is empty', async () => {
-    const { server } = await import('../../mocks/server');
-    const { http, HttpResponse } = await import('msw');
     server.use(http.get('/api/signals', () => HttpResponse.json([])));
     const Wrapper = makeWrapper();
     render(

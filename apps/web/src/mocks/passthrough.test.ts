@@ -4,11 +4,10 @@ import { passthrough } from '@mocks/passthrough';
 describe('passthrough', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
-    // Make the passthrough branch run (it bails out when DEV is false).
     vi.stubEnv('DEV', true);
   });
 
-  it('returns the live backend response when /health-style fetch succeeds', async () => {
+  it('forwards the request to the live backend and returns its response', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(
@@ -17,48 +16,30 @@ describe('passthrough', () => {
           headers: { 'content-type': 'application/json' },
         }),
       );
-    const mock = {
-      status: 200,
-      headers: { get: () => 'application/json' },
-      text: () => Promise.resolve(JSON.stringify({ from: 'mock' })),
-    };
-    const res = await passthrough('kpis', mock as unknown as Response);
+    const res = await passthrough('kpis');
+    expect(fetchSpy).toHaveBeenCalledOnce();
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual({ from: 'live' });
-    expect(fetchSpy).toHaveBeenCalledOnce();
   });
 
-  it('falls back to the mock when the backend is unreachable', async () => {
+  it('returns 503 when the backend is unreachable (no mock fallback)', async () => {
     vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('offline'));
-    const mock = {
-      status: 200,
-      headers: { get: () => 'application/json' },
-      text: () =>
-        Promise.resolve(JSON.stringify({ from: 'mock', count: 7 })),
-    };
-    const res = await passthrough('kpis', mock as unknown as Response);
-    expect(res.status).toBe(200);
+    const res = await passthrough('kpis');
+    expect(res.status).toBe(503);
     const body = await res.json();
-    expect(body).toEqual({ from: 'mock', count: 7 });
+    expect(body).toEqual({ error: 'backend_unreachable', endpoint: 'kpis' });
   });
 
-  it('falls back to the mock on non-2xx', async () => {
+  it('returns 502 when the backend returns a non-2xx response', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response('down', { status: 503 }),
     );
-    const mock = {
-      status: 200,
-      headers: { get: () => 'application/json' },
-      text: () => Promise.resolve(JSON.stringify({ from: 'mock' })),
-    };
-    const res = await passthrough('kpis', mock as unknown as Response);
-    const body = await res.json();
-    expect(body).toEqual({ from: 'mock' });
+    const res = await passthrough('kpis');
+    expect(res.status).toBe(502);
   });
 
-  it('times out fast on slow backends', async () => {
-    // Never resolves — abort should fire after 1500 ms by default.
+  it('returns 504 when the backend times out', async () => {
     vi
       .spyOn(globalThis, 'fetch')
       .mockImplementation(
@@ -69,32 +50,34 @@ describe('passthrough', () => {
             );
           }),
       );
-    const mock = {
-      status: 200,
-      headers: { get: () => 'application/json' },
-      text: () => Promise.resolve(JSON.stringify({ from: 'mock' })),
-    };
     const start = Date.now();
-    const res = await passthrough('kpis', mock as unknown as Response, 50);
+    const res = await passthrough('kpis', undefined, 50);
     const elapsed = Date.now() - start;
     expect(elapsed).toBeLessThan(500);
-    const body = await res.json();
-    expect(body).toEqual({ from: 'mock' });
+    expect(res.status).toBe(504);
   });
 
-  it('returns the mock directly when not in DEV (production)', async () => {
+  it('preserves path segments with slashes (e.g. model/features)', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(
+        new Response('[]', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    await passthrough('model/features');
+    expect(fetchSpy).toHaveBeenCalledWith(
+      expect.stringContaining('/api/model/features'),
+      expect.anything(),
+    );
+  });
+
+  it('returns 503 in test mode without making any fetch call', async () => {
     vi.stubEnv('DEV', false);
     const fetchSpy = vi.spyOn(globalThis, 'fetch');
-    const mock = {
-      status: 200,
-      headers: { get: () => 'application/json' },
-      text: () => Promise.resolve(JSON.stringify({ from: 'mock' })),
-    };
-    const res = await passthrough('kpis', mock as unknown as Response);
-    expect(res.status).toBe(200);
+    const res = await passthrough('kpis');
     expect(fetchSpy).not.toHaveBeenCalled();
-    const body = await res.json();
-    expect(body).toEqual({ from: 'mock' });
+    expect(res.status).toBe(503);
   });
-
 });

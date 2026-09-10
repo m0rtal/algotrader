@@ -1,8 +1,10 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor } from '@testing-library/react';
+import { http, HttpResponse } from 'msw';
 import type { ReactNode } from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BacktestTab } from '@features/backtest/BacktestTab';
+import { server } from '../../mocks/server';
 
 const seriesMock = { setData: vi.fn() };
 const chartMock = {
@@ -26,7 +28,21 @@ function makeWrapper() {
   );
 }
 
+const sampleFolds = [
+  { id: 1, trainStart: '2023-01-01', trainEnd: '2024-06-30', testStart: '2024-07-01', testEnd: '2024-12-31', sharpe: 1.42, cagr: 0.18, winRate: 0.58, trades: 87, maxDd: -0.062 },
+  { id: 2, trainStart: '2023-07-01', trainEnd: '2024-12-31', testStart: '2025-01-01', testEnd: '2025-06-30', sharpe: 1.65, cagr: 0.21, winRate: 0.62, trades: 92, maxDd: -0.048 },
+  { id: 3, trainStart: '2024-01-01', trainEnd: '2025-06-30', testStart: '2025-07-01', testEnd: '2025-12-31', sharpe: 1.28, cagr: 0.14, winRate: 0.55, trades: 78, maxDd: -0.071 },
+  { id: 4, trainStart: '2024-07-01', trainEnd: '2025-12-31', testStart: '2026-01-01', testEnd: '2026-06-30', sharpe: 1.84, cagr: 0.24, winRate: 0.66, trades: 105, maxDd: -0.041 },
+];
+
 describe('BacktestTab', () => {
+  beforeEach(() => {
+    server.use(
+      http.get('/api/backtest/folds', () => HttpResponse.json(sampleFolds)),
+    );
+  });
+  afterEach(() => server.resetHandlers());
+
   it('renders the 5 summary cards', async () => {
     const Wrapper = makeWrapper();
     render(
@@ -35,7 +51,6 @@ describe('BacktestTab', () => {
       </Wrapper>,
     );
     expect(await screen.findByText('OOS Sharpe', {}, { timeout: 5000 })).toBeInTheDocument();
-    // CAGR appears as both a card label and a column header; use getAllByText
     expect(screen.getAllByText('CAGR').length).toBeGreaterThan(0);
     expect(screen.getByText('Win Rate')).toBeInTheDocument();
     expect(screen.getByText('Profit Factor')).toBeInTheDocument();

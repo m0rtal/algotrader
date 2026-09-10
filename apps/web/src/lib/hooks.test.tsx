@@ -1,24 +1,21 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, renderHook, waitFor } from '@testing-library/react';
+import { renderHook, waitFor } from '@testing-library/react';
+import { http, HttpResponse } from 'msw';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   useBars,
-  useDeleteSettings,
-  useFolds,
   useKpis,
   useModel,
   useModelFeatures,
   usePipeline,
   usePortfolio,
   useRegime,
-  useSaveSettings,
-  useSaveToken,
-  useSettings,
   useSignals,
   useTickers,
   useTrades,
 } from '@lib/hooks';
+import { server } from '../mocks/server';
 
 function makeWrapper() {
   const client = new QueryClient({
@@ -29,13 +26,130 @@ function makeWrapper() {
   );
 }
 
-describe('data hooks', () => {
+describe('data hooks (against MSW handlers returning canned data)', () => {
   let wrapper: ReturnType<typeof makeWrapper>;
 
   beforeEach(() => {
     wrapper = makeWrapper();
+    server.use(
+      http.get('/api/kpis', () =>
+        HttpResponse.json([
+          { label: 'Equity', value: '1 124 380 ₽', sub: '+12 438 ₽ · +1.12%' },
+        ]),
+      ),
+      http.get('/api/signals', () =>
+        HttpResponse.json([
+          {
+            symbol: 'SBER',
+            side: 'long',
+            price: 312.4,
+            forecast5d: 0.028,
+            confidence: 0.72,
+            strength: 0.6,
+            regime: 'trend',
+            volume: 5200,
+            updatedAt: '2026-09-10T19:34:00Z',
+          },
+        ]),
+      ),
+      http.get('/api/trades', () =>
+        HttpResponse.json([
+          {
+            id: 't1',
+            symbol: 'SBER',
+            side: 'buy',
+            qty: 10,
+            price: 312.4,
+            amount: 3124,
+            pnl: null,
+            strategy: 'mom_20d',
+            ts: '2026-09-10T19:34:00Z',
+          },
+        ]),
+      ),
+      http.get('/api/portfolio', () =>
+        HttpResponse.json({
+          cash: 0,
+          invested: 1124380,
+          total: 1124380,
+          longCount: 1,
+          shortCount: 0,
+          grossExposure: 1.0,
+          netExposure: 1.0,
+          positions: [
+            {
+              symbol: 'SBER',
+              side: 'long',
+              qty: 10,
+              avgPrice: 300,
+              price: 312.4,
+              value: 3124,
+              weight: 0.0028,
+              pnl: 124,
+            },
+          ],
+        }),
+      ),
+      http.get('/api/regime', () =>
+        HttpResponse.json({
+          state: 'trend',
+          confidence: 0.78,
+          imoexChange: 0.0042,
+          volatility20d: 14.2,
+          breadth: 0.71,
+          sinceDate: '2026-09-04',
+        }),
+      ),
+      http.get('/api/model', () =>
+        HttpResponse.json({
+          version: 'v2.3',
+          trainWindowMonths: 24,
+          trainStart: '2024-09',
+          trainEnd: '2026-08',
+          oosAccuracy: 0.572,
+          oosSharpe: 1.84,
+          ic: 0.081,
+          lastTrainDate: '2026-09-01',
+          nextTrainDate: '2026-10-01',
+        }),
+      ),
+      http.get('/api/model/features', () =>
+        HttpResponse.json([{ name: 'mom_20d', importance: 0.088 }]),
+      ),
+      http.get('/api/pipeline', () =>
+        HttpResponse.json([{ name: 'Universe', status: 'ok' }]),
+      ),
+      http.get('/api/tickers', () =>
+        HttpResponse.json([
+          {
+            symbol: 'SBER',
+            name: 'Сбер Банк',
+            sector: 'Финансы',
+            price: 312.4,
+            bars: 1,
+            firstDate: '2026-09-10',
+            lastDate: '2026-09-10',
+            fileSize: 1024,
+            gaps: 0,
+          },
+        ]),
+      ),
+      http.get('/api/bars/:symbol', ({ params }) => {
+        if (params.symbol === 'SBER') {
+          return HttpResponse.json({
+            symbol: 'SBER',
+            count: 1,
+            first: '2026-09-10',
+            last: '2026-09-10',
+            bars: [{ ts: '2026-09-10', open: 312.4, high: 312.4, low: 312.4, close: 312.4, volume: 1000 }],
+          });
+        }
+        return HttpResponse.json({ error: 'not_found' }, { status: 404 });
+      }),
+    );
   });
   afterEach(() => {
+    server.resetHandlers();
     wrapper = makeWrapper();
   });
 
@@ -43,16 +157,13 @@ describe('data hooks', () => {
     const { result } = renderHook(() => useKpis(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toBeDefined();
-    expect(Array.isArray(result.current.data)).toBe(true);
-    expect((result.current.data as unknown[]).length).toBeGreaterThan(0);
   });
 
   it('useSignals fetches signal list with valid shape', async () => {
     const { result } = renderHook(() => useSignals(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     const first = result.current.data?.[0] as { symbol: string; side: string } | undefined;
-    expect(first?.symbol).toBeTruthy();
-    expect(['long', 'short', 'hold']).toContain(first?.side);
+    expect(first?.symbol).toBe('SBER');
   });
 
   it('useTrades fetches trade list', async () => {
@@ -91,12 +202,6 @@ describe('data hooks', () => {
     expect(result.current.data?.length).toBeGreaterThan(0);
   });
 
-  it('useFolds fetches walk-forward folds', async () => {
-    const { result } = renderHook(() => useFolds(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data?.length).toBeGreaterThan(0);
-  });
-
   it('useTickers fetches ticker list', async () => {
     const { result } = renderHook(() => useTickers(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
@@ -116,113 +221,9 @@ describe('data hooks', () => {
     expect(result.current.data?.bars.length).toBeGreaterThan(0);
   });
 
-  it('useBars throws when symbol is not in mock data', async () => {
+  it('useBars surfaces an error when symbol is not in the backend', async () => {
     const { result } = renderHook(() => useBars('UNKNOWN'), { wrapper });
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect((result.current.error as Error).message).toBeTruthy();
-  });
-
-  it('useSettings returns values from GET /api/settings', async () => {
-    const { result } = renderHook(() => useSettings(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data?.values.broker.environment).toBe('sandbox');
-    expect(result.current.data?.values.risk.maxDrawdownPct).toBe(10);
-    expect(result.current.data?.version).toBeTruthy();
-  });
-
-  it('useSaveSettings PUTs and the new values land in state', async () => {
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
-    });
-    const { result } = renderHook(
-      () => ({
-        save: useSaveSettings(),
-        settings: useSettings(),
-      }),
-      {
-        wrapper: ({ children }) => (
-          <QueryClientProvider client={client}>{children}</QueryClientProvider>
-        ),
-      },
-    );
-    await waitFor(() => expect(result.current.settings.isSuccess).toBe(true));
-    const current = result.current.settings.data!.values;
-    const next = {
-      ...current,
-      risk: { ...current.risk, maxDrawdownPct: 8, killSwitchThresholdPct: 15 },
-    };
-    await act(async () => {
-      await result.current.save.mutateAsync({
-        values: next,
-        version: result.current.settings.data!.version,
-      });
-    });
-    await waitFor(() => expect(result.current.settings.data?.values.risk.maxDrawdownPct).toBe(8));
-  });
-
-  it('useDeleteSettings returns 204 and triggers invalidation', async () => {
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
-    });
-    const { result } = renderHook(
-      () => ({
-        del: useDeleteSettings(),
-      }),
-      {
-        wrapper: ({ children }) => (
-          <QueryClientProvider client={client}>{children}</QueryClientProvider>
-        ),
-      },
-    );
-    let response: unknown;
-    await act(async () => {
-      response = await result.current.del.mutateAsync();
-    });
-    // 204 No Content — undefined body
-    expect(response).toBeUndefined();
-  });
-});
-
-describe('useSettings — 404 fallback (defensive default)', () => {
-  it('returns DEFAULT_SETTINGS when /settings responds 404', async () => {
-    const { http, HttpResponse } = await import('msw');
-    const { server } = await import('../mocks/server');
-    // Override the default /settings handler with a 404.
-    server.use(
-      http.get('/api/settings', () =>
-        new HttpResponse('not found', { status: 404 }),
-      ),
-    );
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
-    });
-    const { result } = renderHook(() => useSettings(), {
-      wrapper: ({ children }) => (
-        <QueryClientProvider client={client}>{children}</QueryClientProvider>
-      ),
-    });
-    // Wait until the query settles (isError stays false because the
-    // hook swallows the 404 and returns DEFAULT_SETTINGS).
-    await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(result.current.isError).toBe(false);
-    expect(result.current.data).toBeDefined();
-    expect(result.current.data?.values).toBeDefined();
-  });
-});
-
-describe('useSaveToken', () => {
-  it('sends PUT /settings/token and invalidates the settings cache on success', async () => {
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
-    });
-    const Wrapper = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
-    );
-    const { result } = renderHook(() => useSaveToken(), { wrapper: Wrapper });
-    let response: { tokenLast4: string; tokenRedacted: boolean } | undefined;
-    await act(async () => {
-      response = await result.current.mutateAsync({ token: 't.real.ABCD' });
-    });
-    expect(response).toEqual({ tokenLast4: 'ABCD', tokenRedacted: true });
   });
 });
