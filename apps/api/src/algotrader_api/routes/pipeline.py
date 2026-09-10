@@ -17,7 +17,7 @@ router = APIRouter(prefix="/api", tags=["pipeline"])
 
 
 class PhaseStatus(BaseModel):
-    phase: Literal["discover_universe", "fetch_bars"]
+    phase: Literal["discover_universe", "fetch_bars", "backfill_universe"]
     status: Literal["ok", "warn", "err", "idle"]
     startedAt: str
     finishedAt: str | None
