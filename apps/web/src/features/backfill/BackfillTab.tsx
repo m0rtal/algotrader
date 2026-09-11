@@ -31,6 +31,17 @@ export function useStopBackfill() {
   });
 }
 
+export function useStartBackfill() {
+  const qc = useQueryClient();
+  return useMutation<unknown, Error, void>({
+    mutationFn: () => api('/admin/backfill/start', { method: 'POST', body: '{}' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['backfill-status'] });
+      qc.invalidateQueries({ queryKey: ['backfill-pending'] });
+    },
+  });
+}
+
 export function usePendingCount(refetchInterval = 60_000) {
   return useQuery<{ new: number; stale: number; up_to_date: number; error: number; total: number }>({
     queryKey: ['backfill-pending'],
@@ -134,6 +145,7 @@ export function BackfillTab() {
   const pending = usePendingCount();
   const reset = useForceReset();
   const stop = useStopBackfill();
+  const start = useStartBackfill();
   const { events, connected } = useBackfillEvents();
   const [showResetConfirm, setShowResetConfirm] = useState(false);
 
@@ -204,6 +216,13 @@ export function BackfillTab() {
         )}
 
         <div className="flex flex-wrap gap-2">
+          <button
+            disabled={running || start.isPending}
+            onClick={() => start.mutate()}
+            className="rounded border border-[var(--accent)] bg-[var(--accent)]/15 px-3 py-1.5 text-sm font-medium text-[var(--accent)] hover:bg-[var(--accent)]/25 disabled:opacity-50"
+          >
+            Start backfill
+          </button>
           <button
             disabled={!running}
             onClick={() => stop.mutate()}

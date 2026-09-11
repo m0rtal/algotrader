@@ -136,6 +136,39 @@ describe('BackfillTab', () => {
     expect(stopBtn).toBeDisabled();
   });
 
+  it('renders Start backfill button enabled when idle', async () => {
+    const Wrapper = makeWrapper();
+    render(
+      <Wrapper>
+        <BackfillTab />
+      </Wrapper>,
+    );
+    const startBtn = await screen.findByRole('button', { name: /Start backfill/i });
+    expect(startBtn).toBeInTheDocument();
+    expect(startBtn).not.toBeDisabled();
+  });
+
+  it('clicking Start backfill POSTs to /admin/backfill/start and refreshes status', async () => {
+    let startCalled = 0;
+    server.use(
+      http.post('/api/admin/backfill/start', () => {
+        startCalled += 1;
+        return HttpResponse.json({ ok: true, run_id: 42 });
+      }),
+    );
+    const Wrapper = makeWrapper();
+    render(
+      <Wrapper>
+        <BackfillTab />
+      </Wrapper>,
+    );
+    const startBtn = await screen.findByRole('button', { name: /Start backfill/i });
+    fireEvent.click(startBtn);
+    await waitFor(() => {
+      expect(startCalled).toBe(1);
+    });
+  });
+
   it('shows scheduler-mode hint text on the backfill tab', async () => {
     const Wrapper = makeWrapper();
     render(
