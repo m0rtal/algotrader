@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-09-11
+goal: Make backfill runner hit live Tinkoff data for shares ETFs bonds and
+  futures and close gaps that left Bars tab empty
