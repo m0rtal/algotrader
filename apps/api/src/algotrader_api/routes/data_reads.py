@@ -106,7 +106,7 @@ def get_backtest_folds() -> list:
 
 
 @router.get("/logs")
-def get_logs(limit: int = 50) -> list:
+def get_logs(limit: int = 50, since_minutes: int = 60) -> list:
     """Recent ingestion log lines (operator-facing event stream).
 
     Reads `ingestion_logs` table written by the backfill runner — this
@@ -117,12 +117,18 @@ def get_logs(limit: int = 50) -> list:
     - `ts` cropped to HH:MM:SS for compactness in the strip
     - `text` = "{figi} {message}" if figi present, else just `message`
     - text is cropped to ~90 chars; UI further slices to top 30 rows
+
+    `since_minutes` is a soft retention window so the operator-facing
+    strip never shows events from a previous backfill run that was
+    forgotten. The full table stays in SQLite for incident review; the
+    LogStrip just stops at the boundary.
     """
     rows = sqlite_exec(
         _get_sqlite_path(),
         "SELECT ts, level, figi, message FROM ingestion_logs "
+        "WHERE ts >= datetime('now', ?) "
         "ORDER BY id DESC LIMIT ?",
-        (int(limit),),
+        (f"-{int(since_minutes)} minutes", int(limit)),
     )
     out: list[dict] = []
     for r in rows:

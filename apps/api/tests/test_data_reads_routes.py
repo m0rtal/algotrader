@@ -7,6 +7,8 @@ returns at least the ticker list from the test fixture's parquet glob.
 """
 from __future__ import annotations
 
+import re
+
 from fastapi.testclient import TestClient
 
 
@@ -52,6 +54,7 @@ def test_logs_returns_recent_from_ingestion_logs(client: TestClient, data_dir: s
     so the mapping branch in get_logs is covered.
     """
     import sqlite3
+    from datetime import datetime
 
     db_path = f"{data_dir}/state.db"
     conn = sqlite3.connect(db_path)
@@ -68,9 +71,9 @@ def test_logs_returns_recent_from_ingestion_logs(client: TestClient, data_dir: s
         """
     )
     rows = [
-        ("2026-09-10T14:32:11.000000+00:00", 1, "error", "BBG000BKPL53", "fetch failed: 5xx"),
-        ("2026-09-10T14:33:00.000000+00:00", 1, "info", "BBG000F02T51", "fetched 180 bars"),
-        ("2026-09-10T14:34:00.000000+00:00", 1, "debug", None, "noop"),
+        (datetime.now().isoformat(timespec="seconds"), 1, "error", "BBG000BKPL53", "fetch failed: 5xx"),
+        (datetime.now().isoformat(timespec="seconds"), 1, "info", "BBG000F02T51", "fetched 180 bars"),
+        (datetime.now().isoformat(timespec="seconds"), 1, "debug", None, "noop"),
     ]
     conn.executemany(
         "INSERT INTO ingestion_logs (ts, run_id, level, figi, message) VALUES (?, ?, ?, ?, ?)",
@@ -83,9 +86,10 @@ def test_logs_returns_recent_from_ingestion_logs(client: TestClient, data_dir: s
     assert isinstance(body, list)
     assert len(body) == 3
     by_text = {r["text"].split(" ", 1)[0]: r for r in body}
-    # timestamp cropped to HH:MM:SS
+    # timestamp cropped to HH:MM:SS (the seeded rows all share the
+    # same wall-clock second, so we just assert the format)
     err = next(r for r in body if r["tone"] == "err")
-    assert err["ts"] == "14:32:11"
+    assert re.fullmatch(r"\d{2}:\d{2}:\d{2}", err["ts"])
     info = next(r for r in body if r["tone"] == "ok")
     assert info["tone"] == "ok"
     flat = next(r for r in body if r["tone"] == "flat")
@@ -93,6 +97,39 @@ def test_logs_returns_recent_from_ingestion_logs(client: TestClient, data_dir: s
     # figi prefix appears in text, figi-less rows have just the message
     assert any("BBG000BKPL53" in r["text"] for r in body)
     assert any(r["text"] == "noop" for r in body)
+
+
+def test_logs_since_minutes_filters_old_rows(client: TestClient, data_dir: str) -> None:
+    """`since_minutes` keeps the LogStrip honest across long-running sessions.
+
+    A row from 90 minutes ago must not appear in the strip when
+    `since_minutes=60`. The full table keeps it for incident review;
+    the API just stops at the boundary so the operator never sees
+    stale noise from a previous backfill run.
+    """
+    import sqlite3
+    from datetime import datetime, timedelta
+
+    db_path = f"{data_dir}/state.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO ingestion_logs (ts, run_id, level, figi, message) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ((datetime.now() - timedelta(minutes=90)).isoformat(timespec="seconds"),
+         1, "error", "OLD", "old noise"),
+    )
+    conn.execute(
+        "INSERT INTO ingestion_logs (ts, run_id, level, figi, message) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (datetime.now().isoformat(timespec="seconds"), 1, "info", "NEW", "fresh"),
+    )
+    conn.commit()
+    conn.close()
+
+    body = client.get("/api/logs?since_minutes=60").json()
+    texts = [r["text"] for r in body]
+    assert any("OLD old noise" not in t for t in texts)
+    assert any("NEW fresh" in t for t in texts)
 
 
 def test_tickers_returns_per_ticker_summary_from_duckdb(client: TestClient) -> None:
