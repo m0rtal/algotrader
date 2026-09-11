@@ -178,13 +178,20 @@ async def stop_backfill() -> dict:
 async def backfill_status() -> dict:
     """Current state + progress + last-run summary."""
     runner = _slot.runner
+    sqlite_path = get_settings().sqlite_path
     state = runner.state.value if runner is not None else "idle"
-    # Pull a few live numbers from the runner when it's active.
+    # Pull a few live numbers from the runner when it's active. When
+    # the runner is gone (idle / between runs) we read the persistent
+    # `instrument_metadata` totals so the operator never sees a
+    # misleading 0 in the dashboard.
     tickers_done = getattr(runner, "tickers_done", 0) if runner else 0
     tickers_total = getattr(runner, "tickers_total", 0) if runner else 0
-    total_bars = getattr(runner, "total_bars", 0) if runner else 0
+    if runner is not None:
+        total_bars = getattr(runner, "total_bars", 0)
+    else:
+        total_bars = _total_bars_on_disk(sqlite_path, get_settings().bars_dir)
     # Last completed run summary from the DB.
-    last_run = _last_run_summary(get_settings().sqlite_path)
+    last_run = _last_run_summary(sqlite_path)
     return {
         "state": state,
         "run_id": _slot.run_id,
@@ -272,6 +279,40 @@ def _last_run_summary(sqlite_path: str) -> dict | None:
         return None
 
 
+def _total_bars_on_disk(sqlite_path: str, bars_dir: str | None = None) -> int:
+    """Sum of per-ticker bar counts in DuckDB `bars` view.
+
+    The runner keeps `total_bars` only while it's alive; once the
+    process stops, the operator-facing "Bars on disk" reads from
+    DuckDB so the dashboard never shows a misleading 0 between runs.
+    Falls back to `instrument_metadata.total_bars` if DuckDB is not
+    initialised yet (cold-start window).
+    """
+    if bars_dir:
+        try:
+            from ..db import duck as duck_mod
+
+            conn = duck_mod.get_connection(bars_dir)
+            row = conn.execute("SELECT COALESCE(SUM(cnt), 0) FROM ("
+                                "SELECT COUNT(*) AS cnt FROM bars GROUP BY ticker)").fetchone()
+            if row:
+                return int(row[0])
+        except Exception:  # pragma: no cover — duck not warmed yet
+            pass
+    if not Path(sqlite_path).exists():
+        return 0
+    try:
+        rows = _exec(
+            sqlite_path,
+            "SELECT COALESCE(SUM(total_bars), 0) FROM instrument_metadata "
+            "WHERE last_run_status = 'ok'",
+            (),
+        )
+        return int(rows[0][0]) if rows else 0
+    except sqlite3.Error:  # pragma: no cover — corrupt db is outside the test envelope
+        return 0
+
+
 # ─── read-only status helpers ──────────────────────────────────────
 
 
@@ -298,8 +339,7 @@ def _pending_count(sqlite_path: str, *, incremental_threshold_days: int = 2) -> 
             sqlite_path,
             "SELECT i.figi, m.last_bar_ts, m.last_run_status "
             "FROM instruments i "
-            "LEFT JOIN instrument_metadata m ON i.figi = m.figi "
-            "WHERE i.class IN ('share', 'etf')",
+            "LEFT JOIN instrument_metadata m ON i.figi = m.figi",
             (),
         )
     except sqlite3.Error:  # pragma: no cover — corrupt db is outside the test envelope

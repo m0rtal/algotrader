@@ -25,6 +25,54 @@ def _parse_resource_attributes(s: str) -> dict[str, str]:
     return dict(item.split("=", 1) for item in s.split(",") if "=" in item)
 
 
+def _flag_orphan_ok_rows(bars_dir: str, sqlite_path: str) -> int:
+    """Mark `instrument_metadata` rows as error if no parquet bars exist.
+
+    Earlier broken backfill runs (e.g. run_id=27 from the sandbox→live
+    transition) wrote `status='ok'` rows to `instrument_metadata`
+    without actually persisting bars — either because `_extract_last_bar_ts`
+    failed to handle the SDK's pre-converted dict candles and bailed early,
+    or because the row was written to a `null` legacy parquet file.
+    Those rows lie to the pending counter (which counts them as
+    `up_to_date`) and to the Bars tab (which counts them in `Bars on
+    disk` once a `total_bars` value was rounded). On backend startup
+    we reconcile: anything with `status='ok'` and `total_bars > 0` that
+    has zero bars in the DuckDB view gets flipped to `error` so the
+    next backfill run will retry it.
+    """
+    from .db import duck as duck_mod
+    from .db.sqlite import execute as _exec
+
+    conn = duck_mod.get_connection(bars_dir)
+    have_bars_rows = conn.execute(
+        "SELECT DISTINCT ticker FROM bars WHERE ticker IS NOT NULL"
+    ).fetchall()
+    have_bars = {r[0] for r in have_bars_rows if r and r[0]}
+
+    rows = _exec(
+        sqlite_path,
+        "SELECT m.figi, i.ticker "
+        "FROM instrument_metadata m "
+        "JOIN instruments i ON i.figi = m.figi "
+        "WHERE m.last_run_status='ok'",
+        (),
+    )
+    orphan_ids = [
+        figi for figi, ticker in rows if ticker not in have_bars
+    ]
+    if not orphan_ids:
+        return 0
+    placeholders = ",".join(["?"] * len(orphan_ids))
+    _exec(
+        sqlite_path,
+        f"UPDATE instrument_metadata "
+        f"SET last_run_status='error', last_error='bars_missing_on_disk' "
+        f"WHERE figi IN ({placeholders})",
+        tuple(orphan_ids),
+    )
+    return len(orphan_ids)
+
+
 def create_app() -> FastAPI:
     """Build the FastAPI app (factory pattern for testing)."""
     settings = get_settings()
@@ -55,6 +103,17 @@ def create_app() -> FastAPI:
             logger.error("migrations.failed", error=str(e), path=settings.sqlite_path)
             raise
         duck.get_connection(settings.bars_dir)  # warm DuckDB connection
+
+        # Integrity check: any `instrument_metadata` row that claims `ok`
+        # but the corresponding parquet file has no bars (or has the
+        # NULL-ticker legacy row) is false-positive bookkeeping left over
+        # from earlier broken runs. Flip them to `error` so the pending
+        # counter classifies them for retry on the next run instead of
+        # silently satisfying the UI as "up to date".
+        try:
+            _flag_orphan_ok_rows(settings.bars_dir, settings.sqlite_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warn("backfill.orphan_check_failed", error=str(e))
 
         # Seed synthetic bars only when:
         # - no parquet files exist yet, AND
