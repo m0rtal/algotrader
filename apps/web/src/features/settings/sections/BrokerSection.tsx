@@ -1,9 +1,7 @@
 import { useState } from 'react';
 import { type BrokerSettings } from '@algotrader/shared';
-import { useSaveToken } from '@lib/hooks';
-import { ConfirmDialog } from '../ConfirmDialog';
 import { Section } from '../Section';
-import { SelectField, TextField } from '../Field';
+import { TextField } from '../Field';
 
 interface Props {
   values: BrokerSettings;
@@ -12,139 +10,230 @@ interface Props {
   saving: boolean;
   dirty: boolean;
   disabled?: boolean;
+  /** Token draft lives in the parent so save fan-out can read it. */
+  tokenDraft: string;
+  onTokenDraftChange: (v: string) => void;
 }
 
-export function BrokerSection({ values, onChange, onSave, saving, dirty, disabled }: Props) {
-  const [showLiveConfirm, setShowLiveConfirm] = useState(false);
-  // Local token draft. Empty string sent to backend means "keep existing".
-  const [tokenDraft, setTokenDraft] = useState('');
-  const [tokenTouched, setTokenTouched] = useState(false);
-  const [tokenSaveStatus, setTokenSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>(
-    'idle',
-  );
-  const [tokenSaveError, setTokenSaveError] = useState<string | null>(null);
-  const saveToken = useSaveToken();
+// Token format: starts with "t.", then [A-Za-z0-9._-], 20–512 chars total.
+const TOKEN_PREFIX = 't.';
+const TOKEN_MIN = 20;
+const TOKEN_MAX = 512;
+const TOKEN_RE = /^t\.[A-Za-z0-9._-]+$/;
+
+function validateToken(draft: string): string | null {
+  const t = draft.trim();
+  if (!t) return null;
+  if (t.length < TOKEN_MIN) return `Минимум ${TOKEN_MIN} символов (сейчас ${t.length}).`;
+  if (t.length > TOKEN_MAX) return `Максимум ${TOKEN_MAX} символов (сейчас ${t.length}).`;
+  if (!t.startsWith(TOKEN_PREFIX)) return `Токен Tinkoff начинается с «${TOKEN_PREFIX}».`;
+  if (!TOKEN_RE.test(t)) return 'Допустимы только A–Z, a–z, 0–9, точка, подчёркивание, дефис.';
+  return null;
+}
+
+export function BrokerSection({
+  values,
+  onChange,
+  onSave,
+  saving,
+  dirty,
+  disabled,
+  tokenDraft,
+  onTokenDraftChange,
+}: Props) {
+  const [touched, setTouched] = useState(false);
+
+  const tokenError = touched ? validateToken(tokenDraft) : null;
+  const tokenHasDraft = tokenDraft.trim().length > 0;
+  const tokenOk = tokenHasDraft && !tokenError;
+
+  const envIsLive = values.environment === 'live';
 
   const handleEnvChange = (next: BrokerSettings['environment']) => {
-    if (next === 'live' && values.environment !== 'live') {
-      setShowLiveConfirm(true);
-      return;
-    }
+    // No confirm dialog — inline warning below the radio cards carries
+    // the risk. Selection is acknowledged by leaving Live chosen and
+    // clicking Save.
     onChange({ environment: next });
   };
 
-  const confirmLive = () => {
-    onChange({ environment: 'live' });
-    setShowLiveConfirm(false);
-  };
+  const envStatus = envIsLive
+    ? { label: 'live', tone: 'warn' as const }
+    : { label: 'sandbox', tone: 'ok' as const };
 
-  const handleSaveToken = async () => {
-    // ponytail: defensive — button is also disabled when draft is whitespace,
-    // so this guard handles the "force-click" case only.
-    /* c8 ignore next */
-    if (!tokenDraft.trim()) return;
-    setTokenSaveStatus('saving');
-    setTokenSaveError(null);
-    try {
-      const res = await saveToken.mutateAsync({ token: tokenDraft.trim() });
-      // Reflect new last-4 immediately; clear draft.
-      onChange({ tokenLast4: res.tokenLast4, tokenRedacted: true });
-      setTokenDraft('');
-      setTokenTouched(false);
-      setTokenSaveStatus('saved');
-      setTimeout(() => setTokenSaveStatus('idle'), 3000);
-    } catch (e) {
-      const err = e as Error & { status?: number };
-      setTokenSaveStatus('error');
-      // ponytail: defensive fallback — Error.message is usually present but
-      // custom error classes may omit it.
-      /* c8 ignore next */
-      setTokenSaveError(err.message ?? 'save failed');
-      setTimeout(() => setTokenSaveStatus('idle'), 5000);
-    }
-  };
+  const tokenStatus = !tokenHasDraft
+    ? values.tokenLast4
+      ? { label: 'задан', tone: 'ok' as const }
+      : { label: 'не задан', tone: 'warn' as const }
+    : tokenOk
+      ? { label: 'готов', tone: 'ok' as const }
+      : { label: 'проверьте', tone: 'err' as const };
 
-  const tokenHint =
-    tokenSaveStatus === 'saving'
-      ? 'Запись токена…'
-      : tokenSaveStatus === 'saved'
-        ? `Токен сохранён (последние 4: ${values.tokenLast4 || '—'}). Воркер подхватит при следующем запуске.`
-        : tokenSaveStatus === 'error'
-          ? // ponytail: defensive — tokenSaveError is always set when status='error',
-            // but TS doesn't know that, so the fallback is logically unreachable.
-            /* c8 ignore next */
-            `Ошибка: ${tokenSaveError ?? 'неизвестно'}`
-          : tokenTouched
-            ? 'Нажмите «Сохранить токен» чтобы записать на бэкенд. Пустой ввод оставляет существующий.'
-            : values.tokenLast4
-              ? `Текущий: ••••••••${values.tokenLast4}. Полный токен хранится на бэкенде. Вставьте новый чтобы заменить.`
-              : 'Токен не задан. Вставьте токен Tinkoff и нажмите «Сохранить токен».';
+  const accountStatus = values.accountId
+    ? { label: 'заполнен', tone: 'ok' as const }
+    : { label: 'пусто', tone: 'warn' as const };
 
   return (
-    <>
-      <Section
-        title="Брокер"
-        description="Подключение к Tinkoff Investments API. Sandbox безопасен, Live — реальные деньги."
-        onSave={onSave}
-        saving={saving}
-        dirty={dirty}
-        disabled={disabled}
-      >
-        <SelectField
-          label="Окружение"
-          value={values.environment}
-          onChange={(v) => handleEnvChange(v as BrokerSettings['environment'])}
-          options={[
-            { value: 'sandbox', label: 'Sandbox (безопасно)' },
-            { value: 'live', label: 'Live (реальные деньги)' },
-          ]}
-          disabled={disabled}
-        />
-        <div className="space-y-2">
-          <TextField
-            label="Токен"
-            type="password"
-            value={tokenDraft}
-            onChange={(v) => {
-              setTokenDraft(v);
-              setTokenTouched(true);
-              setTokenSaveStatus('idle');
-              // Mark token as redacted for the local broker view; actual write
-              // happens on Save Token, not on Save Settings.
-              onChange({ tokenRedacted: true });
-            }}
-            placeholder="Вставьте токен Tinkoff"
-            hint={tokenHint}
-            disabled={disabled || tokenSaveStatus === 'saving'}
-          />
-          <button
-            type="button"
-            onClick={handleSaveToken}
-            disabled={disabled || !tokenDraft.trim() || tokenSaveStatus === 'saving'}
-            data-testid="save-token"
-            className="px-3 py-1.5 text-xs rounded border border-accent text-accent hover:bg-accent/10 disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            {tokenSaveStatus === 'saving' ? 'Сохранение…' : 'Сохранить токен'}
-          </button>
+    <Section
+      title="Брокер"
+      description="Подключение к Tinkoff Investments API. Sandbox безопасен, Live — реальные деньги."
+      onSave={onSave}
+      saving={saving}
+      dirty={dirty || tokenHasDraft}
+      disabled={disabled}
+    >
+      <div className="md:col-span-2 flex flex-col gap-1.5">
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] uppercase text-text-dim tracking-wider">Окружение</span>
+          <FieldStatusLite tone={envStatus.tone}>{envStatus.label}</FieldStatusLite>
         </div>
+        <div role="radiogroup" aria-label="Окружение" className="grid grid-cols-2 gap-2">
+          <EnvRadioCard
+            label="Sandbox"
+            sub="Тестовые счета. Без реальных денег."
+            selected={values.environment === 'sandbox'}
+            onSelect={() => handleEnvChange('sandbox')}
+            tone="ok"
+          />
+          <EnvRadioCard
+            label="Live"
+            sub="Реальные деньги. Проверьте risk-лимиты."
+            selected={values.environment === 'live'}
+            onSelect={() => handleEnvChange('live')}
+            tone="warn"
+          />
+        </div>
+        {envIsLive && (
+          <aside
+            role="note"
+            aria-label="Предупреждение о реальных деньгах"
+            className="mt-1 border border-amber rounded-md p-2 bg-amber/10 text-amber text-xs flex gap-2"
+          >
+            <span aria-hidden="true">⚠</span>
+            <div>
+              <strong className="block mb-0.5">Live — реальные деньги.</strong>
+              Проверьте risk-лимиты во вкладке «Риск» перед включением. Любая
+              активная стратегия начнёт торговать сразу после сохранения.
+            </div>
+          </aside>
+        )}
+      </div>
+
+      <div className="md:col-span-2 flex flex-col gap-1.5">
+        <TextField
+          label="Токен"
+          type="password"
+          value={tokenDraft}
+          onChange={(v) => {
+            onTokenDraftChange(v);
+            setTouched(true);
+            onChange({ tokenRedacted: true });
+          }}
+          onClear={tokenHasDraft ? () => onTokenDraftChange('') : undefined}
+          placeholder="Вставьте токен Tinkoff"
+          hint={
+            tokenError
+              ? undefined
+              : tokenHasDraft
+                ? 'Готов к записи. Нажмите «Сохранить».'
+                : values.tokenLast4
+                  ? `Текущий: t.••••••••${values.tokenLast4}. Вставьте новый чтобы заменить.`
+                  : 'Токен не задан. Вставьте токен Tinkoff и сохраните.'
+          }
+          error={tokenError ?? undefined}
+          disabled={disabled}
+          reveal
+          status={tokenStatus}
+        />
+      </div>
+
+      <div className="md:col-span-2">
         <TextField
           label="Account ID"
           value={values.accountId}
           onChange={(v) => onChange({ accountId: v })}
           placeholder="ACC-XXXXXXX"
+          hint={values.accountId ? undefined : 'Укажите аккаунт Tinkoff, к которому подключён токен.'}
           disabled={disabled}
+          status={accountStatus}
         />
-      </Section>
-      <ConfirmDialog
-        open={showLiveConfirm}
-        title="Включить live-торговлю?"
-        body="Реальные деньги. Убедитесь что risk-лимиты настроены корректно."
-        confirmLabel="Включить Live"
-        cancelLabel="Отмена"
-        danger
-        onConfirm={confirmLive}
-        onCancel={() => setShowLiveConfirm(false)}
-      />
-    </>
+      </div>
+    </Section>
   );
 }
+
+function EnvRadioCard({
+  label,
+  sub,
+  selected,
+  onSelect,
+  tone,
+}: {
+  label: string;
+  sub: string;
+  selected: boolean;
+  onSelect: () => void;
+  tone: 'ok' | 'warn';
+}) {
+  const ring =
+    tone === 'warn' && selected
+      ? 'border-amber bg-amber/10'
+      : selected
+        ? 'border-accent bg-accent/10'
+        : 'border-border hover:border-text-muted';
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={selected}
+      onClick={onSelect}
+      className={`text-left border rounded-md p-2.5 transition-colors ${ring}`}
+    >
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-semibold">{label}</span>
+        {selected && (
+          <span className={`text-[10px] uppercase tracking-wider ${tone === 'warn' ? 'text-amber' : 'text-green'}`}>
+            ● выбрано
+          </span>
+        )}
+      </div>
+      <div className="text-[11px] text-text-muted mt-1">{sub}</div>
+    </button>
+  );
+}
+
+// Local copy of the status pill — kept inline so this component does
+// not need a separate import surface for a tiny visual atom. Logic is
+// identical to <FieldStatus/> in Field.tsx; the import path is used by
+// TextField for its `status` prop while this one is used in the env
+// row where the label is rendered outside FieldShell.
+function FieldStatusLite({
+  tone,
+  children,
+}: {
+  tone: 'ok' | 'warn' | 'err' | 'dim';
+  children: React.ReactNode;
+}) {
+  const cls =
+    tone === 'ok'
+      ? 'bg-green-soft text-green'
+      : tone === 'warn'
+        ? 'bg-amber/15 text-amber'
+        : tone === 'err'
+          ? 'bg-red-soft text-red'
+          : 'bg-surface-2 text-text-dim';
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider ${cls}`}
+      aria-hidden="true"
+    >
+      <span className="w-1.5 h-1.5 rounded-full bg-current" />
+      {children}
+    </span>
+  );
+}
+
+// Re-export kept for callers that already imported useSaveToken from this
+// module. The actual save now flows through the parent section's onSave
+// handler — the fan-out (POST /api/settings/token then PUT /api/settings)
+// is orchestrated by SettingsTab, not here.
+export { useSaveToken } from '@lib/hooks';

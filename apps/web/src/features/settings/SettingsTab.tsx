@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { DEFAULT_SETTINGS } from '@algotrader/shared';
-import { useDeleteSettings, useSaveSettings, useSettings } from '@lib/hooks';
+import { useDeleteSettings, useSaveSettings, useSaveToken, useSettings } from '@lib/hooks';
 import { useSettingsStore } from '@stores/settingsStore';
 import { BrokerSection } from '@features/settings/sections/BrokerSection';
 import { DataSection } from '@features/settings/sections/DataSection';
@@ -21,9 +21,11 @@ const TABS: ReadonlyArray<{ id: SectionId; label: string }> = [
 export function SettingsTab() {
   const { data, isLoading, isError, error } = useSettings();
   const saveMutation = useSaveSettings();
+  const saveTokenMutation = useSaveToken();
   const deleteMutation = useDeleteSettings();
   const { values, loaded, update, setValues, isDirty, version } = useSettingsStore();
   const [active, setActive] = useState<SectionId>('broker');
+  const [tokenDraft, setTokenDraft] = useState('');
   const [toast, setToast] = useState<{ message: string; tone: 'ok' | 'warn' | 'err' | 'info' } | null>(null);
 
   useEffect(() => {
@@ -33,10 +35,29 @@ export function SettingsTab() {
   const showToast = (message: string, tone: 'ok' | 'warn' | 'err' | 'info') => setToast({ message, tone });
 
   const handleSave = async () => {
+    // Fan-out: if the broker section has a fresh token draft, POST it
+    // first (writes to the secrets table), then PUT the public settings
+    // row with the new tokenLast4 reflected. Both share one progress
+    // and one result banner.
+    if (tokenDraft.trim()) {
+      try {
+        const tokenRes = await saveTokenMutation.mutateAsync({ token: tokenDraft.trim() });
+        // Reflect new last4 immediately so the PUT body matches.
+        update('broker', { tokenLast4: tokenRes.tokenLast4, tokenRedacted: true });
+        setTokenDraft('');
+      } catch (e) {
+        const err = e as Error & { status?: number };
+        showToast(`Ошибка записи токена: ${err.message ?? 'неизвестно'}`, 'err');
+        return;
+      }
+    }
     try {
       const res = await saveMutation.mutateAsync({ values, version: version ?? 'v1' });
       setValues(res.values, res.version);
-      showToast('Сохранено', 'ok');
+      const last4 = res.values.broker.tokenLast4 || '—';
+      const env = res.values.broker.environment;
+      const acc = res.values.broker.accountId;
+      showToast(`Сохранено · ${env} · account ${acc} · token ••••${last4}`, 'ok');
     } catch (e) {
       const err = e as Error & { status?: number };
       if (err.status === 409) {
@@ -82,7 +103,15 @@ export function SettingsTab() {
         ))}
       </div>
       {active === 'broker' && (
-        <BrokerSection values={values.broker} onChange={updateActive} onSave={handleSave} saving={saveMutation.isPending} dirty={loaded && isDirty()} />
+        <BrokerSection
+          values={values.broker}
+          onChange={updateActive}
+          onSave={handleSave}
+          saving={saveMutation.isPending || saveTokenMutation.isPending}
+          dirty={(loaded && isDirty()) || tokenDraft.trim().length > 0}
+          tokenDraft={tokenDraft}
+          onTokenDraftChange={setTokenDraft}
+        />
       )}
       {active === 'risk' && (
         <RiskSection values={values.risk} onChange={updateActive} onSave={handleSave} saving={saveMutation.isPending} dirty={loaded && isDirty()} />

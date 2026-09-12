@@ -50,388 +50,263 @@ const data: DataSettings = {
 };
 
 describe('BrokerSection', () => {
-  it('renders environment, token (editable), account id', () => {
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={() => {}}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    expect(screen.getByText('Sandbox (безопасно)')).toBeInTheDocument();
-    // Token is now an editable input — placeholder guides paste.
+  function renderBroker(
+    overrides: Partial<Parameters<typeof BrokerSection>[0]> = {},
+  ) {
+    const onChange = vi.fn();
+    const onSave = vi.fn();
+    const props = {
+      values: broker,
+      onChange,
+      onSave,
+      saving: false,
+      dirty: false,
+      tokenDraft: '',
+      onTokenDraftChange: vi.fn(),
+      ...overrides,
+    };
+    return { ...render(<BrokerSection {...props} />), onChange, onSave, props };
+  }
+
+  it('renders env radio cards, token input with reveal, and account id', () => {
+    renderBroker();
+    expect(screen.getByRole('radio', { name: /Sandbox/ })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /Live/ })).toBeInTheDocument();
     expect(screen.getByPlaceholderText(/Вставьте токен Tinkoff/)).toBeInTheDocument();
+    // Reveal toggle renders for the token field.
+    expect(screen.getByRole('button', { name: 'Показать токен' })).toBeInTheDocument();
     expect(screen.getByDisplayValue('ACC-1')).toBeInTheDocument();
   });
 
-  it('selecting live shows confirm dialog', async () => {
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={() => {}}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    const select = screen.getByRole('combobox', { name: 'Окружение' });
-    fireEvent.change(select, { target: { value: 'live' } });
-    await waitFor(() => {
-      expect(screen.getByText('Включить live-торговлю?')).toBeInTheDocument();
-    });
+  it('marks Sandbox radio as checked by default', () => {
+    renderBroker();
+    expect(screen.getByRole('radio', { name: /Sandbox/ })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByRole('radio', { name: /Live/ })).toHaveAttribute('aria-checked', 'false');
   });
 
-  it('canceling live confirm reverts to sandbox', async () => {
-    let current: BrokerSettings = broker;
-    const handleChange = vi.fn((patch: Partial<BrokerSettings>) => {
-      current = { ...current, ...patch };
-    });
-    const { rerender } = render(
-      <BrokerSection
-        values={broker}
-        onChange={handleChange}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    const select = screen.getByRole('combobox', { name: 'Окружение' });
-    fireEvent.change(select, { target: { value: 'live' } });
-    await waitFor(() => {
-      expect(screen.getByText('Включить live-торговлю?')).toBeInTheDocument();
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Отмена' }));
-    expect(handleChange).not.toHaveBeenCalledWith(expect.objectContaining({ environment: 'live' }));
-    // Dialog closes
-    await waitFor(() => {
-      expect(screen.queryByText('Включить live-торговлю?')).not.toBeInTheDocument();
-    });
-    rerender(
-      <BrokerSection
-        values={current}
-        onChange={handleChange}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-  });
-
-  it('confirming live confirm fires onChange with live', async () => {
-    const handleChange = vi.fn();
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={handleChange}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    fireEvent.change(screen.getByRole('combobox', { name: 'Окружение' }), {
-      target: { value: 'live' },
-    });
-    await waitFor(() => {
-      expect(screen.getByText('Включить live-торговлю?')).toBeInTheDocument();
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Включить Live' }));
-    expect(handleChange).toHaveBeenCalledWith({ environment: 'live' });
-  });
-
-  it('account id input fires onChange', () => {
-    const handleChange = vi.fn();
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={handleChange}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    const input = screen.getByDisplayValue('ACC-1');
-    fireEvent.change(input, { target: { value: 'NEW' } });
-    expect(handleChange).toHaveBeenCalledWith({ accountId: 'NEW' });
-  });
-
-  it('selecting sandbox when already sandbox fires onChange without confirm', () => {
+  it('shows inline warn-banner when Live is selected, no confirm dialog', async () => {
     const onChange = vi.fn();
-    const sandbox: BrokerSettings = { ...broker, environment: 'sandbox' };
-    render(
-      <BrokerSection
-        values={sandbox}
-        onChange={onChange}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    const select = screen.getByRole('combobox', { name: 'Окружение' });
-    fireEvent.change(select, { target: { value: 'sandbox' } });
-    expect(onChange).toHaveBeenCalledWith({ environment: 'sandbox' });
+    render(<BrokerSection
+      values={{ ...broker, environment: 'live' }}
+      onChange={onChange}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft=""
+      onTokenDraftChange={vi.fn()}
+    />);
+    expect(screen.getByRole('note')).toHaveTextContent(/Live — реальные деньги/);
+    // No ConfirmDialog opens.
+    expect(screen.queryByText('Включить live-торговлю?')).not.toBeInTheDocument();
   });
 
-  it('confirming live trading fires onChange with environment=live', async () => {
+  it('hides warn-banner when Sandbox is selected', () => {
+    renderBroker();
+    expect(screen.queryByRole('note')).not.toBeInTheDocument();
+  });
+
+  it('clicking Live radio fires onChange with environment=live', () => {
     const onChange = vi.fn();
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={onChange}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    const select = screen.getByRole('combobox', { name: 'Окружение' });
-    fireEvent.change(select, { target: { value: 'live' } });
-    await waitFor(() => expect(screen.getByText('Включить live-торговлю?')).toBeInTheDocument());
-    fireEvent.click(screen.getByRole('button', { name: 'Включить Live' }));
+    render(<BrokerSection
+      values={broker}
+      onChange={onChange}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft=""
+      onTokenDraftChange={vi.fn()}
+    />);
+    fireEvent.click(screen.getByRole('radio', { name: /Live/ }));
     expect(onChange).toHaveBeenCalledWith({ environment: 'live' });
   });
 
-  it('cancelling live trading confirm keeps environment as sandbox', async () => {
+  it('clicking Sandbox radio fires onChange with environment=sandbox', () => {
     const onChange = vi.fn();
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={onChange}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    const select = screen.getByRole('combobox', { name: 'Окружение' });
-    fireEvent.change(select, { target: { value: 'live' } });
-    await waitFor(() => expect(screen.getByText('Включить live-торговлю?')).toBeInTheDocument());
-    fireEvent.click(screen.getByRole('button', { name: 'Отмена' }));
-    expect(onChange).not.toHaveBeenCalled();
+    render(<BrokerSection
+      values={{ ...broker, environment: 'live' }}
+      onChange={onChange}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft=""
+      onTokenDraftChange={vi.fn()}
+    />);
+    fireEvent.click(screen.getByRole('radio', { name: /Sandbox/ }));
+    expect(onChange).toHaveBeenCalledWith({ environment: 'sandbox' });
   });
 
   it('account id input fires onChange', () => {
     const onChange = vi.fn();
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={onChange}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    const input = screen.getByLabelText('Account ID');
-    fireEvent.change(input, { target: { value: 'NEW-ID' } });
+    render(<BrokerSection
+      values={broker}
+      onChange={onChange}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft=""
+      onTokenDraftChange={vi.fn()}
+    />);
+    fireEvent.change(screen.getByLabelText('Account ID'), { target: { value: 'NEW-ID' } });
     expect(onChange).toHaveBeenCalledWith({ accountId: 'NEW-ID' });
   });
 
-  it('renders the Save button', () => {
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={() => {}}
-        onSave={vi.fn()}
-        saving={false}
-        dirty={true}
-      />,
-    );
-    expect(screen.getByRole('button', { name: 'Сохранить' })).toBeInTheDocument();
+  it('token reveal toggle changes input type from password to text', () => {
+    renderBroker();
+    const input = screen.getByPlaceholderText(/Вставьте токен Tinkoff/) as HTMLInputElement;
+    expect(input.type).toBe('password');
+    fireEvent.click(screen.getByRole('button', { name: 'Показать токен' }));
+    expect(input.type).toBe('text');
+    expect(screen.getByRole('button', { name: 'Скрыть токен' })).toHaveAttribute('aria-pressed', 'true');
   });
 
-  it('disables Save when not dirty', () => {
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={() => {}}
-        onSave={vi.fn()}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    const btn = screen.getByRole('button', { name: 'Сохранить' });
-    expect(btn).toBeDisabled();
-  });
-
-  it('shows saving state', () => {
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={() => {}}
-        onSave={vi.fn()}
-        saving={true}
-        dirty={true}
-      />,
-    );
-    expect(screen.getByText('Сохранение…')).toBeInTheDocument();
-  });
-
-  it('renders Save token button disabled when draft is empty', () => {
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={() => {}}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    const btn = screen.getByTestId('save-token') as HTMLButtonElement;
-    expect(btn).toBeInTheDocument();
-    expect(btn.disabled).toBe(true);
-  });
-
-  it('enables Save token when draft has value', () => {
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={() => {}}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
+  it('token input forwards value via onTokenDraftChange', () => {
+    const onTokenDraftChange = vi.fn();
+    render(<BrokerSection
+      values={broker}
+      onChange={() => {}}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft=""
+      onTokenDraftChange={onTokenDraftChange}
+    />);
     fireEvent.change(screen.getByPlaceholderText(/Вставьте токен Tinkoff/), {
-      target: { value: 'new.token' },
+      target: { value: 't.short' },
     });
-    expect(screen.getByTestId('save-token')).not.toBeDisabled();
+    expect(onTokenDraftChange).toHaveBeenCalledWith('t.short');
   });
 
-  it('typing into token field marks tokenRedacted via onChange', () => {
-    const handleChange = vi.fn();
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={handleChange}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
+  it('shows validation error when token does not start with t.', () => {
+    const { rerender } = render(<BrokerSection
+      values={broker}
+      onChange={() => {}}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft=""
+      onTokenDraftChange={vi.fn()}
+    />);
+    // Touch the field by typing once; that flips `touched` inside the
+    // component so validation becomes active.
     fireEvent.change(screen.getByPlaceholderText(/Вставьте токен Tinkoff/), {
-      target: { value: 'abc' },
+      target: { value: 'abcd_long_enough_for_min_check' },
     });
-    expect(handleChange).toHaveBeenCalledWith({ tokenRedacted: true });
+    rerender(<BrokerSection
+      values={broker}
+      onChange={() => {}}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft="abcd_long_enough_for_min_check"
+      onTokenDraftChange={vi.fn()}
+    />);
+    expect(screen.getByRole('alert')).toHaveTextContent(/начинается с «t\.»/);
   });
 
-  it('shows last-4 hint when tokenLast4 is set and field untouched', () => {
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={() => {}}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    expect(screen.getByText(/Текущий: ••••••••ABCD/)).toBeInTheDocument();
+  it('does not show validation error before user touches the field', () => {
+    render(<BrokerSection
+      values={broker}
+      onChange={() => {}}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft="bad"
+      onTokenDraftChange={vi.fn()}
+    />);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('shows "no token" hint when tokenLast4 is empty', () => {
-    render(
-      <BrokerSection
-        values={{ ...broker, tokenLast4: '' }}
-        onChange={() => {}}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
+  it('shows last-4 hint when token is set and draft is empty', () => {
+    render(<BrokerSection
+      values={broker}
+      onChange={() => {}}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft=""
+      onTokenDraftChange={vi.fn()}
+    />);
+    expect(screen.getByText(/Текущий: t\.••••••••ABCD/)).toBeInTheDocument();
+  });
+
+  it('shows "token not set" hint when tokenLast4 is empty and draft is empty', () => {
+    render(<BrokerSection
+      values={{ ...broker, tokenLast4: '' }}
+      onChange={() => {}}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft=""
+      onTokenDraftChange={vi.fn()}
+    />);
     expect(screen.getByText(/Токен не задан/)).toBeInTheDocument();
   });
 
-  it('hides last-4 hint after user edits draft', () => {
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={() => {}}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    fireEvent.change(screen.getByPlaceholderText(/Вставьте токен Tinkoff/), {
-      target: { value: 'x' },
-    });
-    expect(screen.queryByText(/Текущий: ••••••••ABCD/)).not.toBeInTheDocument();
-    expect(screen.getByText(/Нажмите «Сохранить токен»/)).toBeInTheDocument();
+  it('shows empty-account hint when accountId is empty', () => {
+    render(<BrokerSection
+      values={{ ...broker, accountId: '' }}
+      onChange={() => {}}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft=""
+      onTokenDraftChange={vi.fn()}
+    />);
+    expect(screen.getByText(/Укажите аккаунт Tinkoff/)).toBeInTheDocument();
   });
 
-  it('clicking Save token calls useSaveToken mutation with draft', async () => {
-    const mutateAsync = vi.fn().mockResolvedValue({ tokenLast4: '9999', tokenRedacted: true });
-    const useSaveTokenSpy = vi.spyOn(await import('@lib/hooks'), 'useSaveToken').mockReturnValue({
-      mutateAsync,
-      isPending: false,
-      reset: vi.fn(),
-    } as unknown as ReturnType<typeof import('@lib/hooks').useSaveToken>);
-    const handleChange = vi.fn();
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={handleChange}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    fireEvent.change(screen.getByPlaceholderText(/Вставьте токен Tinkoff/), {
-      target: { value: 't.realval.9999' },
-    });
-    fireEvent.click(screen.getByTestId('save-token'));
-    await waitFor(() => {
-      expect(mutateAsync).toHaveBeenCalledWith({ token: 't.realval.9999' });
-    });
-    expect(handleChange).toHaveBeenCalledWith({ tokenLast4: '9999', tokenRedacted: true });
-    useSaveTokenSpy.mockRestore();
+  it('Save button is rendered inside the Section', () => {
+    render(<BrokerSection
+      values={broker}
+      onChange={() => {}}
+      onSave={vi.fn()}
+      saving={false}
+      dirty
+      tokenDraft=""
+      onTokenDraftChange={vi.fn()}
+    />);
+    expect(screen.getByRole('button', { name: 'Сохранить' })).toBeInTheDocument();
   });
 
-  it('shows error message on Save token failure', async () => {
-    const mutateAsync = vi.fn().mockRejectedValue(new Error('network down'));
-    vi.spyOn(await import('@lib/hooks'), 'useSaveToken').mockReturnValue({
-      mutateAsync,
-      isPending: false,
-      reset: vi.fn(),
-    } as unknown as ReturnType<typeof import('@lib/hooks').useSaveToken>);
-    render(
-      <BrokerSection
-        values={broker}
-        onChange={() => {}}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    fireEvent.change(screen.getByPlaceholderText(/Вставьте токен Tinkoff/), {
-      target: { value: 't.realval' },
-    });
-    fireEvent.click(screen.getByTestId('save-token'));
-    await waitFor(() => {
-      expect(screen.getByText(/Ошибка: network down/)).toBeInTheDocument();
-    });
+  it('Save button is disabled when not dirty', () => {
+    render(<BrokerSection
+      values={broker}
+      onChange={() => {}}
+      onSave={vi.fn()}
+      saving={false}
+      dirty={false}
+      tokenDraft=""
+      onTokenDraftChange={vi.fn()}
+    />);
+    expect(screen.getByRole('button', { name: 'Сохранить' })).toBeDisabled();
   });
 
-  it('shows em-dash fallback in saved hint when tokenLast4 stays empty', async () => {
-    const mutateAsync = vi.fn().mockResolvedValue({ tokenLast4: '', tokenRedacted: true });
-    vi.spyOn(await import('@lib/hooks'), 'useSaveToken').mockReturnValue({
-      mutateAsync,
-      isPending: false,
-      reset: vi.fn(),
-    } as unknown as ReturnType<typeof import('@lib/hooks').useSaveToken>);
-    render(
-      <BrokerSection
-        values={{ ...broker, tokenLast4: '' }}
-        onChange={() => {}}
-        onSave={() => {}}
-        saving={false}
-        dirty={false}
-      />,
-    );
-    fireEvent.change(screen.getByPlaceholderText(/Вставьте токен Tinkoff/), {
-      target: { value: 't.realval' },
-    });
-    fireEvent.click(screen.getByTestId('save-token'));
-    await waitFor(() => {
-      expect(screen.getByText(/последние 4: —/)).toBeInTheDocument();
-    });
+  it('Save button shows saving state', () => {
+    render(<BrokerSection
+      values={broker}
+      onChange={() => {}}
+      onSave={vi.fn()}
+      saving
+      dirty
+      tokenDraft=""
+      onTokenDraftChange={vi.fn()}
+    />);
+    expect(screen.getByText('Сохранение…')).toBeInTheDocument();
+  });
+
+  it('clearing the token field via the clear button calls onTokenDraftChange with empty', () => {
+    const onTokenDraftChange = vi.fn();
+    render(<BrokerSection
+      values={broker}
+      onChange={() => {}}
+      onSave={() => {}}
+      saving={false}
+      dirty={false}
+      tokenDraft="t.already_have_some_value"
+      onTokenDraftChange={onTokenDraftChange}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: 'Очистить' }));
+    expect(onTokenDraftChange).toHaveBeenCalledWith('');
   });
 });
 

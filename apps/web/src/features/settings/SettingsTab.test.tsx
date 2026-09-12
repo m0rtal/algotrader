@@ -121,7 +121,7 @@ describe('SettingsTab', () => {
     act(() => useSettingsStore.setState({ version: null }));
     fireEvent.change(screen.getByLabelText('Account ID'), { target: { value: 'Y' } });
     fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
-    await waitFor(() => expect(screen.getByText('Сохранено')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/Сохранено · sandbox/)).toBeInTheDocument());
     expect(receivedVersion).toBe('v1');
   });
 
@@ -169,7 +169,7 @@ describe('SettingsTab', () => {
       expect(saveBtn).not.toBeDisabled();
     });
     fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
-    await waitFor(() => screen.getByText('Сохранено'));
+    await waitFor(() => screen.getByText(/Сохранено · sandbox/));
   });
 
   it('clicking reset shows confirm then triggers reset', async () => {
