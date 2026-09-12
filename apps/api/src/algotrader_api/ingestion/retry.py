@@ -36,6 +36,17 @@ _RESOURCE_EXHAUSTED_PATTERNS = (
     "429",
 )
 
+# Pattern for Tinkoff server-suggested retry delay. Server returns this
+# in the gRPC trailing metadata as `ratelimit_reset=<seconds>`; we also
+# see it in the string representation of the RuntimeError raised by the
+# SDK. Matching both lets the helper work without depending on the grpc
+# module at import time.
+import re as _re
+
+_RATELIMIT_RESET_RE = _re.compile(
+    r"ratelimit_reset\s*[=:]\s*(\d+)", _re.IGNORECASE
+)
+
 
 class _BackoffState:
     def __init__(self) -> None:
@@ -47,6 +58,44 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     """Return True if exception looks like a rate-limit / quota error."""
     msg = str(exc).lower()
     return any(p.lower() in msg for p in _RESOURCE_EXHAUSTED_PATTERNS)
+
+
+def _extract_retry_after(exc: BaseException) -> float | None:
+    """Read server-suggested retry delay from a rate-limit error.
+
+    Tinkoff sends `ratelimit_reset=<seconds-until-window-rolls>` in the
+    gRPC metadata for RESOURCE_EXHAUSTED responses; respecting that
+    instead of using a fixed exponential backoff avoids flooding the
+    server with retries that are guaranteed to fail until the window
+    rolls over.
+
+    Returns the suggested delay in seconds (always >= 1 so a tiny
+    reset value doesn't cause a hot loop), or None when the metadata
+    is not present. Handles both RuntimeError str representations
+    (what our SDK currently raises) and live grpc.RpcError objects.
+    """
+    delay: float | None = None
+    # 1) String match — covers the SDK's RuntimeError("...Metadata(...)") form.
+    m = _RATELIMIT_RESET_RE.search(str(exc))
+    if m:
+        delay = float(m.group(1))
+    # 2) Live grpc.RpcError — has trailing_metadata() returning an iterable.
+    trailing = getattr(exc, "trailing_metadata", None)
+    if trailing is not None and callable(trailing):
+        try:  # pragma: no cover — defensive against any grpc stub mismatch
+            items = trailing()
+            for entry in list(items):  # type: ignore[arg-type]
+                if not isinstance(entry, tuple) or len(entry) != 2:
+                    continue
+                key, value = entry
+                if str(key).lower() == "ratelimit_reset":
+                    delay = float(value)  # type: ignore[arg-type]
+                    break
+        except Exception:
+            pass
+    if delay is None:
+        return None
+    return max(delay, 1.0)
 
 
 class AdaptiveRetry:
@@ -108,14 +157,27 @@ class AdaptiveRetry:
                         error=str(e),
                     )
                     raise
+                # If the server told us exactly when the rate-limit
+                # window rolls over, honour that instead of relying on
+                # the local exponential schedule.
+                server_suggested = _extract_retry_after(e)
+                if server_suggested is not None:
+                    delay = server_suggested
                 logger.info(
                     "retry.backoff",
                     attempt=attempt,
                     next_delay_s=round(delay, 3),
                     error=str(e),
+                    server_suggested=server_suggested,
                 )
                 await asyncio.sleep(delay)
-                delay = min(delay * self._backoff_factor, self._max_delay)
+                # When the server told us exactly how long to wait, use
+                # that as the seed for the next backoff (so a tight
+                # exponential doesn't drown it out). Otherwise let the
+                # local exponential schedule continue normally.
+                if server_suggested is not None:
+                    delay = max(delay, server_suggested) * self._backoff_factor
+                    delay = min(delay, self._max_delay)
         # Unreachable, but mypy complains without this
         if last_exc is not None:
             raise last_exc
