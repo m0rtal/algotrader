@@ -465,9 +465,27 @@ class BackfillRunner:
     # ─── DB helpers ──────────────────────────────────────────────────
 
     def _list_instruments(self) -> list[dict]:
+        # Ponytail: only share/etf have `get_candles` endpoints on the
+        # Tinkoff live API. Bonds/futures/options have other endpoints
+        # (coupons, settlements, position_uids) we don't yet model.
+        # Pulling them through `_backfill_one` would burn rate-limit
+        # budget on guaranteed NOT_FOUND 50002 responses — which is
+        # exactly the chunk-warning flood the operator was seeing.
+        # `_discover_universe` already marks them with
+        # last_run_status='no_candles_method'; we keep that filter here
+        # too so the read path matches the write path.
         con = sqlite3.connect(self.db_path)
         con.row_factory = sqlite3.Row
-        rows = con.execute("SELECT ticker, figi, class FROM instruments").fetchall()
+        rows = con.execute(
+            "SELECT i.ticker, i.figi, i.class "
+            "FROM instruments i "
+            "WHERE i.class IN ('share', 'etf') "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM instrument_metadata m "
+            "  WHERE m.figi = i.figi "
+            "  AND m.last_run_status = 'no_candles_method'"
+            ")"
+        ).fetchall()
         con.close()
         return [dict(r) for r in rows]
 

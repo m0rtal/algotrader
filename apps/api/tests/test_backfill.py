@@ -479,6 +479,59 @@ async def test_log_writes_row_with_correct_fields(tmp_path):
     datetime.fromisoformat(row[0])
 
 
+# ─── _list_instruments filter ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_instruments_excludes_non_bar_classes(tmp_path):
+    """Only share/etf have `get_candles` endpoints; bonds/futures/options
+    would burn rate-limit on guaranteed NOT_FOUND. They must not appear
+    in `_list_instruments` so the backfill loop never sees them."""
+    import sqlite3
+
+    # autouse `_run_migrations` fixture already created the empty tables
+    # on `tmp_path / state.db`; reuse them.
+    con = sqlite3.connect(str(tmp_path / "state.db"))
+    con.executemany(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            ("SBER", "BBG004730N88", "share", "Sber", "rub", 10),
+            ("FXUS", "BBG111111111", "etf", "FXUS ETF", "rub", 1),
+            ("RU000A10B420", "TCS00A10B420", "bond", "Bond A", "rub", 1),
+            ("FUT1", "FUTFIGI1", "future", "Future 1", "rub", 1),
+            ("OPT1", "3334f2b7-7320-4a24-8661-170605e02e83", "option", "Opt", "rub", 1),
+        ],
+    )
+    con.executemany(
+        "INSERT INTO instrument_metadata (figi, last_run_status) VALUES (?, ?)",
+        [
+            ("BBG004730N88", "ok"),
+            ("BBG111111111", "ok"),
+            ("TCS00A10B420", "no_candles_method"),
+            ("FUTFIGI1", "no_candles_method"),
+            ("3334f2b7-7320-4a24-8661-170605e02e83", "no_candles_method"),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    async def noop(ev):
+        pass
+
+    runner = BackfillRunner(
+        client=MagicMock(),
+        db_path=str(tmp_path / "state.db"),
+        bars_dir=str(tmp_path / "bars"),
+        event_sink=noop,
+    )
+    instruments = runner._list_instruments()
+    classes = sorted({i["class"] for i in instruments})
+    assert classes == ["etf", "share"], f"unexpected classes: {classes}"
+    tickers = sorted(i["ticker"] for i in instruments)
+    assert tickers == ["FXUS", "SBER"]
+
+
 # ─── defensive branches ─────────────────────────────────────────────
 
 
