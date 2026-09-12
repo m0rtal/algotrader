@@ -309,6 +309,20 @@ class BackfillRunner:
         # Tinkoff's live API rejects (INVALID_ARGUMENT 30014) requests longer
         # than ~7 days for the day interval. Walk the [from_, to] window in
         # 7-day chunks; a single-chunk call behaves like the old flow.
+        # Each chunk is wrapped in AdaptiveRetry so a transient
+        # RESOURCE_EXHAUSTED (gRPC 8) or HTTP 429 from the rate limiter
+        # is handled via exponential backoff instead of being logged as
+        # a per-chunk warning and abandoned. We keep the backoff tight
+        # (max 5s, max 2 attempts) so a sustained throttle still fails
+        # the ticker promptly rather than stalling the whole run.
+        from .retry import AdaptiveRetry
+
+        chunk_retry = AdaptiveRetry(
+            max_attempts=2,
+            initial_delay=0.5,
+            backoff_factor=2.0,
+            max_delay=5.0,
+        )
         all_candles: list = []
         chunk_days = 7
         cur = from_
@@ -319,11 +333,13 @@ class BackfillRunner:
             chunk_end = min(cur + timedelta(days=chunk_days - 1), to)
             chunks_attempted += 1
             try:
-                chunk = await self.client.get_candles(
-                    figi=figi,
-                    date_from=cur,
-                    date_to=chunk_end,
-                    interval="CANDLE_INTERVAL_DAY",
+                chunk = await chunk_retry.run(
+                    lambda cur=cur, chunk_end=chunk_end: self.client.get_candles(
+                        figi=figi,
+                        date_from=cur,
+                        date_to=chunk_end,
+                        interval="CANDLE_INTERVAL_DAY",
+                    )
                 )
                 all_candles.extend(chunk)
             except Exception as e:  # noqa: BLE001

@@ -283,6 +283,81 @@ async def test_backfill_one_logs_failure_doesnt_abort(tmp_path):
     assert "network blip" in progress[0].payload["error"]
 
 
+@pytest.mark.asyncio
+async def test_backfill_one_retries_chunk_on_resource_exhausted(tmp_path):
+    """A RESOURCE_EXHAUSTED chunk should be retried (not just logged as
+    a warning and abandoned). The runner holds a per-ticker retry
+    policy; one initial call + one retry should be enough to recover
+    before the per-chunk warning fires."""
+    import sqlite3
+
+    bars_dir = tmp_path / "bars"
+    closed = SimpleNamespace(
+        time=SimpleNamespace(year=2024, month=6, day=1),
+        open=SimpleNamespace(units=100, nano=0),
+        high=SimpleNamespace(units=110, nano=0),
+        low=SimpleNamespace(units=95, nano=0),
+        close=SimpleNamespace(units=105, nano=0),
+        volume=1000,
+        is_complete=True,
+    )
+    closed_bar_dict = {
+        "time": {"year": 2024, "month": 6, "day": 1},
+        "open": 100.0,
+        "high": 110.0,
+        "low": 95.0,
+        "close": 105.0,
+        "volume": 1000,
+        "is_complete": True,
+    }
+
+    client = MagicMock()
+    # First call raises RESOURCE_EXHAUSTED, second call succeeds.
+    client.get_candles = AsyncMock(
+        side_effect=[
+            RuntimeError("RESOURCE_EXHAUSTED: rate limit"),
+            [closed_bar_dict],
+        ]
+    )
+
+    events = []
+
+    async def collect(ev):
+        events.append(ev)
+
+    runner = BackfillRunner(
+        client=client,
+        db_path=str(tmp_path / "state.db"),
+        bars_dir=str(bars_dir),
+        event_sink=collect,
+    )
+    written = await runner._backfill_one(
+        figi="BBG001",
+        from_=date(2024, 6, 1),
+        to=date(2024, 6, 7),
+    )
+    # Retry succeeded → we should have written 1 bar from the recovered chunk.
+    assert written == 1
+    # The SDK was called twice (first attempt + retry).
+    assert client.get_candles.await_count == 2
+    # No ticker_progress error event was emitted for this figi.
+    error_events = [
+        ev for ev in events
+        if ev.type == "ticker_progress"
+        and ev.payload.get("status") == "error"
+    ]
+    assert error_events == []
+    # Metadata reflects a successful run, not the transient RESOURCE_EXHAUSTED.
+    con = sqlite3.connect(str(tmp_path / "state.db"))
+    row = con.execute(
+        "SELECT last_run_status FROM instrument_metadata WHERE figi = ?",
+        ("BBG001",),
+    ).fetchone()
+    con.close()
+    assert row is not None
+    assert row[0] == "ok"
+
+
 # ─── state transitions ──────────────────────────────────────────────
 
 
