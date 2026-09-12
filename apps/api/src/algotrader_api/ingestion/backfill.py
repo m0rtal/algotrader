@@ -198,7 +198,9 @@ class BackfillRunner:
                 )
                 continue
             try:
-                bars_written = await self._backfill_one(figi=figi, from_=from_, to=to)
+                bars_written = await self._backfill_one(
+                    figi=figi, ticker=inst.get("ticker"), from_=from_, to=to
+                )
                 self.tickers_done += 1
                 self.total_bars += bars_written
             except Exception as e:  # noqa: BLE001 — defensive, never abort
@@ -292,13 +294,23 @@ class BackfillRunner:
         figi: str,
         from_: date,
         to: date,
+        ticker: str | None = None,
     ) -> int:
         """Fetch candles for one ticker, filter closed, write parquet, update metadata.
 
         Returns the number of bars written. Errors are caught and logged
         as `ticker_progress` events with `status='error'`; the runner
         continues to the next ticker.
+
+        `ticker` is optional and used only for log message readability
+        (so the operator sees `VB58CU6B/3334f2b7-...` instead of the raw
+        position_uid). It must be populated by the caller — passing it
+        here avoids a per-ticker DB roundtrip inside the loop and also
+        works for backfill runs that start without a fresh
+        `_discover_universe`, where `_ticker_by_figi` would be empty.
         """
+        if ticker:
+            self._ticker_by_figi[figi] = ticker
         # Tinkoff's live API rejects (INVALID_ARGUMENT 30014) requests longer
         # than ~7 days for the day interval. Walk the [from_, to] window in
         # 7-day chunks; a single-chunk call behaves like the old flow.
