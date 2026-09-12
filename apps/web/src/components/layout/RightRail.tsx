@@ -7,8 +7,8 @@ export function RightRail() {
   if (!model || !features || !pipeline) return null;
   return (
     <div className="p-4 space-y-3">
-      <div className="bg-surface-2 border border-border rounded-md p-3">
-        <div className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2">ML Model</div>
+      <section className="bg-surface-2 border border-border rounded-md p-3">
+        <h3 className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2">ML Model</h3>
         <Row label="Версия" value={model.version} />
         <Row label="Train окно" value={`${model.trainWindowMonths} мес`} />
         <Row label="Train period" value={`${model.trainStart.slice(0, 7)} → ${model.trainEnd.slice(0, 7)}`} />
@@ -17,9 +17,9 @@ export function RightRail() {
         <Row label="IC (rank)" value={model.ic.toFixed(3)} tone="pos" />
         <Row label="Last train" value={model.lastTrainDate} />
         <Row label="Next retrain" value={model.nextTrainDate} />
-      </div>
-      <div className="bg-surface-2 border border-border rounded-md p-3">
-        <div className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2">Top features</div>
+      </section>
+      <section className="bg-surface-2 border border-border rounded-md p-3">
+        <h3 className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2">Top features</h3>
         {features.map((f) => (
           <div key={f.name} className="flex items-center gap-2 py-0.5 text-[11px]">
             <span className="w-[70px] text-text-muted mono">{f.name}</span>
@@ -32,15 +32,15 @@ export function RightRail() {
             <span className="mono text-text w-[36px] text-right">{f.importance.toFixed(3)}</span>
           </div>
         ))}
-      </div>
-      <div className="bg-surface-2 border border-border rounded-md p-3">
-        <div className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2">
+      </section>
+      <section className="bg-surface-2 border border-border rounded-md p-3">
+        <h3 className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2">
           Pipeline status
-        </div>
+        </h3>
         {pipeline.map((s) => (
           <Row key={s.name} label={s.name} value={s.status === 'ok' ? `✓ ${s.detail ?? ''}` : s.status === 'idle' ? `○ ${s.detail ?? ''}` : s.status} tone={s.status === 'ok' ? 'pos' : s.status === 'err' ? 'neg' : undefined} />
         ))}
-      </div>
+      </section>
     </div>
   );
 }

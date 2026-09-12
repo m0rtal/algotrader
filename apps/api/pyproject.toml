@@ -60,6 +60,10 @@ source = ["algotrader_api"]
 branch = true
 omit = [
     "src/algotrader_api/ingestion/real_client.py",
+    # Operator-facing maintenance scripts (cleanup, future vacuum
+    # tools, …). They run once on demand, not in the request path,
+    # so coverage gate doesn't apply.
+    "src/algotrader_api/maintenance/*",
 ]
 
 [tool.coverage.report]

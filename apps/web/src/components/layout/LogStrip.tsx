@@ -15,7 +15,16 @@ export function LogStrip() {
     queryFn: async () => LogSchema.array().parse(await api<unknown>('/logs')),
     refetchInterval: 5_000,
   });
-  if (!data) return null;
+  if (!data) {
+    return (
+      <div
+        data-testid="global-log-strip"
+        className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-surface/95 backdrop-blur px-4 py-1.5 mono text-[11px] text-text-dim max-h-16 overflow-hidden flex flex-col gap-0.5"
+      >
+        <span className="opacity-50">— Подключение к логам… —</span>
+      </div>
+    );
+  }
   const empty = data.length === 0;
   return (
     <div

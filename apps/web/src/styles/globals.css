@@ -9,15 +9,30 @@
   --color-border-soft: #1a1e2b;
   --color-text: #e4e6eb;
   --color-text-muted: #8b91a3;
-  --color-text-dim: #5a6075;
-  --color-accent: #5d5fef;
+  --color-text-dim: #888ea0;
+  --color-accent: #7a82ff;
   --color-green: #26a69a;
   --color-red: #ef5350;
   --color-amber: #ffa726;
 
+  /* Soft tints for chips/badges. Derived from the solid tokens so
+     contrast stays consistent across surfaces. */
+  --color-green-soft: rgba(38, 166, 154, 0.15);
+  --color-red-soft: rgba(239, 83, 80, 0.15);
+  --color-text-soft: rgba(138, 145, 163, 0.15);
+
+  /* Unprefixed aliases referenced by older component code
+     (BackfillTab, Settings sections, TickerDrilldown). Kept in sync
+     with the prefixed tokens above — change the alias, not both. */
+  --background: var(--color-bg);
+  --card: var(--color-surface);
+  --muted: var(--color-border-soft);
+  --muted-foreground: var(--color-text-muted);
+  --border: var(--color-border);
+  --accent: var(--color-accent);
+
   --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
-  --font-sans:
-    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }
 
 @layer base {
@@ -39,6 +54,16 @@
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
+
+  /* Visible keyboard focus on every interactive element. Tailwind's
+     preflight resets outline, so without this focus is invisible
+     (WCAG 2.4.7 violation). The ring uses the accent colour and a
+     2px offset so it stays visible on dark surfaces. */
+  :where(button, [role='button'], a, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+  /* Suppress the ring on mouse focus so it does not flash on click. */
 
   /* Custom scrollbars — match the dark theme palette */
   * {
@@ -65,5 +90,14 @@
   }
   *::-webkit-scrollbar-corner {
     background: transparent;
+  }
+
+  /* Respect prefers-reduced-motion: stop decorative infinite
+     animations (status pulse, etc.). Action-triggered transitions
+     stay; the spec only requires suppressing non-essential motion. */
+  @media (prefers-reduced-motion: reduce) {
+    .animate-pulse {
+      animation: none !important;
+    }
   }
 }

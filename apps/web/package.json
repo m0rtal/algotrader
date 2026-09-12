@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "lint": "eslint .",
     "typecheck": "tsc -b --noEmit",
+    "lint:a11y": "node scripts/token-check.mjs && node scripts/contrast-check.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

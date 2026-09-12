@@ -40,6 +40,7 @@ export function Dashboard() {
             {TABS.map((t) => (
               <button
                 key={t.id}
+                type="button"
                 onClick={() => setTab(t.id)}
                 className={`px-4 py-2.5 text-xs cursor-pointer border-b-2 whitespace-nowrap ${
                   active === t.id

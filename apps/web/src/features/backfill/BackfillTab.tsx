@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@lib/api';
+import { ConfirmDialog } from '@features/settings/ConfirmDialog';
 
 // ─── API hooks ──────────────────────────────────────────────────────
 
@@ -43,9 +44,13 @@ export function useStartBackfill() {
 }
 
 export function usePendingCount(refetchInterval = 60_000) {
-  return useQuery<{ new: number; stale: number; up_to_date: number; error: number; total: number }>({
+  // The pending endpoint returns the same shape as the inferred return
+  // type below; using `any` here would relax the type guard that
+  // queryClient gives us, so we declare the expected shape explicitly.
+  type Pending = { new: number; stale: number; up_to_date: number; error: number; total: number };
+  return useQuery<Pending>({
     queryKey: ['backfill-pending'],
-    queryFn: () => api<any>('/admin/backfill/pending'),
+    queryFn: () => api<Pending>('/admin/backfill/pending'),
     refetchInterval,
   });
 }
@@ -53,17 +58,17 @@ export function usePendingCount(refetchInterval = 60_000) {
 export function useForceReset() {
   const qc = useQueryClient();
   return useMutation<{ deleted_rows: number }, Error, void>({
-    mutationFn: () => api<{ deleted_rows: number }>('/admin/backfill/force-reset', {
-      method: 'POST',
-      body: '{}',
-    }),
+    mutationFn: () =>
+      api<{ deleted_rows: number }>('/admin/backfill/force-reset', {
+        method: 'POST',
+        body: '{}',
+      }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['backfill-pending'] });
       qc.invalidateQueries({ queryKey: ['backfill-status'] });
     },
   });
 }
-
 
 type BackfillEvent = {
   type: string;
@@ -166,9 +171,7 @@ export function BackfillTab() {
       <section className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4 space-y-4">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">Backfill</h2>
-          <span className="text-xs text-[var(--muted-foreground)]">
-            Daily 02:00 MSK scheduler
-          </span>
+          <span className="text-xs text-[var(--muted-foreground)]">Daily 02:00 MSK scheduler</span>
         </div>
 
         <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
@@ -180,7 +183,7 @@ export function BackfillTab() {
 
         <div>
           <h3 className="text-sm font-medium mb-2">Next run will fetch</h3>
-          {pending.data && (pending.data.new + pending.data.stale + pending.data.error) === 0 ? (
+          {pending.data && pending.data.new + pending.data.stale + pending.data.error === 0 ? (
             <p className="text-sm text-green-400">
               All {pending.data.total} tickers are up to date. The scheduler has nothing to do.
             </p>
@@ -217,6 +220,7 @@ export function BackfillTab() {
 
         <div className="flex flex-wrap gap-2">
           <button
+            type="button"
             disabled={running || start.isPending}
             onClick={() => start.mutate()}
             className="rounded border border-[var(--accent)] bg-[var(--accent)]/15 px-3 py-1.5 text-sm font-medium text-[var(--accent)] hover:bg-[var(--accent)]/25 disabled:opacity-50"
@@ -224,6 +228,7 @@ export function BackfillTab() {
             Start backfill
           </button>
           <button
+            type="button"
             disabled={!running}
             onClick={() => stop.mutate()}
             className="rounded border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
@@ -231,6 +236,7 @@ export function BackfillTab() {
             Stop current run
           </button>
           <button
+            type="button"
             disabled={reset.isPending}
             onClick={() => setShowResetConfirm(true)}
             className="rounded border border-[var(--border)] px-3 py-1.5 text-sm text-red-400 disabled:opacity-50"
@@ -262,8 +268,8 @@ export function BackfillTab() {
         >
           {events.length === 0 && (
             <p className="text-[var(--muted-foreground)]">
-              Waiting for events from the next scheduler run… The global log
-              footer at the bottom of every page shows system-wide activity.
+              Waiting for events from the next scheduler run… The global log footer at the bottom of
+              every page shows system-wide activity.
             </p>
           )}
           {[...events].reverse().map((ev, i) => (
@@ -282,47 +288,33 @@ export function BackfillTab() {
               >
                 {ev.type}
               </span>
-              <span className="truncate">
-                {JSON.stringify(ev.payload ?? {}).slice(0, 200)}
-              </span>
+              <span className="truncate">{JSON.stringify(ev.payload ?? {}).slice(0, 200)}</span>
             </div>
           ))}
         </div>
       </div>
 
-      {/* Reset metadata confirmation dialog */}
-      {showResetConfirm && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-[var(--card)] border border-[var(--border)] rounded-lg p-6 max-w-md">
-            <h3 className="text-lg font-semibold mb-2">Force full re-backfill?</h3>
-            <p className="text-sm text-[var(--muted-foreground)] mb-4">
-              This wipes every <code className="text-xs">instrument_metadata</code> row, so the next
-              scheduled run (and any subsequent manual trigger) will re-fetch the full
-              history for all {pending.data?.total ?? '?'} instruments. Use this only after a
-              corporate action that restated the series, or if you suspect on-disk bars are
-              corrupt. Routine maintenance is automatic — the daily 02:00 MSK scheduler
-              catches new tickers and stale ones without manual intervention.
-            </p>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setShowResetConfirm(false)}
-                className="rounded border border-[var(--border)] px-3 py-1.5 text-sm"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  reset.mutate();
-                  setShowResetConfirm(false);
-                }}
-                className="rounded bg-red-500 px-3 py-1.5 text-sm text-white"
-              >
-                Reset metadata
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Reset metadata confirmation dialog — uses the shared
+          ConfirmDialog so Escape, focus trap, and danger styling come
+          for free. Body explains the destructive impact; opens only
+          once the pending count is loaded so we never show "?". */}
+      <ConfirmDialog
+        open={showResetConfirm && !!pending.data}
+        title="Force full re-backfill?"
+        body={
+          pending.data
+            ? `This wipes every instrument_metadata row, so the next scheduled run (and any subsequent manual trigger) will re-fetch the full history for all ${pending.data.total} instruments. Use this only after a corporate action that restated the series, or if you suspect on-disk bars are corrupt. Routine maintenance is automatic — the daily 02:00 MSK scheduler catches new tickers and stale ones without manual intervention.`
+            : 'Loading the instrument count…'
+        }
+        confirmLabel="Reset metadata"
+        cancelLabel="Cancel"
+        danger
+        onConfirm={() => {
+          setShowResetConfirm(false);
+          reset.mutate();
+        }}
+        onCancel={() => setShowResetConfirm(false)}
+      />
     </div>
   );
 }

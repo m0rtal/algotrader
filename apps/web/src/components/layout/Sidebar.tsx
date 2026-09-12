@@ -10,8 +10,8 @@ export function Sidebar() {
 
   return (
     <div className="p-4 space-y-3.5">
-      <div className="bg-surface-2 border border-border rounded-md p-3">
-        <div className="text-[10px] uppercase tracking-wider text-text-dim font-semibold">Режим рынка</div>
+      <section className="bg-surface-2 border border-border rounded-md p-3">
+        <h3 className="text-[10px] uppercase tracking-wider text-text-dim font-semibold">Режим рынка</h3>
         <div className="flex items-center gap-2.5 mt-2">
           <span className="w-2.5 h-2.5 rounded-full bg-green shadow-[0_0_8px_var(--color-green)]" />
           <span className="font-semibold text-sm capitalize">{regime.state === 'trend' ? 'Up-Trend' : regime.state}</span>
@@ -25,12 +25,12 @@ export function Sidebar() {
         <div className="text-[11px] text-text-muted mt-2.5 pt-2.5 border-t border-border-soft">
           HMM 3-сост. · с {regime.sinceDate}
         </div>
-      </div>
+      </section>
 
       <div>
-        <div className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2.5">
+        <h3 className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2.5">
           Universe · кликни тикер
-        </div>
+        </h3>
         <div className="grid grid-cols-2 gap-2 mb-2.5">
           <Stat label="Активных" value={tickers?.length ?? 47} />
           <Stat label="С фильтром" value={23} />

@@ -49,7 +49,7 @@ export function SignalsTab() {
             {data.map((s) => (
               <tr key={s.symbol} className="hover:bg-surface-2">
                 <td className="px-2 py-2 mono border-b border-border-soft font-medium whitespace-nowrap">
-                  <button onClick={() => openTicker(s.symbol)} className="hover:text-accent">
+                  <button type="button" onClick={() => openTicker(s.symbol)} className="hover:text-accent">
                     {s.symbol}
                   </button>
                 </td>
@@ -57,10 +57,10 @@ export function SignalsTab() {
                   <span
                     className={`inline-block px-2 py-0.5 rounded-sm text-[10px] font-semibold uppercase ${
                       s.side === 'long'
-                        ? 'bg-[rgba(38,166,154,0.15)] text-green'
+                        ? 'bg-green-soft text-green'
                         : s.side === 'short'
-                          ? 'bg-[rgba(239,83,80,0.15)] text-red'
-                          : 'bg-[rgba(138,145,163,0.15)] text-text-muted'
+                          ? 'bg-red-soft text-red'
+                          : 'bg-text-soft text-text-muted'
                     }`}
                   >
                     {s.side}

@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useId, useRef } from 'react';
 import { useUiStore } from '@stores/uiStore';
 import { useBars, useTickers } from '@lib/hooks';
 import { formatPct } from '@lib/format';
@@ -9,37 +9,72 @@ export function TickerDrilldown() {
   const close = useUiStore((s) => s.closeTicker);
   const { data: tickers } = useTickers();
   const { data: bars, isLoading } = useBars(symbol);
+  const titleId = useId();
+  const panelRef = useRef<HTMLDivElement>(null);
+  const previousFocus = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (!symbol) return;
+    // Move focus into the panel on open; restore on close.
+    const panel = panelRef.current;
+    const focusable = panel?.querySelector<HTMLElement>(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    );
+    previousFocus.current = document.activeElement as HTMLElement | null;
+    focusable?.focus();
+
     const onKey = (e: KeyboardEvent) => {
-      /* v8 ignore next */
-      if (e.key === 'Escape') close();
+      if (e.key === 'Escape') {
+        /* v8 ignore next */
+        close();
+      }
     };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      previousFocus.current?.focus();
+    };
   }, [symbol, close]);
 
   if (!symbol) return null;
 
   const ticker = tickers?.find((t) => t.symbol === symbol);
   const closes = bars?.bars.map((b: { close: number }) => b.close) ?? [];
-  const change5 = closes.length >= 6 ? ((closes[closes.length - 1]! - closes[closes.length - 6]!) / closes[closes.length - 6]!) * 100 : 0;
-  const changeAll = closes.length >= 2 ? ((closes[closes.length - 1]! - closes[0]!) / closes[0]!) * 100 : 0;
+  const change5 =
+    closes.length >= 6
+      ? ((closes[closes.length - 1]! - closes[closes.length - 6]!) / closes[closes.length - 6]!) *
+        100
+      : 0;
+  const changeAll =
+    closes.length >= 2 ? ((closes[closes.length - 1]! - closes[0]!) / closes[0]!) * 100 : 0;
 
   return (
+    // Backdrop is a click target only; Escape handling lives on window
+    // in the useEffect above. role="presentation" tells AT to ignore
+    // the div while the inner role="dialog" carries the semantics.
     <div
+      role="presentation"
       className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center"
       onClick={(e) => {
         if (e.target === e.currentTarget) close();
       }}
     >
-      <div className="bg-surface border border-border rounded-lg p-5 w-full max-w-[640px] sm:max-w-[800px] max-h-[80vh] overflow-y-auto">
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="bg-surface border border-border rounded-lg p-5 w-full max-w-[640px] sm:max-w-[800px] max-h-[80vh] overflow-y-auto"
+      >
         <div className="flex items-center justify-between mb-4">
-          <div className="text-base font-semibold mono">
+          <h2 id={titleId} className="text-base font-semibold mono">
             {symbol} · {ticker?.name ?? ''}
-          </div>
-          <button onClick={close} className="text-text-muted hover:text-text text-lg px-2 py-1">
+          </h2>
+          <button
+            type="button"
+            onClick={close}
+            className="text-text-muted hover:text-text text-lg px-2 py-1"
+          >
             ✕
           </button>
         </div>
@@ -67,7 +102,9 @@ export function TickerDrilldown() {
             <EquityCurve data={closes} height={100} />
           ) : (
             /* v8 ignore next */
-            (<div className="text-text-muted h-full flex items-center justify-center">Нет данных</div>)
+            <div className="text-text-muted h-full flex items-center justify-center">
+              Нет данных
+            </div>
           )}
         </div>
         <div className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2.5">
@@ -104,7 +141,13 @@ function Stat({
   small?: boolean;
 }) {
   const color =
-    tone === 'pos' ? 'text-green' : tone === 'neg' ? 'text-red' : tone === 'warn' ? 'text-amber' : 'text-text';
+    tone === 'pos'
+      ? 'text-green'
+      : tone === 'neg'
+        ? 'text-red'
+        : tone === 'warn'
+          ? 'text-amber'
+          : 'text-text';
   return (
     <div className="bg-surface-2 rounded p-2">
       <div className="text-[10px] text-text-dim uppercase">{label}</div>
