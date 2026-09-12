@@ -235,13 +235,10 @@ class BackfillRunner:
         """
         total = 0
         # Fetch the universe of all asset classes for `instruments` table
-        # completeness, but only `share` and `etf` actually emit
-        # `get_candles` on the live API — bonds/futures/options have
-        # candle-less endpoints (coupons, margin, etc) we don't yet
-        # model. For those classes we upsert the metadata with
-        # status='no_candles_method' so the operator sees them in
-        # `instruments` and `pending` but the runner doesn't burn
-        # rate-limit slots on per-ticker 404s.
+        # completeness. All classes go through the backfill loop —
+        # bond/future/option just use a different identifier (uid /
+        # position_uid) which `real_client_convert.py` already maps
+        # to the `figi` column.
         fetcher_specs = [
             ("get_shares", "share"),
             ("get_bonds", "bond"),
@@ -249,7 +246,6 @@ class BackfillRunner:
             ("get_futures", "future"),
             ("get_options", "option"),
         ]
-        classes_with_candles = {"share", "etf"}
         for method_name, _cls in fetcher_specs:
             if self._stop_flag.is_set():
                 break
@@ -268,18 +264,15 @@ class BackfillRunner:
                 if figi and ticker:
                     self._ticker_by_figi[figi] = ticker
                 self._upsert_instrument(row)
-                # Classes without `get_candles` are marked
-                # no_candles_method here so the runner doesn't
-                # queue them in the backfill loop where they'd just
-                # burn rate-limit and return NOT_FOUND.
-                if asset_class and figi and asset_class not in classes_with_candles:
-                    self._upsert_metadata(
-                        figi=figi,
-                        last_bar_ts=None,
-                        total_bars=0,
-                        status="no_candles_method",
-                        error_msg=None,
-                    )
+                # Insert metadata row only for previously-unseen figis.
+                # Existing rows preserve their last_bar_ts/status from
+                # previous backfill runs — otherwise we would invalidate
+                # the `decide_strategy` skip/incremental decisions.
+                # No-candles-method is no longer used; instrument status
+                # is the source of truth (a genuine NOT_FOUND from the
+                # SDK sets status='error' inside `_backfill_one`).
+                if figi:
+                    self._seed_metadata_for_figi(figi)
             for row in rows:
                 await self._emit(
                     "ticker_progress",
@@ -465,24 +458,13 @@ class BackfillRunner:
     # ─── DB helpers ──────────────────────────────────────────────────
 
     def _list_instruments(self) -> list[dict]:
-        # Ponytail: only share/etf have `get_candles` endpoints on the
-        # Tinkoff live API. Bonds/futures/options have other endpoints
-        # (coupons, settlements, position_uids) we don't yet model.
-        # Pulling them through `_backfill_one` would burn rate-limit
-        # budget on guaranteed NOT_FOUND 50002 responses — which is
-        # exactly the chunk-warning flood the operator was seeing.
-        # The class-based filter is authoritative; do NOT also gate on
-        # `last_run_status` because legacy rows from before
-        # `_discover_universe` learned to mark these classes have
-        # status='error' instead of 'no_candles_method', and they would
-        # slip past the secondary check.
+        # All instruments go through the backfill loop. Class-specific
+        # get_candles wiring lives in `ingestion/client.py` (real_client
+        # maps figi/uid/position_uid per asset class). See
+        # `_discover_universe` for the per-class metadata seeding.
         con = sqlite3.connect(self.db_path)
         con.row_factory = sqlite3.Row
-        rows = con.execute(
-            "SELECT ticker, figi, class "
-            "FROM instruments "
-            "WHERE class IN ('share', 'etf')"
-        ).fetchall()
+        rows = con.execute("SELECT ticker, figi, class FROM instruments").fetchall()
         con.close()
         return [dict(r) for r in rows]
 
@@ -528,6 +510,27 @@ class BackfillRunner:
                     currency,
                     lot_size,
                 ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _seed_metadata_for_figi(self, figi: str) -> None:
+        """Insert a metadata row for `figi` only if it doesn't already exist.
+
+        Used during universe discovery: each instrument needs a metadata
+        row for `_pending_count` to count it, but existing rows carry
+        their last_bar_ts from previous runs and must not be wiped —
+        otherwise `decide_strategy` would re-do work the daily scheduler
+        has already finished.
+        """
+        con = sqlite3.connect(self.db_path)
+        try:
+            con.execute(
+                "INSERT OR IGNORE INTO instrument_metadata "
+                "(figi, last_bar_ts, total_bars, last_run_status, last_run_at, last_error) "
+                "VALUES (?, NULL, 0, 'pending', NULL, NULL)",
+                (figi,),
             )
             con.commit()
         finally:

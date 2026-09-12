@@ -483,14 +483,13 @@ async def test_log_writes_row_with_correct_fields(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_list_instruments_excludes_non_bar_classes(tmp_path):
-    """Only share/etf have `get_candles` endpoints; bonds/futures/options
-    would burn rate-limit on guaranteed NOT_FOUND. They must not appear
-    in `_list_instruments` so the backfill loop never sees them.
-
-    The filter is class-only — it must also exclude legacy rows that
-    `_discover_universe` already marked status='error' instead of
-    'no_candles_method'."""
+async def test_list_instruments_returns_all_classes(tmp_path):
+    """All asset classes go through the backfill loop; bonds/futures/
+    options just need their identifier wired correctly upstream
+    (see real_client_convert). Filter-by-class here would hide them
+    from the operator-facing pending counter even when the SDK can
+    serve them.
+    """
     import sqlite3
 
     con = sqlite3.connect(str(tmp_path / "state.db"))
@@ -501,22 +500,7 @@ async def test_list_instruments_excludes_non_bar_classes(tmp_path):
             ("SBER", "BBG004730N88", "share", "Sber", "rub", 10),
             ("FXUS", "BBG111111111", "etf", "FXUS ETF", "rub", 1),
             ("RU000A10B420", "TCS00A10B420", "bond", "Bond A", "rub", 1),
-            ("FUT1", "FUTFIGI1", "future", "Future 1", "rub", 1),
             ("OPT1", "3334f2b7-7320-4a24-8661-170605e02e83", "option", "Opt", "rub", 1),
-            # Option with legacy 'error' status — should still be filtered
-            # out because the gate is on class, not metadata status.
-            ("OPT2", "00629fa5-a920-4670-9a94-d3af61bd2522", "option", "Opt2", "rub", 1),
-        ],
-    )
-    con.executemany(
-        "INSERT INTO instrument_metadata (figi, last_run_status) VALUES (?, ?)",
-        [
-            ("BBG004730N88", "ok"),
-            ("BBG111111111", "ok"),
-            ("TCS00A10B420", "no_candles_method"),
-            ("FUTFIGI1", "no_candles_method"),
-            ("3334f2b7-7320-4a24-8661-170605e02e83", "no_candles_method"),
-            ("00629fa5-a920-4670-9a94-d3af61bd2522", "error"),
         ],
     )
     con.commit()
@@ -533,9 +517,8 @@ async def test_list_instruments_excludes_non_bar_classes(tmp_path):
     )
     instruments = runner._list_instruments()
     classes = sorted({i["class"] for i in instruments})
-    assert classes == ["etf", "share"], f"unexpected classes: {classes}"
-    tickers = sorted(i["ticker"] for i in instruments)
-    assert tickers == ["FXUS", "SBER"]
+    assert classes == ["bond", "etf", "option", "share"]
+    assert len(instruments) == 4
 
 
 # ─── defensive branches ─────────────────────────────────────────────
