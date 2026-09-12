@@ -471,20 +471,17 @@ class BackfillRunner:
         # Pulling them through `_backfill_one` would burn rate-limit
         # budget on guaranteed NOT_FOUND 50002 responses — which is
         # exactly the chunk-warning flood the operator was seeing.
-        # `_discover_universe` already marks them with
-        # last_run_status='no_candles_method'; we keep that filter here
-        # too so the read path matches the write path.
+        # The class-based filter is authoritative; do NOT also gate on
+        # `last_run_status` because legacy rows from before
+        # `_discover_universe` learned to mark these classes have
+        # status='error' instead of 'no_candles_method', and they would
+        # slip past the secondary check.
         con = sqlite3.connect(self.db_path)
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            "SELECT i.ticker, i.figi, i.class "
-            "FROM instruments i "
-            "WHERE i.class IN ('share', 'etf') "
-            "AND NOT EXISTS ("
-            "  SELECT 1 FROM instrument_metadata m "
-            "  WHERE m.figi = i.figi "
-            "  AND m.last_run_status = 'no_candles_method'"
-            ")"
+            "SELECT ticker, figi, class "
+            "FROM instruments "
+            "WHERE class IN ('share', 'etf')"
         ).fetchall()
         con.close()
         return [dict(r) for r in rows]
