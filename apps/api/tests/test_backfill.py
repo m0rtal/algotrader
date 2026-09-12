@@ -804,3 +804,53 @@ async def test_backfill_one_skipped_when_no_closed_bars(tmp_path):
     progress = [ev for ev in events if ev.type == "ticker_progress"]
     assert progress[0].payload["status"] == "skipped"
     assert progress[0].payload["bars_written"] == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_one_mirrors_candles_into_sqlite_bars_table(tmp_path):
+    """After writing parquet, the same candles land in the SQLite `bars`
+    table so `/api/bars/<symbol>` can serve from SQLite without
+    re-reading parquet.
+    """
+    import sqlite3
+
+    bars_dir = tmp_path / "bars"
+    closed = SimpleNamespace(
+        time=SimpleNamespace(year=2024, month=6, day=1),
+        open=SimpleNamespace(units=100, nano=0),
+        high=SimpleNamespace(units=110, nano=0),
+        low=SimpleNamespace(units=95, nano=0),
+        close=SimpleNamespace(units=105, nano=0),
+        volume=1000,
+        is_complete=True,
+    )
+    client = MagicMock()
+    client.get_candles = AsyncMock(return_value=[closed])
+    events = []
+
+    async def collect(ev):
+        events.append(ev)
+
+    runner = BackfillRunner(
+        client=client,
+        db_path=str(tmp_path / "state.db"),
+        bars_dir=str(bars_dir),
+        event_sink=collect,
+    )
+    written = await runner._backfill_one(
+        figi="BBG-MIRROR",
+        from_=date(2024, 6, 1),
+        to=date(2024, 6, 7),
+    )
+    assert written >= 1
+
+    con = sqlite3.connect(str(tmp_path / "state.db"))
+    rows = con.execute(
+        "SELECT ts, open, high, low, close, volume "
+        "FROM bars WHERE figi = ? ORDER BY ts",
+        ("BBG-MIRROR",),
+    ).fetchall()
+    con.close()
+    assert len(rows) >= 1
+    assert rows[0][0] == "2024-06-01"
+    assert rows[0][1] == 100.0

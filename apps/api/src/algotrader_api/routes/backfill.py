@@ -155,8 +155,9 @@ async def start_backfill(body: dict | None = None) -> dict:
             # Mark the pipeline phase done (best-effort; ignore failure).
             try:
                 from ..ingestion import pipeline as pipeline_mod
+
                 pipeline_mod.end_phase(db_path, run_id, status="ok", rows_processed=0)
-            except Exception:
+            except Exception:  # pragma: no cover — defensive: end_phase may fail when schema is mid-migration
                 pass
             _slot.reset()
 

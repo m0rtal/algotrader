@@ -138,7 +138,7 @@ def create_app() -> FastAPI:
         settings_route.set_sqlite_path(settings.sqlite_path)
         health.set_sqlite_path(settings.sqlite_path)
         health.set_bars_dir(settings.bars_dir)
-        bars.set_bars_dir(settings.bars_dir)
+        bars.set_sqlite_path(settings.sqlite_path)
         data_reads.set_bars_dir(settings.bars_dir)
         data_reads.set_sqlite_path(settings.sqlite_path)
 

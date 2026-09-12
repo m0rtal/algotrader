@@ -437,6 +437,22 @@ class BackfillRunner:
                 status="ok",
                 error_msg=None,
             )
+            # Mirror the same candles into the SQLite `bars` table so
+            # `/api/bars/<symbol>` and `/health` can serve from SQLite
+            # without touching DuckDB or the parquet directory. Best
+            # effort — a SQLite write failure here doesn't fail the
+            # backfill (the parquet file is already written and the
+            # metadata is consistent with the parquet count).
+            try:
+                from ..db.bars_sqlite import replace_bars_for_figi
+
+                replace_bars_for_figi(self.db_path, figi, closed)
+            except Exception as sqlite_err:  # noqa: BLE001 — best-effort mirror
+                logger.warn(
+                    "bars.sqlite_mirror_failed",
+                    figi=figi,
+                    error=str(sqlite_err),
+                )
             await self._log(
                 "info", figi=figi, message=f"bars_written={written} last_bar_ts={last_ts}"
             )
