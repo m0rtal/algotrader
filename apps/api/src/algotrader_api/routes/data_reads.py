@@ -158,7 +158,7 @@ def get_tickers() -> list:
     upstream metrics land.
     """
     bars_dir = _get_bars_dir()
-    overview = duck.query_ticker_overview(bars_dir)
+    overview = duck.query_ticker_overview(bars_dir, sqlite_path=_get_sqlite_path())
     by_ticker = {
         r["ticker"]: r for r in sqlite_exec(
             _get_sqlite_path(),
