@@ -27,7 +27,10 @@ class _MixedClient:
 @pytest.mark.asyncio
 async def test_discover_universe_continues_on_class_error():
     out = await discover_universe(_MixedClient())
-    # 3 classes returned (shares, etfs, options), 2 raised and were logged.
+    # Only tradeable classes survive the filter. get_bonds raised
+    # so bonds is missing; get_futures / get_options are skipped
+    # at the source (not even called) because they aren't in
+    # TRADEABLE_CLASSES. Shares + etfs remain.
     classes = sorted(r["class"] for r in out)
-    assert classes == ["etf", "option", "share"]
-    assert len(out) == 3
+    assert classes == ["etf", "share"]
+    assert len(out) == 2

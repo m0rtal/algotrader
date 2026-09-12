@@ -117,7 +117,12 @@ def test_decide_strategy_at_threshold_boundary_returns_incremental():
 
 @pytest.mark.asyncio
 async def test_discover_universe_returns_total_instrument_count(tmp_path):
-    """After fetching all 5 asset classes, returns total instruments."""
+    """After fetching tradeable asset classes only, returns the
+    total of shares + bonds + etfs. Future/option requests are NOT
+    made — the broker SDK is never called for non-tradeable
+    classes, so we don't waste rate-limit budget or pollute the
+    `instruments` table.
+    """
     events = []
 
     async def collect(ev):
@@ -134,22 +139,27 @@ async def test_discover_universe_returns_total_instrument_count(tmp_path):
     client.get_etfs = AsyncMock(return_value=[
         {"ticker": "E1", "figi": "FG4", "class": "etf"},
     ])
-    client.get_futures = AsyncMock(return_value=[])
-    client.get_options = AsyncMock(return_value=[])
+    client.get_futures = AsyncMock(return_value=[
+        {"ticker": "F1", "figi": "FG-FUT", "class": "future"},
+    ])
+    client.get_options = AsyncMock(return_value=[
+        {"ticker": "O1", "figi": "FG-OPT", "class": "option"},
+    ])
 
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=collect,
     )
     count = await runner._discover_universe()
-    assert count == 4  # 1 share + 2 bonds + 1 etf + 0 futures + 0 options
+    assert count == 4  # 1 share + 2 bonds + 1 etf
+    # Tradeable classes were called.
     client.get_shares.assert_awaited_once()
     client.get_bonds.assert_awaited_once()
     client.get_etfs.assert_awaited_once()
-    client.get_futures.assert_awaited_once()
-    client.get_options.assert_awaited_once()
+    # Non-tradeable classes were NOT called — the contract.
+    client.get_futures.assert_not_called()
+    client.get_options.assert_not_called()
     assert any(ev.type == "ticker_progress" for ev in events)
 
 
@@ -159,7 +169,6 @@ async def test_discover_universe_returns_total_instrument_count(tmp_path):
 @pytest.mark.asyncio
 async def test_backfill_one_filters_closed_candles(tmp_path):
     """is_complete=False bars are dropped; is_complete=True bars written."""
-    bars_dir = tmp_path / "bars"
     closed = SimpleNamespace(
         time=SimpleNamespace(year=2024, month=6, day=1),
         open=SimpleNamespace(units=100, nano=0),
@@ -192,7 +201,6 @@ async def test_backfill_one_filters_closed_candles(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(bars_dir),
         event_sink=collect,
     )
     written = await runner._backfill_one(
@@ -202,8 +210,6 @@ async def test_backfill_one_filters_closed_candles(tmp_path):
     )
     # 5 chunks × 1 closed bar = 5 closed candles persisted.
     assert written == 5
-    parquet = bars_dir / "BBG004730N88.parquet"
-    assert parquet.exists()
     progress_events = [ev for ev in events if ev.type == "ticker_progress"]
     assert len(progress_events) == 1
     assert progress_events[0].payload["status"] == "ok"
@@ -233,7 +239,6 @@ async def test_backfill_one_updates_instrument_metadata(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=noop,
     )
     await runner._backfill_one(figi="BBG001", from_=date(2024, 1, 1), to=date(2024, 12, 31))
@@ -268,7 +273,6 @@ async def test_backfill_one_logs_failure_doesnt_abort(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=collect,
     )
     written = await runner._backfill_one(
@@ -291,7 +295,6 @@ async def test_backfill_one_retries_chunk_on_resource_exhausted(tmp_path):
     before the per-chunk warning fires."""
     import sqlite3
 
-    bars_dir = tmp_path / "bars"
     closed = SimpleNamespace(
         time=SimpleNamespace(year=2024, month=6, day=1),
         open=SimpleNamespace(units=100, nano=0),
@@ -328,7 +331,6 @@ async def test_backfill_one_retries_chunk_on_resource_exhausted(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(bars_dir),
         event_sink=collect,
     )
     written = await runner._backfill_one(
@@ -391,7 +393,6 @@ async def test_run_emits_status_ticker_progress_done_events(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=collect,
     )
     await runner.run(history_years=5, incremental_threshold_days=2)
@@ -431,7 +432,6 @@ async def test_stop_signal_causes_runner_to_exit_between_tickers(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=noop,
     )
     original = runner._backfill_one
@@ -461,7 +461,6 @@ async def test_log_writes_row_with_correct_fields(tmp_path):
     runner = BackfillRunner(
         client=MagicMock(),
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=noop,
     )
     runner.run_id = 42
@@ -483,16 +482,23 @@ async def test_log_writes_row_with_correct_fields(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_list_instruments_returns_all_classes(tmp_path):
-    """All asset classes go through the backfill loop; bonds/futures/
-    options just need their identifier wired correctly upstream
-    (see real_client_convert). Filter-by-class here would hide them
-    from the operator-facing pending counter even when the SDK can
-    serve them.
+async def test_list_instruments_returns_tradeable_only(tmp_path):
+    """`_list_instruments` filters at the SQL boundary so a stale
+    `future` or `option` row left over from before the policy
+    change can't slip into the backfill loop.
     """
     import sqlite3
 
     con = sqlite3.connect(str(tmp_path / "state.db"))
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS instruments (
+            ticker TEXT PRIMARY KEY, figi TEXT UNIQUE, class TEXT,
+            name TEXT, currency TEXT, lot_size INTEGER, isin TEXT,
+            sector TEXT
+        );
+        """
+    )
     con.executemany(
         "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
         "VALUES (?, ?, ?, ?, ?, ?)",
@@ -501,6 +507,7 @@ async def test_list_instruments_returns_all_classes(tmp_path):
             ("FXUS", "BBG111111111", "etf", "FXUS ETF", "rub", 1),
             ("RU000A10B420", "TCS00A10B420", "bond", "Bond A", "rub", 1),
             ("OPT1", "3334f2b7-7320-4a24-8661-170605e02e83", "option", "Opt", "rub", 1),
+            ("FUT1", "FUT-FIGI-1", "future", "Fut", "rub", 1),
         ],
     )
     con.commit()
@@ -512,13 +519,16 @@ async def test_list_instruments_returns_all_classes(tmp_path):
     runner = BackfillRunner(
         client=MagicMock(),
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=noop,
     )
     instruments = runner._list_instruments()
     classes = sorted({i["class"] for i in instruments})
-    assert classes == ["bond", "etf", "option", "share"]
-    assert len(instruments) == 4
+    assert classes == ["bond", "etf", "share"]
+    assert len(instruments) == 3
+    figis = {i["figi"] for i in instruments}
+    assert "BBG004730N88" in figis
+    assert "3334f2b7-7320-4a24-8661-170605e02e83" not in figis
+    assert "FUT-FIGI-1" not in figis
 
 
 # ─── defensive branches ─────────────────────────────────────────────
@@ -542,7 +552,6 @@ async def test_discover_universe_continues_after_method_failure(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=collect,
     )
     count = await runner._discover_universe()
@@ -582,7 +591,6 @@ async def test_backfill_one_filters_today_or_later_candles(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=noop,
     )
     written = await runner._backfill_one(
@@ -598,7 +606,6 @@ def test_extract_last_bar_ts_returns_none_for_empty():
     runner = BackfillRunner(
         client=MagicMock(),
         db_path="/tmp/nonexistent",
-        bars_dir="/tmp/nonexistent",
         event_sink=lambda ev: None,
     )
     assert runner._extract_last_bar_ts([]) is None
@@ -610,7 +617,6 @@ def test_extract_last_bar_ts_returns_none_when_no_time_attr():
     runner = BackfillRunner(
         client=MagicMock(),
         db_path="/tmp/nonexistent",
-        bars_dir="/tmp/nonexistent",
         event_sink=lambda ev: None,
     )
     # No `time` attribute at all — falls into the default branch.
@@ -623,7 +629,6 @@ def test_extract_last_bar_ts_finds_max():
     runner = BackfillRunner(
         client=MagicMock(),
         db_path="/tmp/nonexistent",
-        bars_dir="/tmp/nonexistent",
         event_sink=lambda ev: None,
     )
     candles = [
@@ -645,7 +650,6 @@ def test_upsert_instrument_skips_row_without_figi(tmp_path):
     runner = BackfillRunner(
         client=MagicMock(),
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=noop,
     )
     runner._upsert_instrument({"ticker": "X", "class": "share"})  # no figi
@@ -687,7 +691,6 @@ async def test_run_emits_status_with_tickers_total_after_discover(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=collect,
     )
     await runner.run(history_years=5, incremental_threshold_days=2)
@@ -723,7 +726,6 @@ async def test_run_stop_signal_before_first_ticker(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=noop,
     )
     runner.stop()  # pre-stop
@@ -741,8 +743,12 @@ async def test_run_stop_signal_before_first_ticker(tmp_path):
 
 @pytest.mark.asyncio
 async def test_run_handles_discover_failure_with_done_event(tmp_path):
-    """If _discover_universe raises, a 'done' event with status='error'
-    is emitted and state returns to IDLE."""
+    """If _discover_universe raises on a tradeable class, a 'done'
+    event with status='error' is emitted and state returns to IDLE.
+
+    Only the three tradeable classes (share/bond/etf) are called, so
+    we expect three error log entries, not five.
+    """
     events = []
 
     async def collect(ev):
@@ -752,22 +758,24 @@ async def test_run_handles_discover_failure_with_done_event(tmp_path):
     client.get_shares = AsyncMock(side_effect=RuntimeError("boom"))
     client.get_bonds = AsyncMock(side_effect=RuntimeError("boom"))
     client.get_etfs = AsyncMock(side_effect=RuntimeError("boom"))
+    # Non-tradeable SDK methods are never called.
     client.get_futures = AsyncMock(side_effect=RuntimeError("boom"))
     client.get_options = AsyncMock(side_effect=RuntimeError("boom"))
 
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=collect,
     )
     await runner.run(history_years=5, incremental_threshold_days=2)
-    # 5 method failures → 5 "error" ingestion_log entries
+    # 3 method failures (tradeable) → 3 error log entries.
     import sqlite3
     con = sqlite3.connect(str(tmp_path / "state.db"))
-    count = con.execute("SELECT COUNT(*) FROM ingestion_logs WHERE message LIKE '%failed: boom'").fetchone()[0]
+    count = con.execute(
+        "SELECT COUNT(*) FROM ingestion_logs WHERE message LIKE '%failed: boom'"
+    ).fetchone()[0]
     con.close()
-    assert count == 5
+    assert count == 3
 
 
 @pytest.mark.asyncio
@@ -794,7 +802,6 @@ async def test_backfill_one_skipped_when_no_closed_bars(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path / "bars"),
         event_sink=collect,
     )
     written = await runner._backfill_one(
@@ -814,7 +821,6 @@ async def test_backfill_one_mirrors_candles_into_sqlite_bars_table(tmp_path):
     """
     import sqlite3
 
-    bars_dir = tmp_path / "bars"
     closed = SimpleNamespace(
         time=SimpleNamespace(year=2024, month=6, day=1),
         open=SimpleNamespace(units=100, nano=0),
@@ -834,7 +840,6 @@ async def test_backfill_one_mirrors_candles_into_sqlite_bars_table(tmp_path):
     runner = BackfillRunner(
         client=client,
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(bars_dir),
         event_sink=collect,
     )
     written = await runner._backfill_one(

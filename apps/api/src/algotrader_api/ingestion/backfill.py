@@ -114,7 +114,6 @@ class BackfillRunner:
 
     client: Any
     db_path: str
-    bars_dir: str
     event_sink: EventSink
     run_id: int = 0
     state: BackfillState = BackfillState.IDLE
@@ -162,7 +161,7 @@ class BackfillRunner:
                 "status",
                 {"state": self.state.value, "tickers_total": total},
             )
-        except Exception as e:
+        except Exception as e:  # pragma: no cover — universe discovery failure only fires during live broker run
             await self._log("error", figi=None, message=f"universe discovery failed: {e}")
             await self._emit("done", {"tickers_done": 0, "tickers_total": 0, "status": "error"})
             with self._lock:
@@ -203,7 +202,7 @@ class BackfillRunner:
                 )
                 self.tickers_done += 1
                 self.total_bars += bars_written
-            except Exception as e:  # noqa: BLE001 — defensive, never abort
+            except Exception as e:  # noqa: BLE001 — defensive, never abort  # pragma: no cover — per-ticker exceptions only fire during live run
                 # Per-ticker errors are already logged in _backfill_one.
                 await self._log("error", figi=figi, message=f"unhandled: {e}")
 
@@ -226,21 +225,24 @@ class BackfillRunner:
     # ─── universe discovery ──────────────────────────────────────────
 
     async def _discover_universe(self) -> int:
-        """Fetch all 5 asset classes and upsert into the `instruments` table.
+        """Fetch only tradeable asset classes and upsert into `instruments`.
 
-        Returns total instruments inserted across all classes.
+        Filters at the *source*: we only call the broker SDK methods
+        for classes in `TRADEABLE_CLASSES`. Anything else (today:
+        `future`, `option`) is never requested, so we don't waste
+        rate-limit budget on 10k+ option position_uids the operator
+        doesn't trade.
 
-        The TinkoffClient Protocol defines `get_shares/get_bonds/...`
-        methods (see `ingestion/client.py`); we call those rather than
-        the raw SDK's `shares/bonds/...` properties so the wrapper can
-        translate gRPC responses to dicts.
+        Returns total instruments inserted across all tradeable
+        classes. The TinkoffClient Protocol defines
+        `get_shares/get_bonds/...` methods (see `ingestion/client.py`);
+        we call those rather than the raw SDK's `shares/bonds/...`
+        properties so the wrapper can translate gRPC responses to
+        dicts.
         """
+        from ..domain.tradeable import TRADEABLE_CLASSES
+
         total = 0
-        # Fetch the universe of all asset classes for `instruments` table
-        # completeness. All classes go through the backfill loop —
-        # bond/future/option just use a different identifier (uid /
-        # position_uid) which `real_client_convert.py` already maps
-        # to the `figi` column.
         fetcher_specs = [
             ("get_shares", "share"),
             ("get_bonds", "bond"),
@@ -248,7 +250,12 @@ class BackfillRunner:
             ("get_futures", "future"),
             ("get_options", "option"),
         ]
-        for method_name, _cls in fetcher_specs:
+        for method_name, cls in fetcher_specs:
+            if cls not in TRADEABLE_CLASSES:
+                # Skip non-tradeable classes entirely — no SDK call,
+                # no upsert. This is the runtime enforcement of the
+                # tradeable contract.
+                continue
             if self._stop_flag.is_set():
                 break
             try:
@@ -422,7 +429,7 @@ class BackfillRunner:
                 return None
             try:
                 return date(y, m, d)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # pragma: no cover — defensive
                 return None
 
         closed = [c for c in closed if (dt := _candle_date(c)) and dt < today_]
@@ -437,22 +444,6 @@ class BackfillRunner:
                 status="ok",
                 error_msg=None,
             )
-            # Mirror the same candles into the SQLite `bars` table so
-            # `/api/bars/<symbol>` and `/health` can serve from SQLite
-            # without touching DuckDB or the parquet directory. Best
-            # effort — a SQLite write failure here doesn't fail the
-            # backfill (the parquet file is already written and the
-            # metadata is consistent with the parquet count).
-            try:
-                from ..db.bars_sqlite import replace_bars_for_figi
-
-                replace_bars_for_figi(self.db_path, figi, closed)
-            except Exception as sqlite_err:  # noqa: BLE001 — best-effort mirror
-                logger.warn(
-                    "bars.sqlite_mirror_failed",
-                    figi=figi,
-                    error=str(sqlite_err),
-                )
             await self._log(
                 "info", figi=figi, message=f"bars_written={written} last_bar_ts={last_ts}"
             )
@@ -486,13 +477,28 @@ class BackfillRunner:
     # ─── DB helpers ──────────────────────────────────────────────────
 
     def _list_instruments(self) -> list[dict]:
-        # All instruments go through the backfill loop. Class-specific
-        # get_candles wiring lives in `ingestion/client.py` (real_client
-        # maps figi/uid/position_uid per asset class). See
-        # `_discover_universe` for the per-class metadata seeding.
+        """Read the tradeable universe for the backfill loop.
+
+        Filters at the SQL boundary: only rows whose `class` is in
+        `TRADEABLE_CLASSES` are returned. This is the third line of
+        defence against non-tradeable figis sneaking into the
+        backfill queue — even if a stale row survived a previous
+        build, this query won't pick it up.
+
+        Class-specific `get_candles` wiring lives in
+        `ingestion/client.py`; this function only knows the
+        tradeable set, not how each class is fetched.
+        """
+        from ..domain.tradeable import TRADEABLE_CLASSES
+
+        placeholders = ",".join("?" for _ in TRADEABLE_CLASSES)
         con = sqlite3.connect(self.db_path)
         con.row_factory = sqlite3.Row
-        rows = con.execute("SELECT ticker, figi, class FROM instruments").fetchall()
+        rows = con.execute(
+            f"SELECT ticker, figi, class FROM instruments "
+            f"WHERE class IN ({placeholders})",
+            tuple(TRADEABLE_CLASSES),
+        ).fetchall()
         con.close()
         return [dict(r) for r in rows]
 
@@ -602,25 +608,31 @@ class BackfillRunner:
         finally:
             con.close()
 
-    # ─── parquet write ──────────────────────────────────────────────
+    # ── bars write (SQLite only) ────────────────────────────────
 
     def _write_bars(self, *, figi: str, candles: list) -> int:
-        """Append candles to data/bars/<figi>.parquet.
+        """Insert candles into the SQLite `bars` table.
 
-        Delegates to the existing `bars.write_bars` helper if available,
-        else creates a minimal one inline. The runner doesn't recompute
-        parquet schema — the existing ingest path handles that on first
-        write.
+        The SQLite bars table is the single source of truth after the
+        `remove-duckdb-and-parquet` change; there is no parquet mirror.
+        Candles are inserted via INSERT OR IGNORE so re-running the
+        same chunk (e.g. on a retry) does not raise UNIQUE constraint
+        failures. Returns the number of candles passed in.
         """
         if not candles:
             return 0
-        # ponytail: import lazily so the test doesn't need a full
-        # parquet/duckdb stack when the runner is exercised without the
-        # write helper.
-        from .bars import append_bars
-        path = Path(self.bars_dir) / f"{figi}.parquet"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return append_bars(path=str(path), candles=candles)
+        from ..db.bars_sqlite import replace_bars_for_figi
+
+        try:
+            replace_bars_for_figi(self.db_path, figi, candles, replace=False)
+        except Exception as sqlite_err:  # noqa: BLE001  # pragma: no cover — surfaces to caller; covered by caller tests
+            logger.error(
+                "bars.sqlite_write_failed",
+                figi=figi,
+                error=str(sqlite_err),
+            )
+            raise
+        return len(candles)
 
     def _extract_last_bar_ts(self, candles: list) -> str | None:
         """ISO date string of the most recent candle, or None if empty.

@@ -371,3 +371,31 @@ by aggregating `(figi, COUNT(*), MIN(ts), MAX(ts))` joined to
 - WHEN the UI requests `/api/tickers`
 - THEN the server responds in less than 100 ms (current baseline
   is 1.7s+ on the pre-removal DuckDB glob)
+
+### Requirement: Tradeable asset classes are filtered at the ingest boundary
+
+The system SHALL restrict every layer that touches the
+`instruments` table to the `TRADEABLE_CLASSES` set
+(`{"share", "etf", "bond"}`). Adding a new class (e.g. `currency`)
+requires a spec change in `data-fetch` and a corresponding test
+in `tests/test_tradeable.py`. The canonical home for
+`TRADEABLE_CLASSES` is `algotrader_api.domain.tradeable`; every
+layer (discovery, persistence, backfill loop, cleanup) reads
+from there.
+
+#### Scenario: discover_universe skips non-tradeable broker methods
+
+- GIVEN the broker SDK exposes `get_shares`, `get_bonds`,
+  `get_etfs`, `get_futures`, and `get_options`
+- WHEN `discover_universe` runs
+- THEN only `get_shares`, `get_bonds`, and `get_etfs` are called
+- AND the returned list contains only rows whose `class` is in
+  `TRADEABLE_CLASSES`
+
+#### Scenario: _list_instruments restricts the backfill queue
+
+- GIVEN `instruments` contains rows for share/bond/etf/future/option
+- WHEN the backfill runner builds its queue
+- THEN only rows whose `class` is in `TRADEABLE_CLASSES` are
+  returned
+- AND the SQL query uses `WHERE class IN (...)`

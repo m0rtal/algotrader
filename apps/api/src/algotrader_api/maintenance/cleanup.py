@@ -21,14 +21,23 @@ import os
 import sqlite3
 from dataclasses import dataclass
 
-from ..db.duck import query_ticker_overview  # noqa: F401  (re-exported for tests)
+from ..db.bars_sqlite import replace_bars_for_figi  # noqa: F401  (re-exported for tests)
+from ..domain.tradeable import TRADEABLE_CLASSES, is_tradeable  # noqa: F401  (re-exported for tests)
 
-
-# Classes the operator actively trades. Anything else is dropped on
-# cleanup. Updates to this tuple must be deliberate — share/etf/bond
-# are preserved including historical (delisted) figis; future/option
-# are dropped wholesale because the operator doesn't trade them.
-TRADEABLE_CLASSES: frozenset[str] = frozenset({"share", "etf", "bond"})
+# Re-exported for backwards compat. The canonical home is
+# `algotrader_api.domain.tradeable.TRADABLE_CLASSES` — every layer
+# (discover_universe, upsert_instruments, _list_instruments) reads
+# from there. This module keeps a local re-export so tests and
+# operator scripts that import `algotrader_api.maintenance.cleanup`
+# don't break.
+__all__ = [
+    "TRADEABLE_CLASSES",
+    "is_tradeable",
+    "replace_bars_for_figi",
+    "CleanupSummary",
+    "prune_non_tradeable_classes",
+    "reconcile_with_broker",
+]
 
 
 @dataclass
@@ -38,9 +47,8 @@ class CleanupSummary:
     instruments_dropped: int = 0
     metadata_dropped: int = 0
     logs_dropped: int = 0
-    parquet_files_dropped: int = 0
-    parquet_bytes_freed: int = 0
-    parquet_files_orphaned: int = 0  # parquet stem missing from instruments
+    bars_dropped: int = 0
+    bars_bytes_freed: int = 0
 
 
 def _open_sqlite(sqlite_path: str) -> sqlite3.Connection:
@@ -52,27 +60,23 @@ def _open_sqlite(sqlite_path: str) -> sqlite3.Connection:
 
 def prune_non_tradeable_classes(
     sqlite_path: str,
-    bars_dir: str,
     *,
     classes: frozenset[str] | None = None,
     dry_run: bool = False,
 ) -> CleanupSummary:
-    """Drop every row in `instruments`, `instrument_metadata`, and
-    `ingestion_logs` whose figi belongs to a non-tradeable class, then
-    delete the matching parquet files under `bars_dir`.
+    """Drop every row in `instruments`, `instrument_metadata`,
+    `ingestion_logs`, and `bars` whose figi belongs to a non-tradeable
+    class.
 
-    The parquet filename stem is either the figi (legacy files) or the
-    ticker (modern files). We only delete files whose stem is still
-    present in the dropped `instruments` rows so we never clobber a
-    ticker-style file that the operator might want to keep.
+    Pre-`remove-duckdb-and-parquet`, this function also deleted the
+    matching `<stem>.parquet` files. The SQLite `bars` table is the
+    single source of truth now, so the equivalent cleanup happens via
+    a `DELETE FROM bars WHERE figi IN (...)` instead.
 
     Parameters
     ----------
     sqlite_path : str
         Path to the app's state.db.
-    bars_dir : str
-        Directory containing `<stem>.parquet` files. Files for
-        non-tradeable classes are deleted (if a stem still resolves).
     classes : frozenset[str], optional
         Override which classes to drop. Default: the complement of
         `TRADEABLE_CLASSES`.
@@ -115,6 +119,15 @@ def prune_non_tradeable_classes(
             )
             summary.logs_dropped = cur.fetchone()["cnt"]
 
+            cur = con.execute(
+                f"SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(open) + LENGTH(high) + LENGTH(low) + LENGTH(close) + LENGTH(volume)), 0) AS bytes "
+                f"FROM bars WHERE figi IN ({placeholders})",
+                tuple(drop_figis),
+            )
+            row = cur.fetchone()
+            summary.bars_dropped = row["cnt"]
+            summary.bars_bytes_freed = int(row["bytes"])
+
         if not dry_run and drop_figis:
             placeholders = ",".join("?" for _ in drop_figis)
             con.execute(
@@ -129,39 +142,13 @@ def prune_non_tradeable_classes(
                 f"DELETE FROM ingestion_logs WHERE figi IN ({placeholders})",
                 tuple(drop_figis),
             )
+            con.execute(
+                f"DELETE FROM bars WHERE figi IN ({placeholders})",
+                tuple(drop_figis),
+            )
             con.commit()
         elif not dry_run:
             con.commit()
-
-        # Drop the matching parquet files. Stem = figi for legacy
-        # files; modern files are ticker-style and never belong to
-        # non-tradeable classes, so the figi-as-stem match is safe.
-        if os.path.isdir(bars_dir):
-            for figi in drop_figis:
-                path = os.path.join(bars_dir, f"{figi}.parquet")
-                if not os.path.isfile(path):
-                    continue
-                summary.parquet_bytes_freed += os.path.getsize(path)
-                if not dry_run:
-                    os.remove(path)  # pragma: no cover — guarded by `not dry_run`
-                summary.parquet_files_dropped += 1
-
-        # Detect parquet files whose stem no longer corresponds to any
-        # instrument. We don't delete these automatically — the
-        # operator may have manually seeded bars that aren't in
-        # `instruments` yet. They show up in the summary so a future
-        # cleanup pass can address them.
-        if os.path.isdir(bars_dir):
-            known_figis = {
-                row["figi"]
-                for row in con.execute("SELECT figi FROM instruments").fetchall()
-            }
-            for name in os.listdir(bars_dir):
-                if not name.endswith(".parquet"):
-                    continue
-                stem = os.path.splitext(name)[0]
-                if stem not in known_figis:
-                    summary.parquet_files_orphaned += 1
     finally:
         con.close()
     return summary

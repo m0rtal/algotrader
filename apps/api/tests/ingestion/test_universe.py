@@ -10,23 +10,35 @@ from algotrader_api.ingestion import universe
 
 
 @pytest.mark.asyncio
-async def test_discover_universe_returns_all_classes():
+async def test_discover_universe_returns_tradeable_classes_only():
+    """`discover_universe` filters at the source — future/option
+    rows set on the InMemoryTinkoffClient never reach the output,
+    even though the SDK method is wired. This is the runtime
+    contract that keeps the universe from drifting to 10k+ figs.
+    """
     client = InMemoryTinkoffClient()
     client.set_shares([{"ticker": "SBER", "figi": "s1", "class": "share", "name": "n", "currency": "RUB", "lot_size": 10}])
     client.set_bonds([{"ticker": "RU000A0", "figi": "b1", "class": "bond", "name": "n", "currency": "RUB", "lot_size": 1}])
     client.set_etfs([{"ticker": "FXRU", "figi": "e1", "class": "etf", "name": "n", "currency": "RUB", "lot_size": 1}])
+    # Non-tradeable rows are set on the client but must not appear
+    # in the output (we never call get_futures / get_options).
     client.set_futures([{"ticker": "RIU5", "figi": "f1", "class": "future", "name": "n", "currency": "RUB", "lot_size": 1}])
     client.set_options([{"ticker": "SIU5C", "figi": "o1", "class": "option", "name": "n", "currency": "RUB", "lot_size": 1}])
 
     rows = await universe.discover_universe(client)
-    assert len(rows) == 5
+    assert len(rows) == 3
     classes = {r["class"] for r in rows}
-    assert classes == {"share", "bond", "etf", "future", "option"}
+    assert classes == {"share", "bond", "etf"}
 
 
 @pytest.mark.asyncio
 async def test_discover_universe_partial_failure_continues():
-    """If one class fails, others should still be returned."""
+    """If one class fails, others should still be returned.
+
+    Tradeable classes are shares/bonds/etfs; we leave bonds empty
+    here so the count check stays accurate after the tradeable
+    filter was added.
+    """
     client = InMemoryTinkoffClient()
     client.set_shares([{"ticker": "SBER", "figi": "s1", "class": "share", "name": "n", "currency": "RUB", "lot_size": 10}])
     # Don't set bonds — will return empty (not raise)
