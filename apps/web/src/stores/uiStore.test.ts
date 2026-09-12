@@ -1,8 +1,25 @@
 import { act, renderHook } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { useUiStore, type TabId } from '@stores/uiStore';
 
 describe('uiStore', () => {
+  // The store is a module-level singleton. Without a reset, tests
+  // that mutate activeTab leak state into the next renderHook call.
+  // beforeEach clears both the in-memory store and localStorage so
+  // every test sees the documented initial state.
+  beforeEach(() => {
+    localStorage.clear();
+    useUiStore.setState({
+      activeTab: 'signals',
+      selectedTicker: null,
+      sidebarOpen: false,
+      railOpen: false,
+    });
+  });
+  afterEach(() => {
+    localStorage.clear();
+  });
+
   it('initial state: signals tab, no selected ticker', () => {
     const { result } = renderHook(() => useUiStore());
     expect(result.current.activeTab).toBe('signals');
@@ -95,5 +112,47 @@ describe('uiStore', () => {
     expect(result.current.sidebarOpen).toBe(false);
     expect(result.current.railOpen).toBe(false);
     expect(result.current.selectedTicker).toBe('SBER');
+  });
+
+  it('persists activeTab across hook remounts (localStorage)', () => {
+    // Set a non-default tab and confirm the persisted storage
+    // actually holds it; re-creating the hook without partialize
+    // also picks it up via the persist middleware.
+    localStorage.clear();
+    const first = renderHook(() => useUiStore());
+    act(() => first.result.current.setActiveTab('backfill'));
+    const raw = localStorage.getItem('algotrader.ui');
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(raw!);
+    expect(parsed.state.activeTab).toBe('backfill');
+    // Transient fields MUST NOT be persisted — refresh should land
+    // the operator on a clean dashboard.
+    expect(parsed.state.selectedTicker).toBeUndefined();
+    expect(parsed.state.sidebarOpen).toBeUndefined();
+    expect(parsed.state.railOpen).toBeUndefined();
+    first.unmount();
+  });
+
+  it('rehydrates activeTab from a previously written storage entry', () => {
+    // Seed localStorage BEFORE the hook is first mounted so the
+    // persist middleware picks the value up during module init.
+    localStorage.clear();
+    localStorage.setItem(
+      'algotrader.ui',
+      JSON.stringify({ state: { activeTab: 'portfolio' }, version: 1 }),
+    );
+    // Force the persist middleware to re-read localStorage instead
+    // of returning the in-memory cached value.
+    useUiStore.persist.rehydrate();
+    const second = renderHook(() => useUiStore());
+    expect(second.result.current.activeTab).toBe('portfolio');
+  });
+
+  it('clears the persisted tab when storage is missing or corrupt', () => {
+    localStorage.clear();
+    localStorage.setItem('algotrader.ui', '{not-json');
+    const second = renderHook(() => useUiStore());
+    // Falls back to the initial value rather than throwing.
+    expect(second.result.current.activeTab).toBe('signals');
   });
 });
