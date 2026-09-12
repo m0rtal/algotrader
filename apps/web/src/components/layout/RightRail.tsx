@@ -1,4 +1,6 @@
+import { useEffect } from 'react';
 import { useModel, useModelFeatures, usePipeline } from '@lib/hooks';
+import { useUiStore } from '@stores/uiStore';
 
 export function RightRail() {
   const { data: model } = useModel();
@@ -8,10 +10,15 @@ export function RightRail() {
   return (
     <div className="p-4 space-y-3">
       <section className="bg-surface-2 border border-border rounded-md p-3">
-        <h3 className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2">ML Model</h3>
+        <h3 className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2">
+          ML Model
+        </h3>
         <Row label="Версия" value={model.version} />
         <Row label="Train окно" value={`${model.trainWindowMonths} мес`} />
-        <Row label="Train period" value={`${model.trainStart.slice(0, 7)} → ${model.trainEnd.slice(0, 7)}`} />
+        <Row
+          label="Train period"
+          value={`${model.trainStart.slice(0, 7)} → ${model.trainEnd.slice(0, 7)}`}
+        />
         <Row label="OOS accuracy" value={model.oosAccuracy.toFixed(3)} tone="pos" />
         <Row label="OOS Sharpe" value={model.oosSharpe.toFixed(2)} />
         <Row label="IC (rank)" value={model.ic.toFixed(3)} tone="pos" />
@@ -19,7 +26,9 @@ export function RightRail() {
         <Row label="Next retrain" value={model.nextTrainDate} />
       </section>
       <section className="bg-surface-2 border border-border rounded-md p-3">
-        <h3 className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2">Top features</h3>
+        <h3 className="text-[10px] uppercase tracking-wider text-text-dim font-semibold mb-2">
+          Top features
+        </h3>
         {features.map((f) => (
           <div key={f.name} className="flex items-center gap-2 py-0.5 text-[11px]">
             <span className="w-[70px] text-text-muted mono">{f.name}</span>
@@ -38,9 +47,57 @@ export function RightRail() {
           Pipeline status
         </h3>
         {pipeline.map((s) => (
-          <Row key={s.name} label={s.name} value={s.status === 'ok' ? `✓ ${s.detail ?? ''}` : s.status === 'idle' ? `○ ${s.detail ?? ''}` : s.status} tone={s.status === 'ok' ? 'pos' : s.status === 'err' ? 'neg' : undefined} />
+          <Row
+            key={s.name}
+            label={s.name}
+            value={
+              s.status === 'ok'
+                ? `✓ ${s.detail ?? ''}`
+                : s.status === 'idle'
+                  ? `○ ${s.detail ?? ''}`
+                  : s.status
+            }
+            tone={s.status === 'ok' ? 'pos' : s.status === 'err' ? 'neg' : undefined}
+          />
         ))}
       </section>
+    </div>
+  );
+}
+
+/** Drawer wrapper around <RightRail />. Slides in from the right on
+ *  mobile when the gear button in Topbar is pressed. Same accessibility
+ *  pattern as SidebarDrawer: role="presentation" backdrop, Escape
+ *  handler on window, inner panel labelled by the parent <aside id>. */
+export function RightRailDrawer() {
+  const open = useUiStore((s) => s.railOpen);
+  const close = useUiStore((s) => s.closeSidebars);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') close();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, close]);
+
+  if (!open) return null;
+  return (
+    // eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions
+    <div
+      className="fixed inset-0 z-40 bg-black/60 flex justify-end lg:hidden"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) close();
+      }}
+    >
+      <aside
+        id="dashboard-rail"
+        className="bg-bg w-80 max-w-[85vw] overflow-y-auto border-l border-border"
+        aria-label="Панель модели"
+      >
+        <RightRail />
+      </aside>
     </div>
   );
 }

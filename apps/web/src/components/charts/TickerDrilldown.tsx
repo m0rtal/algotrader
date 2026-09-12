@@ -64,7 +64,7 @@ export function TickerDrilldown() {
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
-        className="bg-surface border border-border rounded-lg p-5 w-full max-w-[640px] sm:max-w-[800px] max-h-[80vh] overflow-y-auto"
+        className="bg-surface border border-border rounded-none sm:rounded-lg p-4 sm:p-5 w-full max-w-full sm:max-w-[640px] md:max-w-[800px] max-h-screen sm:max-h-[80vh] overflow-y-auto"
       >
         <div className="flex items-center justify-between mb-4">
           <h2 id={titleId} className="text-base font-semibold mono">

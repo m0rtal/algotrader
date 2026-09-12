@@ -57,4 +57,43 @@ describe('uiStore', () => {
       expect(result.current.activeTab).toBe(tab);
     }
   });
+
+  it('initial state: sidebars closed', () => {
+    const { result } = renderHook(() => useUiStore());
+    expect(result.current.sidebarOpen).toBe(false);
+    expect(result.current.railOpen).toBe(false);
+  });
+
+  it('toggleSidebar flips sidebarOpen', () => {
+    const { result } = renderHook(() => useUiStore());
+    act(() => result.current.toggleSidebar());
+    expect(result.current.sidebarOpen).toBe(true);
+    act(() => result.current.toggleSidebar());
+    expect(result.current.sidebarOpen).toBe(false);
+  });
+
+  it('toggleRail flips railOpen', () => {
+    const { result } = renderHook(() => useUiStore());
+    act(() => result.current.toggleRail());
+    expect(result.current.railOpen).toBe(true);
+  });
+
+  it('closeSidebars resets both', () => {
+    const { result } = renderHook(() => useUiStore());
+    act(() => result.current.toggleSidebar());
+    act(() => result.current.toggleRail());
+    act(() => result.current.closeSidebars());
+    expect(result.current.sidebarOpen).toBe(false);
+    expect(result.current.railOpen).toBe(false);
+  });
+
+  it('openTicker closes both sidebars (mobile drawer UX)', () => {
+    const { result } = renderHook(() => useUiStore());
+    act(() => result.current.toggleSidebar());
+    act(() => result.current.toggleRail());
+    act(() => result.current.openTicker('SBER'));
+    expect(result.current.sidebarOpen).toBe(false);
+    expect(result.current.railOpen).toBe(false);
+    expect(result.current.selectedTicker).toBe('SBER');
+  });
 });

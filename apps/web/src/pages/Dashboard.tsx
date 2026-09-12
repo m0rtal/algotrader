@@ -7,8 +7,8 @@ import { StorageTab } from '@features/storage/StorageTab';
 import { BackfillTab } from '@features/backfill/BackfillTab';
 import { Topbar } from '@components/layout/Topbar';
 import { KPIStr } from '@components/layout/KPIStr';
-import { Sidebar } from '@components/layout/Sidebar';
-import { RightRail } from '@components/layout/RightRail';
+import { Sidebar, SidebarDrawer } from '@components/layout/Sidebar';
+import { RightRail, RightRailDrawer } from '@components/layout/RightRail';
 import { TickerDrilldown } from '@components/charts/TickerDrilldown';
 
 const TABS: { id: TabId; label: string }[] = [
@@ -28,7 +28,7 @@ export function Dashboard() {
     <div className="h-screen flex flex-col bg-bg text-text overflow-hidden">
       <Topbar />
       <KPIStr />
-      {/* Mobile (<lg): single column, right rail below sidebar. Desktop (lg+): 3 columns. */}
+      {/* Mobile (<lg): single column, drawers overlay. Desktop (lg+): 3 columns. */}
       <div className="grid flex-1 bg-border-soft min-h-0 grid-cols-1 lg:[grid-template-columns:240px_minmax(0,1fr)_320px]">
         {/* Sidebar: scroll on desktop; full-height on mobile (sits above content) */}
         <aside className="bg-bg min-h-0 overflow-y-auto hidden lg:block">
@@ -42,7 +42,7 @@ export function Dashboard() {
                 key={t.id}
                 type="button"
                 onClick={() => setTab(t.id)}
-                className={`px-4 py-2.5 text-xs cursor-pointer border-b-2 whitespace-nowrap ${
+                className={`px-3 sm:px-4 py-2.5 text-xs cursor-pointer border-b-2 whitespace-nowrap ${
                   active === t.id
                     ? 'text-text border-accent'
                     : 'text-text-muted border-transparent hover:text-text'
@@ -66,6 +66,9 @@ export function Dashboard() {
           <RightRail />
         </aside>
       </div>
+      {/* Mobile drawers — fixed overlays, only mounted when open. */}
+      <SidebarDrawer />
+      <RightRailDrawer />
       <TickerDrilldown />
     </div>
   );
