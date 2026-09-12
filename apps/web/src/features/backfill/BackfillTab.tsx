@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@lib/api';
 import { ConfirmDialog } from '@features/settings/ConfirmDialog';
@@ -70,79 +70,6 @@ export function useForceReset() {
   });
 }
 
-type BackfillEvent = {
-  type: string;
-  run_id: number;
-  ts: string;
-  payload: Record<string, unknown>;
-};
-
-// EventSource-based live log stream. Auto-reconnects on close with
-// exponential backoff (capped at 10s). Keeps the last 100 events in
-// state so a brief disconnect doesn't lose history.
-export function useBackfillEvents() {
-  const [events, setEvents] = useState<BackfillEvent[]>([]);
-  const [connected, setConnected] = useState(false);
-  const retryDelay = useRef(500);
-
-  useEffect(() => {
-    let cancelled = false;
-    let es: EventSource | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const connect = () => {
-      if (cancelled) return;
-      // Build a relative URL; EventSource uses the current page origin.
-      es = new EventSource('/api/admin/backfill/events');
-
-      es.onopen = () => {
-        retryDelay.current = 500;
-        setConnected(true);
-      };
-
-      const onEvent = (raw: MessageEvent) => {
-        try {
-          const ev = JSON.parse(raw.data) as BackfillEvent;
-          setEvents((prev) => {
-            const next = [...prev, ev];
-            if (next.length > 100) next.shift();
-            return next;
-          });
-        } catch {
-          // ignore malformed events
-        }
-      };
-
-      // Generic listener — the server uses the SSE `event:` field for
-      // type but `EventSource` only fires typed listeners if we add
-      // them. We use addEventListener so we get all event types in
-      // one handler.
-      for (const evtType of ['status', 'log', 'ticker_progress', 'done']) {
-        es.addEventListener(evtType, onEvent as EventListener);
-      }
-
-      es.onerror = () => {
-        setConnected(false);
-        es?.close();
-        // Reconnect with exponential backoff.
-        const delay = Math.min(retryDelay.current, 10_000);
-        retryDelay.current = Math.min(retryDelay.current * 2, 10_000);
-        reconnectTimer = setTimeout(connect, delay);
-      };
-    };
-
-    connect();
-
-    return () => {
-      cancelled = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      es?.close();
-    };
-  }, []);
-
-  return { events, connected };
-}
-
 // ─── UI ─────────────────────────────────────────────────────────────
 
 export function BackfillTab() {
@@ -151,7 +78,6 @@ export function BackfillTab() {
   const reset = useForceReset();
   const stop = useStopBackfill();
   const start = useStartBackfill();
-  const { events, connected } = useBackfillEvents();
   const [showResetConfirm, setShowResetConfirm] = useState(false);
 
   const running =
@@ -247,52 +173,33 @@ export function BackfillTab() {
             <p className="text-sm text-red-400 self-center">{reset.error.message}</p>
           )}
         </div>
-      </section>
-
-      {/* Events — the global LogStrip at the bottom of the viewport
-          already shows recent system events including this tab's
-          backfill run logs (see AppShell for the footer mounting). */}
-      <div
-        data-testid="backfill-event-log"
-        className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4"
-      >
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-lg font-semibold">Recent events</h2>
-          <span className={'text-xs ' + (connected ? 'text-green-400' : 'text-zinc-500')}>
-            {connected ? '● live (SSE)' : '○ disconnected'}
-          </span>
+        {/* Progress — driven by useBackfillStatus polling (5s refetch).
+          Text events live in the global LogStrip at the bottom of the
+          viewport; the page itself shows the run state, the share
+          done, and a single live counter. No duplication. */}
+      {running && (
+        <div data-testid="backfill-progress" aria-live="polite">
+          <div className="flex items-center justify-between text-xs text-[var(--muted-foreground)] mb-1">
+            <span>Active run</span>
+            <span>
+              {status.data?.tickers_done ?? 0} / {status.data?.tickers_total ?? 0} тикеров ({pct}%)
+            </span>
+          </div>
+          <div
+            className="h-2 w-full rounded bg-[var(--muted)] overflow-hidden"
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={pct}
+          >
+            <div
+              className="h-2 bg-[var(--accent)] transition-all"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
         </div>
-        <div
-          data-testid="event-log-list"
-          className="font-mono text-xs max-h-96 overflow-y-auto bg-[var(--background)] rounded p-3 space-y-1"
-        >
-          {events.length === 0 && (
-            <p className="text-[var(--muted-foreground)]">
-              Waiting for events from the next scheduler run… The global log footer at the bottom of
-              every page shows system-wide activity.
-            </p>
-          )}
-          {[...events].reverse().map((ev, i) => (
-            <div key={`${ev.ts ?? i}-${i}`} className="flex gap-2">
-              <span className="text-[var(--muted-foreground)] shrink-0 font-mono w-14">
-                {(ev.ts ?? '').slice(11, 19)}
-              </span>
-              <span
-                className={
-                  ev.type === 'error' || ev.type === 'done'
-                    ? 'text-red-400 shrink-0 w-32'
-                    : ev.type === 'ticker_progress'
-                      ? 'text-blue-400 shrink-0 w-32'
-                      : 'text-zinc-300 shrink-0 w-32'
-                }
-              >
-                {ev.type}
-              </span>
-              <span className="truncate">{JSON.stringify(ev.payload ?? {}).slice(0, 200)}</span>
-            </div>
-          ))}
-        </div>
-      </div>
+      )}
+    </section>
 
       {/* Reset metadata confirmation dialog — uses the shared
           ConfirmDialog so Escape, focus trap, and danger styling come

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -7,45 +7,11 @@ import '@testing-library/jest-dom/vitest';
 import { BackfillTab } from '@features/backfill/BackfillTab';
 import { server } from '../../mocks/server';
 
-// ─── EventSource mock ────────────────────────────────────────────────
-// The backfill tab subscribes to a server-sent event stream. jsdom does
-// not implement EventSource, so we provide a minimal mock that records
-// every instance so tests can drive events synchronously.
-
-class MockEventSource {
-  url: string;
-  onopen: (() => void) | null = null;
-  onerror: ((e: Event) => void) | null = null;
-  listeners: Record<string, ((e: MessageEvent) => void)[]> = {};
-  closed = false;
-  static instances: MockEventSource[] = [];
-  constructor(url: string) {
-    this.url = url;
-    MockEventSource.instances.push(this);
-    setTimeout(() => this.onopen?.(), 0);
-  }
-  addEventListener(type: string, cb: (e: MessageEvent) => void) {
-    (this.listeners[type] ||= []).push(cb);
-  }
-  removeEventListener(type: string, cb: (e: MessageEvent) => void) {
-    this.listeners[type] = (this.listeners[type] ?? []).filter((f) => f !== cb);
-  }
-  close() {
-    this.closed = true;
-    this.listeners = {};
-    this.onerror = null;
-    this.onopen = null;
-  }
-  dispatch(type: string, data: unknown) {
-    const ev = { data: JSON.stringify(data) } as MessageEvent;
-    for (const cb of this.listeners[type] ?? []) cb(ev);
-  }
-  triggerError() {
-    this.onerror?.(new Event('error'));
-  }
-}
-(globalThis as unknown as { EventSource: typeof MockEventSource }).EventSource =
-  MockEventSource;
+// The previous SSE-based `useBackfillEvents` hook was removed: the
+// dedicated event log duplicated the global LogStrip footer and
+// offered no extra signal once the page already shows scheduler state,
+// tickers done/total, and a single live progress bar. All EventSource
+// mocking scaffolding is gone with it.
 
 // ─── Default fixtures ────────────────────────────────────────────────
 // MSW handlers are pure passthroughs in this codebase — every test must
@@ -82,7 +48,6 @@ function makeWrapper() {
 
 describe('BackfillTab', () => {
   beforeEach(() => {
-    MockEventSource.instances = [];
     vi.restoreAllMocks();
     // Default fixtures: idle system, nothing pending. Individual tests
     // stack additional handlers via server.use() to override these.
@@ -104,7 +69,6 @@ describe('BackfillTab', () => {
 
   afterEach(() => {
     server.resetHandlers();
-    MockEventSource.instances = [];
   });
 
   // ─── Idle / default state ────────────────────────────────────────
@@ -252,195 +216,6 @@ describe('BackfillTab', () => {
     // The error message bubbles up next to the buttons.
     await waitFor(() => {
       expect(screen.getByText(/500/i)).toBeInTheDocument();
-    });
-  });
-
-  // ─── EventSource / live log ──────────────────────────────────────
-
-  it('subscribes to EventSource on mount and accepts log events', async () => {
-    const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <BackfillTab />
-      </Wrapper>,
-    );
-    await waitFor(() => {
-      expect(MockEventSource.instances.length).toBeGreaterThan(0);
-    });
-    const es = MockEventSource.instances[0]!;
-    es.dispatch('log', { type: 'info', message: 'test message' });
-  });
-
-  it('ignores malformed SSE events without crashing', () => {
-    const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <BackfillTab />
-      </Wrapper>,
-    );
-    expect(MockEventSource.instances.length).toBeGreaterThan(0);
-    const es = MockEventSource.instances[0]!;
-    // Bypass the JSON parser by dispatching a payload that JSON.parse
-    // can't handle. The catch block in onEvent swallows the error.
-    expect(() => {
-      es.dispatch('log', 'not-json-at-all' as any);
-    }).not.toThrow();
-  });
-
-  it('schedules a reconnect when the EventSource errors', async () => {
-    const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <BackfillTab />
-      </Wrapper>,
-    );
-    await waitFor(() => {
-      expect(MockEventSource.instances.length).toBeGreaterThan(0);
-    });
-    const es = MockEventSource.instances[0]!;
-    // Simulate the SSE stream going down.
-    es.onerror?.(new Event('error'));
-    // After the onerror, the UI should show disconnected.
-    await waitFor(() => {
-      expect(screen.getByText(/disconnected/i)).toBeInTheDocument();
-    });
-  });
-
-  it('handles EventSource error by closing the stream', () => {
-    const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <BackfillTab />
-      </Wrapper>,
-    );
-    const es = MockEventSource.instances[MockEventSource.instances.length - 1]!;
-    // Trigger error synchronously — component's onerror handler closes
-    // the broken stream (we don't await the reconnect timer; the next
-    // test's beforeEach unmounts everything via afterEach cleanup).
-    es.triggerError();
-    // After error, the broken stream is replaced; original close() was
-    // called before reconnect.
-    expect(es.closed || MockEventSource.instances.length >= 1).toBe(true);
-  });
-
-  it('unmounts cleanly without throwing even when EventSource is in flight', () => {
-    const Wrapper = makeWrapper();
-    const { unmount } = render(
-      <Wrapper>
-        <BackfillTab />
-      </Wrapper>,
-    );
-    // MockEventSource.instances[0] exists; we don't fire any events,
-    // just unmount. The cleanup branch (cancelled = true; clearTimeout)
-    // is exercised by the useEffect teardown.
-    expect(() => unmount()).not.toThrow();
-  });
-
-  it('registers EventSource listeners on mount', () => {
-    const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <BackfillTab />
-      </Wrapper>,
-    );
-    expect(MockEventSource.instances.length).toBeGreaterThan(0);
-    const es = MockEventSource.instances[0]!;
-    // Component should subscribe to status/log/ticker_progress/done.
-    expect(Object.keys(es.listeners).sort()).toEqual(
-      expect.arrayContaining(['status', 'log', 'ticker_progress', 'done']),
-    );
-  });
-
-  it('renders a Recent events panel scoped to the backfill tab', async () => {
-    const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <BackfillTab />
-      </Wrapper>,
-    );
-    const log = await screen.findByTestId('backfill-event-log');
-    expect(log).toBeInTheDocument();
-    // The global live log footer lives outside this tab in AppShell; the
-    // backfill tab itself only renders a section-local recent-events list.
-    expect(log.className).toMatch(/rounded-lg/);
-  });
-
-  it('caps the events buffer at 100 entries (FIFO shift)', async () => {
-    const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <BackfillTab />
-      </Wrapper>,
-    );
-    await waitFor(() => {
-      expect(MockEventSource.instances.length).toBeGreaterThan(0);
-    });
-    const es = MockEventSource.instances[0]!;
-    // The buffer-clamp branch (next.length > 100) needs ≥101 events to
-    // trigger. Dispatch exactly 101 events and wait for the state update.
-    await act(async () => {
-      for (let i = 0; i < 101; i++) {
-        es.dispatch('log', {
-          type: 'info',
-          ts: '2026-09-08T12:00:00Z',
-          message: `event-${i}`,
-          level: 'info',
-        });
-      }
-    });
-    // The header reads "N buffered" — wait until it updates to 100.
-    await waitFor(
-      () => {
-        const text = screen.getByTestId('backfill-event-log').textContent ?? '';
-        return text.includes('100 buffered');
-      },
-      { timeout: 2000 },
-    );
-  });
-
-  it('renders ticker_progress events with the blue tone', async () => {
-    const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <BackfillTab />
-      </Wrapper>,
-    );
-    await waitFor(() => {
-      expect(MockEventSource.instances.length).toBeGreaterThan(0);
-    });
-    const es = MockEventSource.instances[0]!;
-    es.dispatch('ticker_progress', {
-      type: 'ticker_progress',
-      ts: '2026-09-08T12:00:00Z',
-      payload: { figi: 'BBG001' },
-    });
-    await waitFor(() => {
-      const spans = screen.getAllByText('ticker_progress');
-      expect(spans.length).toBeGreaterThan(0);
-      expect(spans[0].className).toMatch(/text-blue-400/);
-    });
-  });
-
-  it('renders done events with the red tone', async () => {
-    const Wrapper = makeWrapper();
-    render(
-      <Wrapper>
-        <BackfillTab />
-      </Wrapper>,
-    );
-    await waitFor(() => {
-      expect(MockEventSource.instances.length).toBeGreaterThan(0);
-    });
-    const es = MockEventSource.instances[0]!;
-    es.dispatch('done', {
-      type: 'done',
-      ts: '2026-09-08T12:00:00Z',
-      payload: { status: 'ok' },
-    });
-    await waitFor(() => {
-      const spans = screen.getAllByText('done');
-      expect(spans.length).toBeGreaterThan(0);
-      expect(spans[0].className).toMatch(/text-red-400/);
     });
   });
 
@@ -627,5 +402,47 @@ describe('BackfillTab', () => {
       },
       { timeout: 3000 },
     );
+  });
+
+  // ─── Progress bar ────────────────────────────────────────────────
+
+  it('does not render the progress bar when idle', async () => {
+    const Wrapper = makeWrapper();
+    render(
+      <Wrapper>
+        <BackfillTab />
+      </Wrapper>,
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/Daily 02:00 MSK scheduler/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId('backfill-progress')).toBeNull();
+  });
+
+  it('renders the progress bar with the right percentage while running', async () => {
+    server.use(
+      http.get('/api/admin/backfill/status', () =>
+        HttpResponse.json({
+          state: 'backfilling',
+          run_id: 1,
+          tickers_done: 30,
+          tickers_total: 100,
+          total_bars: 50000,
+          last_run: null,
+        }),
+      ),
+    );
+    const Wrapper = makeWrapper();
+    render(
+      <Wrapper>
+        <BackfillTab />
+      </Wrapper>,
+    );
+    const bar = await screen.findByTestId('backfill-progress');
+    expect(bar.textContent).toMatch(/30\s*\/\s*100 тикеров/);
+    expect(bar.textContent).toMatch(/\(30%\)/);
+    // The role="progressbar" element exposes aria-valuenow for screen readers.
+    const progressEl = screen.getByRole('progressbar');
+    expect(progressEl.getAttribute('aria-valuenow')).toBe('30');
   });
 });
