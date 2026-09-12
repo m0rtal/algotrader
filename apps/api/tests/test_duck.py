@@ -167,3 +167,61 @@ def test_query_ticker_overview_merges_legacy_with_modern(tmp_path):
     # Min/max should span both ranges
     assert str(merged["first_ts"]) == "2024-12-01"
     assert str(merged["last_ts"]) == "2025-06-03"
+    # Legacy figi resolved through instruments is recorded so the
+    # route layer can size the right parquet file on disk.
+    assert merged.get("source_figi") == "MERGED-FIGI"
+
+
+def test_query_ticker_overview_widens_first_last_when_legacy_is_newer(
+    tmp_path,
+) -> None:
+    """A legacy parquet file with later `last_ts` than the modern
+    one widens the merged range. Mirrors the reverse case so the
+    branch coverage on the merge loop hits both halves of `min` and
+    `max` updates."""
+    from algotrader_api.db import duck as duck_mod
+    import sqlite3
+
+    bars_dir = tmp_path / "bars"
+    bars_dir.mkdir()
+
+    con = sqlite3.connect(str(tmp_path / "state.db"))
+    con.execute(
+        "CREATE TABLE instruments "
+        "(ticker TEXT PRIMARY KEY, figi TEXT UNIQUE, class TEXT, "
+        "name TEXT, currency TEXT, lot_size INTEGER)"
+    )
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("WIDEN", "WIDEN-FIGI", "share", "Widen Co", "rub", 1),
+    )
+    con.commit()
+    con.close()
+
+    import duckdb as _duck
+    conn = _duck.connect(":memory:")
+    # Modern file ends in 2024; legacy file extends to 2026.
+    conn.execute(
+        f"COPY (SELECT 'WIDEN' AS ticker, DATE '2024-06-01' AS ts, "
+        f"100.0 AS open, 110.0 AS high, 95.0 AS low, 105.0 AS close, 1000 AS volume "
+        f"UNION ALL SELECT 'WIDEN', DATE '2024-06-02', 101, 111, 96, 106, 1100) "
+        f"TO '{bars_dir}/WIDEN.parquet' (FORMAT PARQUET)"
+    )
+    conn.execute(
+        f"COPY (SELECT DATE '2026-01-01' AS ts, 200.0 AS open, 220.0 AS high, "
+        f"190.0 AS low, 210.0 AS close, 2000 AS volume) "
+        f"TO '{bars_dir}/WIDEN-FIGI.parquet' (FORMAT PARQUET)"
+    )
+    conn.close()
+
+    rows = duck_mod.query_ticker_overview(
+        str(bars_dir), sqlite_path=str(tmp_path / "state.db")
+    )
+    widen = next((r for r in rows if r["ticker"] == "WIDEN"), None)
+    assert widen is not None
+    # First_ts comes from modern (legacy first_ts is None because the
+    # legacy parquet file has only one row at 2026-01-01 — it IS the
+    # latest, so it's still wider than modern).
+    assert str(widen["first_ts"]) == "2024-06-01"
+    assert str(widen["last_ts"]) == "2026-01-01"

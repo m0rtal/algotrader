@@ -150,3 +150,44 @@ def test_tickers_returns_per_ticker_summary_from_duckdb(client: TestClient) -> N
         assert row["lastDate"]
         assert row["name"] == ""
         assert row["sector"] == ""
+
+
+def test_tickers_file_size_reflects_parquet_bytes_on_disk(
+    client: TestClient, tmp_path
+) -> None:
+    """`fileSize` is the parquet file's byte size, not a placeholder.
+
+    The Bars tab aggregates `sum(t.fileSize)` and renders it as
+    "MB" — when every row reports 0, the operator sees "0.0 MB" even
+    though the parquet files are 40+ MB on disk. The fix is to stat
+    the parquet file per ticker.
+    """
+    import duckdb
+    import os
+
+    bars_dir = os.path.join(tmp_path, "data", "bars")
+    # conftest already created this dir under data_dir (tmp_path/data/bars).
+    # Write a ticker-style parquet file there.
+    conn = duckdb.connect(":memory:")
+    payload_path = os.path.join(bars_dir, "SIZER.parquet")
+    conn.execute(
+        f"COPY (SELECT 'SIZER' AS ticker, DATE '2025-01-01' AS ts, "
+        f"100.0 AS open, 110.0 AS high, 95.0 AS low, 105.0 AS close, "
+        f"1000 AS volume) TO '{payload_path}' (FORMAT PARQUET)"
+    )
+    conn.close()
+
+    # Force duck.py to rebuild its cached view (it was registered on
+    # the empty bars dir earlier).
+    from algotrader_api.db import duck as duck_mod
+
+    duck_mod.close()
+
+    body = client.get("/api/tickers").json()
+    sized = [r for r in body if r["symbol"] == "SIZER"]
+    assert len(sized) == 1, f"SIZER not found in tickers: {[r['symbol'] for r in body]}"
+    expected_bytes = os.path.getsize(payload_path)
+    assert sized[0]["fileSize"] == expected_bytes, (
+        f"fileSize should reflect actual parquet bytes on disk "
+        f"({expected_bytes}), got {sized[0]['fileSize']}"
+    )

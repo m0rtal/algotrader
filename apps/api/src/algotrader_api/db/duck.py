@@ -212,8 +212,16 @@ def query_ticker_overview(
                 "bars": entry["bars"],
                 "first_ts": entry["first_ts"],
                 "last_ts": entry["last_ts"],
+                "source_figi": figi,
             }
         else:
+            # Merge counts/timestamps. We only set `source_figi` on the
+            # first legacy row that resolved to this ticker; later
+            # rows inherit if the existing one doesn't have it yet
+            # (this happens when a modern file was processed before
+            # the legacy fallback path).
+            if not existing.get("source_figi"):
+                existing["source_figi"] = figi
             existing["bars"] = int(existing["bars"]) + int(entry["bars"])
             existing_first = existing["first_ts"]
             existing_last = existing["last_ts"]

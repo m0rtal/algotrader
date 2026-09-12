@@ -154,9 +154,12 @@ def get_tickers() -> list:
     `instruments` table (name, sector, currency, lot_size). Tickers
     with bars but no instruments row still surface — they just show
     placeholder name/sector (which is exactly the legacy / partial
-    backfill case). `price`, `fileSize`, `gaps` are placeholder until
-    upstream metrics land.
+    backfill case). `fileSize` is the parquet file's byte size on
+    disk so the operator sees a real MB total in the header strip
+    rather than "0.0 MB". `price`, `gaps` remain placeholder.
     """
+    import os
+
     bars_dir = _get_bars_dir()
     overview = duck.query_ticker_overview(bars_dir, sqlite_path=_get_sqlite_path())
     by_ticker = {
@@ -166,11 +169,33 @@ def get_tickers() -> list:
             (),
         ) if r["ticker"]
     }
+    # One os.listdir call gives us the (name → bytes) map for every
+    # parquet in the bars dir. The overview keys are either ticker
+    # (modern files) or figi (legacy files); both stem forms appear
+    # in the file map because filename = figi = stem for legacy and
+    # filename = ticker = stem for modern.
+    sizes_by_stem: dict[str, int] = {}
+    try:
+        for name in os.listdir(bars_dir):
+            if not name.endswith(".parquet"):
+                continue
+            sizes_by_stem[os.path.splitext(name)[0]] = os.path.getsize(
+                os.path.join(bars_dir, name)
+            )
+    except OSError:  # pragma: no cover — bars_dir missing or unreadable
+        sizes_by_stem = {}
+
     out: list[dict] = []
     for r in overview:
         if r["ticker"] is None:
             continue
         meta = by_ticker.get(r["ticker"])
+        # Overview now records the resolved figure id from legacy
+        # figi-style parquet files in `source_figi`. When that is
+        # set, look up by figi (stem = figi for legacy files);
+        # otherwise the ticker itself is the stem (modern files).
+        stem = r.get("source_figi") or r["ticker"]
+        file_size = sizes_by_stem.get(stem, 0)
         out.append(
             {
                 "symbol": r["ticker"],
@@ -180,7 +205,7 @@ def get_tickers() -> list:
                 "bars": int(r["bars"]),
                 "firstDate": str(r["first_ts"]),
                 "lastDate": str(r["last_ts"]),
-                "fileSize": 0,
+                "fileSize": file_size,
                 "gaps": 0,
                 "currency": meta["currency"] if meta and meta["currency"] else "",
                 "lotSize": int(meta["lot_size"]) if meta and meta["lot_size"] else 0,
