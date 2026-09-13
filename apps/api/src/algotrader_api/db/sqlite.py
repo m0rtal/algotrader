@@ -105,6 +105,33 @@ def run_migrations(path: str, migrations_dir: str) -> None:
                 raise
     conn.commit()
 
+    _seed_moex_holidays_if_missing(conn, path)
+
+
+def _seed_moex_holidays_if_missing(conn: sqlite3.Connection, db_path: str) -> None:
+    """Issue #4: seed the 2020-2027 MOEX holiday calendar on fresh install.
+
+    The table itself is created by migration 006. This helper only
+    inserts the rows when the table is present but empty. Idempotent:
+    if the operator has already populated it via the historical
+    import script (``import_moex_holidays.py``) the table is
+    non-empty and we skip.
+
+    The ``OperationalError`` branch handles pre-migration-006 databases
+    (the table simply does not exist yet).
+    """
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM moex_holidays").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if row[0] > 0:
+        return
+    try:
+        from ..scripts_import.import_moex_holidays import import_moex_holidays
+    except Exception:  # noqa: BLE001 — missing JSON or broken import path is non-fatal
+        return
+    import_moex_holidays(db_path)
+
 
 def _split_statements(sql: str) -> list[str]:
     """Split a multi-statement migration file into individual statements.

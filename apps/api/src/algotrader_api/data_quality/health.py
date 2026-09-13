@@ -9,6 +9,7 @@ for the spec.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -82,6 +83,36 @@ def _bars_range(con: sqlite3.Connection, figi: str) -> tuple[date | None, date |
     first = date.fromisoformat(row[0])
     last = date.fromisoformat(row[1])
     return first, last, int(row[2])
+
+
+_log = logging.getLogger("algotrader_api.data_quality.health")
+
+
+def _warn_if_holidays_empty(db_path: str) -> None:
+    """Issue #4: log a warning when moex_holidays is empty at compute time.
+
+    The migration (006) seeds the table, but if the seed ever fails
+    silently (missing JSON, broken import path) the guardian would
+    emit INCOMPLETE_HISTORY for every figi with no operator-visible
+    signal. A warning at the top of ``compute_all`` makes the
+    missing-data situation visible.
+    """
+    con = _open(db_path)
+    try:
+        try:
+            count = con.execute("SELECT COUNT(*) FROM moex_holidays").fetchone()[0]
+        except sqlite3.OperationalError:
+            return
+    finally:
+        con.close()
+    if count == 0:
+        _log.warning(
+            "data_quality.moex_holidays.empty",
+            extra={
+                "hint": "run python -m algotrader_api.scripts_import.import_moex_holidays",
+                "impact": "INCOMPLETE_HISTORY will fire for every figi",
+            },
+        )
 
 
 def _weekdays_excluding_holidays(
@@ -260,6 +291,7 @@ def compute_all(db_path: str, today: date | None = None) -> dict[str, HealthRepo
     SQL boundary per the TRADEABLE_CLASSES contract.
     """
     today = today or date.today()
+    _warn_if_holidays_empty(db_path)
     placeholders = ",".join("?" for _ in TRADEABLE_CLASSES)
     con = _open(db_path)
     try:

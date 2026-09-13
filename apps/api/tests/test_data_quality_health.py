@@ -221,9 +221,10 @@ def test_health_report_marks_incomplete_history_with_holidays(db):
     )
     # Subtract two holidays inside the range; without this, _weekdays_excluding_holidays
     # would still leave actual << expected, but the helper subtraction is what we want to
-    # exercise end-to-end.
+    # exercise end-to-end. INSERT OR IGNORE because migration 006 now seeds the table
+    # with the canonical 2020-2027 calendar — dates that overlap will silently no-op.
     con.executemany(
-        "INSERT INTO moex_holidays (date, name) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO moex_holidays (date, name) VALUES (?, ?)",
         [
             ("2026-05-01", "test-spring"),
             ("2026-06-12", "test-russia-day"),
