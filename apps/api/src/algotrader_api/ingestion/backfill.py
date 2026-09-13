@@ -449,6 +449,43 @@ class BackfillRunner:
 
         closed = [c for c in closed if (dt := _candle_date(c)) and dt < today_]
 
+        # ── integrity gate ────────────────────────────────────────────
+        # Every fetched candle is validated against the bar-level rules
+        # defined in data_quality.integrity. Violating candles are
+        # logged at WARN with rule+detail and dropped — only valid
+        # candles reach `bars`. The total skipped count is also written
+        # to ingestion_logs so the data-quality guardian surfaces it.
+        from ..data_quality.integrity import bar_ts, validate_bar
+
+        clean: list = []
+        skipped = 0
+        for raw in closed:
+            violations = validate_bar(raw)
+            if not violations:
+                clean.append(raw)
+                continue
+            skipped += 1
+            for vio in violations:
+                logger.warning(
+                    "bar-integrity-skip",
+                    figi=figi,
+                    ts=bar_ts(raw),
+                    rule=vio.rule.value,
+                    detail=vio.message,
+                )
+            await self._log(
+                "warn",
+                figi=figi,
+                message=f"bar-corruption-skipped ts={bar_ts(raw)} rule={violations[0].rule.value}",
+            )
+        if skipped and clean:
+            await self._log(
+                "warn",
+                figi=figi,
+                message=f"bar-corruption-skipped={skipped}",
+            )
+        closed = clean
+
         written = self._write_bars(figi=figi, candles=closed)
         if written > 0:
             last_ts = self._extract_last_bar_ts(closed)

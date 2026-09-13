@@ -903,6 +903,160 @@ async def test_run_accepts_limit_to_figis(tmp_path):
     assert called_figi == "FIGI-B"
 
 
+# ─── integrity skip-on-violation ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_backfill_one_skips_corrupt_bars_writes_valid(tmp_path):
+    """BackfillRunner._backfill_one must run validate_bar on every
+    closed candle, skip those that violate rules, log the skipped
+    count to ingestion_logs, and persist only the valid ones to the
+    `bars` table.
+
+    The candle stream from the SDK is a single closed bar with
+    high < open (HIGH_BELOW_O_H_L_C) interleaved with two valid
+    bars. After validation, the bars table should hold exactly the
+    two valid rows.
+    """
+    import sqlite3
+
+    # Two valid bars and one corrupt bar (high < open) on adjacent days
+    valid_a = SimpleNamespace(
+        time=SimpleNamespace(year=2024, month=6, day=1),
+        open=SimpleNamespace(units=100, nano=0),
+        high=SimpleNamespace(units=110, nano=0),
+        low=SimpleNamespace(units=95, nano=0),
+        close=SimpleNamespace(units=105, nano=0),
+        volume=1000,
+        is_complete=True,
+    )
+    corrupt = SimpleNamespace(
+        time=SimpleNamespace(year=2024, month=6, day=2),
+        open=SimpleNamespace(units=100, nano=0),
+        high=SimpleNamespace(units=85, nano=0),  # high < open → violation
+        low=SimpleNamespace(units=80, nano=0),
+        close=SimpleNamespace(units=82, nano=0),
+        volume=1000,
+        is_complete=True,
+    )
+    valid_b = SimpleNamespace(
+        time=SimpleNamespace(year=2024, month=6, day=3),
+        open=SimpleNamespace(units=82, nano=0),
+        high=SimpleNamespace(units=92, nano=0),
+        low=SimpleNamespace(units=80, nano=0),
+        close=SimpleNamespace(units=90, nano=0),
+        volume=1000,
+        is_complete=True,
+    )
+
+    client = MagicMock()
+    # 7-day window = 1 chunk → all 3 candles returned together.
+    client.get_candles = AsyncMock(return_value=[valid_a, corrupt, valid_b])
+
+    events = []
+
+    async def collect(ev):
+        events.append(ev)
+
+    runner = BackfillRunner(
+        client=client,
+        db_path=str(tmp_path / "state.db"),
+        event_sink=collect,
+        run_id=7,
+    )
+    # 7-day window → exactly 1 chunk.
+    written = await runner._backfill_one(
+        figi="BBG-SKIP",
+        from_=date(2024, 6, 1),
+        to=date(2024, 6, 7),
+    )
+
+    # 2 valid bars persisted (1 chunk × 2 valid bars).
+    assert written == 2
+
+    con = sqlite3.connect(str(tmp_path / "state.db"))
+    rows = con.execute(
+        "SELECT ts, open, high, low, close, volume FROM bars "
+        "WHERE figi = ? ORDER BY ts",
+        ("BBG-SKIP",),
+    ).fetchall()
+    con.close()
+    persisted_ts = [r[0] for r in rows]
+    assert all(ts in ("2024-06-01", "2024-06-03") for ts in persisted_ts)
+    assert "2024-06-02" not in persisted_ts  # corrupt bar never persisted
+
+    # ingestion_logs row records the skipped count for this figi.
+    con = sqlite3.connect(str(tmp_path / "state.db"))
+    log_rows = con.execute(
+        "SELECT run_id, level, figi, message FROM ingestion_logs "
+        "WHERE figi = ? AND message LIKE '%bar-corruption-skipped%'",
+        ("BBG-SKIP",),
+    ).fetchall()
+    con.close()
+    assert log_rows, "ingestion_logs should have a bar-corruption-skipped row"
+    # One summary row from the gate (skipped=1); per-candle warn rows also
+    # exist with the same figi prefix.
+    summary_rows = [r for r in log_rows if "bar-corruption-skipped=" in r[3]]
+    assert summary_rows, "expected at least one summary row"
+    run_id, level, figi, message = summary_rows[0]
+    assert run_id == 7
+    assert level == "warn"
+    assert figi == "BBG-SKIP"
+    assert "bar-corruption-skipped=1" in message
+
+
+@pytest.mark.asyncio
+async def test_backfill_one_writes_nothing_when_all_bars_invalid(tmp_path):
+    """If every fetched bar is corrupt, the runner skips all of them,
+    logs the skip count, and writes 0 rows."""
+    import sqlite3
+
+    all_corrupt = SimpleNamespace(
+        time=SimpleNamespace(year=2024, month=6, day=1),
+        open=SimpleNamespace(units=100, nano=0),
+        high=SimpleNamespace(units=80, nano=0),  # high < open
+        low=SimpleNamespace(units=70, nano=0),
+        close=SimpleNamespace(units=75, nano=0),
+        volume=-1,  # AND negative volume
+        is_complete=True,
+    )
+    client = MagicMock()
+    client.get_candles = AsyncMock(return_value=[all_corrupt])
+
+    async def noop(ev):
+        pass
+
+    runner = BackfillRunner(
+        client=client,
+        db_path=str(tmp_path / "state.db"),
+        event_sink=noop,
+    )
+    written = await runner._backfill_one(
+        figi="BBG-ALLBAD",
+        from_=date(2024, 6, 1),
+        to=date(2024, 6, 7),
+    )
+    assert written == 0
+
+    con = sqlite3.connect(str(tmp_path / "state.db"))
+    count = con.execute(
+        "SELECT COUNT(*) FROM bars WHERE figi = ?", ("BBG-ALLBAD",)
+    ).fetchone()[0]
+    log_msg = con.execute(
+        "SELECT message FROM ingestion_logs "
+        "WHERE figi = ? AND message LIKE '%bar-corruption-skipped%' "
+        "ORDER BY id DESC LIMIT 1",
+        ("BBG-ALLBAD",),
+    ).fetchone()
+    con.close()
+    assert count == 0
+    # Either per-bar warn row ("bar-corruption-skipped ts=... rule=...")
+    # or summary row ("bar-corruption-skipped=N") is acceptable — what
+    # matters is that *some* log row mentions the skip and the count.
+    assert log_msg is not None
+    assert "bar-corruption-skipped" in log_msg[0]
+
+
 @pytest.mark.asyncio
 async def test_run_without_limit_to_processes_full_universe(tmp_path):
     """Without limit_to, _list_instruments is called with None."""
