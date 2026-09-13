@@ -1,0 +1,142 @@
+"""Tests for the data-quality health module."""
+from __future__ import annotations
+
+import sqlite3
+from datetime import date, timedelta
+
+import pytest
+
+from algotrader_api.db.migrations import MIGRATIONS_DIR
+from algotrader_api.db.sqlite import run_migrations
+from algotrader_api.data_quality.health import (
+    HealthIssue,
+    compute_health,
+)
+
+
+@pytest.fixture
+def db(tmp_path):
+    """A fresh state.db with the schema applied and one SBER figi."""
+    p = str(tmp_path / "state.db")
+    run_migrations(p, str(MIGRATIONS_DIR))
+    con = sqlite3.connect(p)
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS instruments (
+            ticker TEXT PRIMARY KEY, figi TEXT UNIQUE, class TEXT,
+            name TEXT, currency TEXT, lot_size INTEGER, isin TEXT,
+            sector TEXT, source_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES ('SBER', 'FIGI-SBER', 'share', 'Sber', 'rub', 10)"
+    )
+    con.commit()
+    con.close()
+    return p
+
+
+def _seed_bars(db_path, figi, dates_iso):
+    """Insert bars; tmpfs files are private so a fresh connection works."""
+    con = sqlite3.connect(db_path, timeout=5)
+    try:
+        con.executemany(
+            "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+            "VALUES (?, ?, 1, 1, 1, 1, 1)",
+            [(figi, d) for d in dates_iso],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_health_report_healthy_figi_scores_100(db):
+    today = date(2026, 9, 12)
+    _seed_bars(
+        db, "FIGI-SBER",
+        [(today - timedelta(days=i)).isoformat() for i in range(30, -1, -1)],
+    )
+    r = compute_health(db, "FIGI-SBER", today=today)
+    assert r.health_score == 100
+    assert r.issues == []
+
+
+def test_health_report_missing_recent_days(db):
+    today = date(2026, 9, 12)
+    # Bars from 30 days ago up to 10 days ago; last bar = today - 10.
+    dates = [(today - timedelta(days=i)).isoformat() for i in range(10, 31)]
+    _seed_bars(db, "FIGI-SBER", dates)
+    r = compute_health(db, "FIGI-SBER", today=today)
+    assert HealthIssue.MISSING_RECENT in r.issues
+    assert r.health_score <= 70
+    assert r.last_bar == today - timedelta(days=10)
+
+
+def test_health_report_sparse_history_capped(db):
+    today = date(2026, 9, 12)
+    # First bar 5 years ago; only 30 bars since then. Expected is
+    # roughly 5*250=1250 weekdays, actual is 30 — sparse.
+    first = date(2021, 1, 15)
+    dates = [first.isoformat()]
+    dates += [(today - timedelta(days=i)).isoformat() for i in range(29, -1, -1)]
+    _seed_bars(db, "FIGI-SBER", dates)
+    r = compute_health(db, "FIGI-SBER", today=today)
+    assert HealthIssue.SPARSE_HISTORY in r.issues
+    # Sparse (-20) + the gap between first_bar and the next batch (-20
+    # because it's >5 calendar days) = -40; sparse alone is capped at 20.
+    assert r.health_score >= 50
+    assert r.health_score <= 80
+
+
+def test_health_report_has_gaps_detects_long_gap(db):
+    today = date(2026, 9, 12)
+    dates = [(today - timedelta(days=i)).isoformat() for i in range(30, 15, -1)]
+    dates += [(today - timedelta(days=i)).isoformat() for i in range(8, -1, -1)]
+    _seed_bars(db, "FIGI-SBER", dates)
+    r = compute_health(db, "FIGI-SBER", today=today)
+    assert HealthIssue.HAS_GAPS in r.issues
+    assert len(r.recent_gaps) > 0
+
+
+def test_health_report_rate_limited_failures(db):
+    today = date(2026, 9, 12)
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO ingestion_logs (ts, run_id, level, figi, message) "
+        "VALUES (datetime('now', '-1 day'), 1, 'warn', 'FIGI-SBER', 'rate limit hit')"
+    )
+    con.commit()
+    con.close()
+    r = compute_health(db, "FIGI-SBER", today=today)
+    assert HealthIssue.RATE_LIMITED_FAILURES in r.issues
+    assert r.recent_failures
+
+
+def test_compute_all_returns_only_tradeable_figis(db):
+    today = date(2026, 9, 12)
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES ('OPT', 'FIGI-OPT', 'option', 'Opt', 'rub', 1)"
+    )
+    con.commit()
+    con.close()
+    _seed_bars(
+        db, "FIGI-OPT",
+        [(today - timedelta(days=i)).isoformat() for i in range(30, -1, -1)],
+    )
+    # Inline import to avoid top-level side effect.
+    from algotrader_api.data_quality.health import compute_all
+
+    reports = compute_all(db, today=today)
+    assert "FIGI-SBER" in reports
+    assert "FIGI-OPT" not in reports
+
+
+def test_health_report_unknown_figi_scores_zero(db):
+    """A figi with no instrument row gets score 0 + MISSING_RECENT."""
+    r = compute_health(db, "FIGI-DOES-NOT-EXIST", today=date(2026, 9, 12))
+    assert r.health_score == 0
+    assert HealthIssue.MISSING_RECENT in r.issues
