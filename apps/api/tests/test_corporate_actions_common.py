@@ -124,3 +124,28 @@ def test_merge_rejects_zero_factor(db):
 def test_merge_empty_rows_returns_zero(db):
     """No rows → no work, return 0, no DB write."""
     assert merge_into_corporate_actions(db, []) == 0
+
+
+def test_merge_persists_source_column(db):
+    """Regression: the writer must persist the `source` field set on the
+    CorporateActionRow. Without this, the `source` column is decorative —
+    set on the dataclass but never written to SQLite."""
+    import sqlite3
+
+    _seed_figi(db)
+    row = CorporateActionRow(
+        figi="BBG004730N88",
+        action_type="dividend",
+        ex_date=date(2024, 7, 8),
+        factor=1.0,
+        cash_amount=387.0,
+        note="x",
+        source="test:source",
+    )
+    merge_into_corporate_actions(db, [row])
+    con = sqlite3.connect(db)
+    src = con.execute(
+        "SELECT source FROM corporate_actions WHERE figi=?",
+        ("BBG004730N88",),
+    ).fetchone()[0]
+    assert src == "test:source"

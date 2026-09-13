@@ -219,27 +219,11 @@ def detect_mode(db_path: str) -> int:
                     f"moex_iss_snapshots: face_value {prev_fv} -> {cur_fv} "
                     f"observed_at={observed_at}"
                 ),
-                # source is not a field on CorporateActionRow; we set it via
-                # a direct INSERT below to keep the common writer
-                # schema-stable.
+                source="moex_iss_snapshots",
             )
         )
 
-    # Merge via the common writer for `factor`/`cash_amount`/`note`, then
-    # stamp `source='moex_iss_snapshots'` on the rows we just wrote.
-    n = merge_into_corporate_actions(db_path, out)
-    if n:  # pragma: no cover — branch hit only when at least one split was emitted
-        con = sqlite3.connect(db_path)
-        try:
-            con.execute(
-                "UPDATE corporate_actions SET source = 'moex_iss_snapshots' "
-                "WHERE action_type='split' AND source IS NULL "
-                "AND note LIKE 'moex_iss_snapshots:%'"
-            )
-            con.commit()
-        finally:
-            con.close()
-    return n
+    return merge_into_corporate_actions(db_path, out)
 
 
 def _parse_iso_date(observed_at: str):

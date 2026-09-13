@@ -56,12 +56,12 @@ def merge_into_corporate_actions(
         con.executemany(
             """
             INSERT OR REPLACE INTO corporate_actions
-                (figi, action_type, ex_date, factor, cash_amount, note)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (figi, action_type, ex_date, factor, cash_amount, note, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (r.figi, r.action_type, r.ex_date.isoformat(),
-                 r.factor, r.cash_amount, r.note)
+                 r.factor, r.cash_amount, r.note, r.source)
                 for r in rows
             ],
         )
