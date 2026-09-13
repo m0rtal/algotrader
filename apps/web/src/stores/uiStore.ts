@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 
-export type TabId = 'signals' | 'trades' | 'portfolio' | 'backtest' | 'storage' | 'backfill';
+export type TabId = 'signals' | 'trades' | 'portfolio' | 'backtest' | 'data';
 
 interface UiState {
   activeTab: TabId;
