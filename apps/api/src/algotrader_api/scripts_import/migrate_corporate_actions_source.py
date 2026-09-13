@@ -27,32 +27,34 @@ from __future__ import annotations
 import sqlite3
 
 
-def _infer_source(note: str | None) -> str:
-    """Map a legacy `note` prefix to a `source` value.
-
-    Order matters: check `moex:iss` before `tinkoff:` because note values
-    can be free-form; the historical importer set
-    `note="tinkoff: {currency}"` exactly with the colon after tinkoff, so
-    startswith is unambiguous.
-    """
-    if note is None:  # pragma: no cover — defensive: CorporateActionRow.note defaults to ""
-        return "curated"
-    if note.startswith("moex:iss"):
-        return "moex_iss"
-    if note.startswith("tinkoff:"):
-        return "tinkoff"
-    return "curated"
+# Known source values inferred from a legacy `note` prefix. Anything
+# outside this map is unverifiable and gets DELETED — we cannot tag it
+# `curated` because that's the very fabrication this rule was meant to
+# remove.
+_KNOWN_SOURCE_PREFIXES = {
+    "moex:iss": "moex_iss",
+    "tinkoff:": "tinkoff",
+}
 
 
-def backfill_source(db_path: str) -> int:
-    """Walk every corporate_actions row and set `source` from `note`.
+def _infer_source_or_none(note: str | None) -> str | None:
+    """Return the inferred source, or None if the note is not from a
+    known provenance. Unknown notes will be deleted by backfill_source()."""
+    if not note:
+        return None
+    for prefix, source in _KNOWN_SOURCE_PREFIXES.items():
+        if note.startswith(prefix):
+            return source
+    return None
 
-    Idempotent: rows where `source` is already set and matches the inferred
-    value are left untouched. Returns the number of rows visited — i.e. the
-    total corporate_actions row count. The caller can compare against
-    con.execute('SELECT COUNT(*) FROM corporate_actions') to verify nothing
-    was skipped. Whether the row's value actually changed can be inferred
-    from comparing the result across runs.
+
+def backfill_source(db_path: str) -> dict:
+    """Walk every corporate_actions row.
+
+    Rows whose `note` matches a known source prefix get that source.
+    Rows whose `note` does NOT match any known prefix are DELETED — the
+    `curated` fallback is forbidden by the source-of-truth rule. Returns
+    a stats dict: {backfilled: N, deleted: M, kept: K}.
     """
     con = sqlite3.connect(db_path)
     try:
@@ -61,8 +63,19 @@ def backfill_source(db_path: str) -> int:
             "FROM corporate_actions"
         )
         rows = cur.fetchall()
+        backfilled = 0
+        deleted = 0
         for figi, action_type, ex_date, note, current in rows:
-            inferred = _infer_source(note)
+            inferred = _infer_source_or_none(note)
+            if inferred is None:
+                # unverifiable — delete
+                con.execute(
+                    "DELETE FROM corporate_actions "
+                    "WHERE figi = ? AND action_type = ? AND ex_date = ?",
+                    (figi, action_type, ex_date),
+                )
+                deleted += 1
+                continue
             if current == inferred:
                 continue
             con.execute(
@@ -70,10 +83,13 @@ def backfill_source(db_path: str) -> int:
                 "WHERE figi = ? AND action_type = ? AND ex_date = ?",
                 (inferred, figi, action_type, ex_date),
             )
+            backfilled += 1
         con.commit()
+        cur.execute("SELECT COUNT(*) FROM corporate_actions")
+        kept = cur.fetchone()[0]
     finally:
         con.close()
-    return len(rows)
+    return {"backfilled": backfilled, "deleted": deleted, "kept": kept}
 
 
 if __name__ == "__main__":  # pragma: no cover — operator entry point
@@ -86,5 +102,9 @@ if __name__ == "__main__":  # pragma: no cover — operator entry point
             file=sys.stderr,
         )
         sys.exit(2)
-    n = backfill_source(sys.argv[1])
-    print(f"Backfilled source on {n} corporate_actions rows")
+    stats = backfill_source(sys.argv[1])
+    print(
+        f"Backfilled source on {stats['backfilled']} rows, "
+        f"deleted {stats['deleted']} unverifiable rows, "
+        f"{stats['kept']} rows remaining"
+    )

@@ -5,7 +5,7 @@ Three behaviours to verify:
 2. backfill_source() infers source from the legacy `note` prefix:
      `moex:iss`     -> 'moex_iss'
      `tinkoff: ...` -> 'tinkoff'
-     anything else  -> 'curated'
+     anything else  -> DELETED (the `curated` fallback is forbidden)
 3. backfill_source() is idempotent and safe to re-run.
 """
 from __future__ import annotations
@@ -23,9 +23,6 @@ from algotrader_api.scripts_import.import_corporate_actions_common import (
 )
 
 
-# --- fixtures --------------------------------------------------------------
-
-
 @pytest.fixture
 def db(tmp_path):
     """Migrated DB on a fresh temp path. Includes migration 009."""
@@ -34,115 +31,110 @@ def db(tmp_path):
     yield p
 
 
-def _seed_figi(db_path: str, figi: str = "BBG004730N88") -> None:
-    con = sqlite3.connect(db_path)
-    con.execute(
-        "INSERT INTO instruments(figi, ticker, class, name, currency, lot_size) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (figi, "SBER", "share", "Sber", "rub", 10),
-    )
-    con.commit()
-    con.close()
-
-
-# --- tests -----------------------------------------------------------------
-
-
-def test_migration_009_adds_source_column(db):
-    """After run_migrations, `source` is a nullable TEXT column."""
-    con = sqlite3.connect(db)
-    cols = [row[1] for row in con.execute("PRAGMA table_info(corporate_actions)")]
-    assert "source" in cols
-    # Source is nullable: `notnull` flag from PRAGMA table_info is 0 for nullable cols.
-    info = con.execute("PRAGMA table_info(corporate_actions)").fetchall()
-    source_row = next(r for r in info if r[1] == "source")
-    assert source_row[3] == 0  # notnull flag
-
-
-def test_backfill_source_infers_from_note_prefix(db):
-    """Each note-prefix maps to a known source value."""
-    _seed_figi(db)
-    rows = [
-        CorporateActionRow(
-            figi="BBG004730N88",
-            action_type="dividend",
-            ex_date=date(2024, 7, 8),
-            factor=1.0,
-            cash_amount=387.0,
-            note="moex:iss",
-        ),
-        CorporateActionRow(
-            figi="BBG004730N88",
-            action_type="dividend",
-            ex_date=date(2024, 8, 1),
-            factor=1.0,
-            cash_amount=18.0,
-            note="tinkoff: rub",
-        ),
-        CorporateActionRow(
-            figi="BBG004730N88",
-            action_type="split",
-            ex_date=date(2011, 11, 15),
-            factor=5.0,
-            cash_amount=None,
-            note="VTBR 5-for-1 (denomination)",
-        ),
-    ]
-    merge_into_corporate_actions(db, rows)
-
-    # Lazy import so the test file fails at collection-time before the
-    # implementation exists.
-    from algotrader_api.scripts_import.migrate_corporate_actions_source import (
-        backfill_source,
-    )
-
-    n = backfill_source(db)
-    assert n == 3
-
-    con = sqlite3.connect(db)
-    rows = con.execute(
-        "SELECT ex_date, source FROM corporate_actions ORDER BY ex_date"
-    ).fetchall()
-    assert rows == [
-        (date(2011, 11, 15).isoformat(), "curated"),
-        (date(2024, 7, 8).isoformat(), "moex_iss"),
-        (date(2024, 8, 1).isoformat(), "tinkoff"),
-    ]
-
-
-def test_backfill_source_is_idempotent(db):
-    """Re-running backfill_source() leaves `source` unchanged; doesn't error."""
-    _seed_figi(db)
+def _seed_three_rows(db_path: str) -> None:
+    """Seed one row per known prefix type, plus an unverifiable row."""
     merge_into_corporate_actions(
-        db,
+        db_path,
         [
             CorporateActionRow(
                 figi="BBG004730N88",
+                action_type="split",
+                ex_date=date(2011, 11, 15),
+                factor=5.0,
+                cash_amount=None,
+                note="VTBR 5-for-1",  # unverifiable — gets deleted
+                source="",
+            ),
+            CorporateActionRow(
+                figi="BBG004731032",
                 action_type="dividend",
                 ex_date=date(2024, 7, 8),
                 factor=1.0,
                 cash_amount=387.0,
                 note="moex:iss",
+                source="",
+            ),
+            CorporateActionRow(
+                figi="FIGI-LKOH",
+                action_type="dividend",
+                ex_date=date(2024, 8, 1),
+                factor=1.0,
+                cash_amount=387.0,
+                note="tinkoff: rub",
+                source="",
             ),
         ],
     )
 
+
+def test_migration_009_adds_source_column(db):
+    """After run_migrations the source column exists and is nullable."""
+    con = sqlite3.connect(db)
+    cur = con.execute("PRAGMA table_info(corporate_actions)")
+    cols = {r[1]: r[2] for r in cur}
+    assert cols["source"] == "TEXT"
+
+
+def test_backfill_source_infers_from_note_prefix_and_deletes_unknown(db):
+    """`moex:iss` -> moex_iss, `tinkoff:` -> tinkoff, unknown -> DELETED."""
+    _seed_three_rows(db)
     from algotrader_api.scripts_import.migrate_corporate_actions_source import (
         backfill_source,
     )
-
-    # First pass sets it.
-    assert backfill_source(db) == 1
+    stats = backfill_source(db)
+    assert stats["backfilled"] == 2
+    assert stats["deleted"] == 1
+    assert stats["kept"] == 2
     con = sqlite3.connect(db)
-    src_first = con.execute(
-        "SELECT source FROM corporate_actions"
-    ).fetchone()[0]
-    assert src_first == "moex_iss"
+    rows = con.execute(
+        "SELECT figi, source FROM corporate_actions ORDER BY ex_date"
+    ).fetchall()
+    assert rows == [
+        ("BBG004731032", "moex_iss"),
+        ("FIGI-LKOH", "tinkoff"),
+    ]
+    con.close()
 
-    # Second pass: same value, no change — still returns 1 (rows visited)
-    # but the table value is unchanged.
-    assert backfill_source(db) == 1
-    src_second = con.execute(
-        "SELECT source FROM corporate_actions"
-    ).fetchone()[0]
-    assert src_second == "moex_iss"
+
+def test_backfill_source_is_idempotent(db):
+    """Re-running backfill_source() leaves `source` unchanged; doesn't error."""
+    _seed_three_rows(db)
+    from algotrader_api.scripts_import.migrate_corporate_actions_source import (
+        backfill_source,
+    )
+    # First pass: 2 backfilled, 1 deleted, 2 kept
+    stats1 = backfill_source(db)
+    assert stats1 == {"backfilled": 2, "deleted": 1, "kept": 2}
+    # Second pass: nothing changes; backfilled=0 (all rows already have correct source)
+    stats2 = backfill_source(db)
+    assert stats2 == {"backfilled": 0, "deleted": 0, "kept": 2}
+
+
+def test_backfill_deletes_rows_without_known_prefix(db):
+    """Rows with `note` that matches no known source prefix are DELETED —
+    not tagged as `curated`. The `curated` fallback is the very
+    fabrication this rule was meant to remove."""
+    merge_into_corporate_actions(
+        db,
+        [
+            CorporateActionRow(
+                "BBG-X", "split", date(2024, 1, 1), 2.0, None,
+                "moex:iss", source="",
+            ),
+            CorporateActionRow(
+                "BBG-Y", "split", date(2024, 1, 1), 2.0, None,
+                "curated junk", source="",
+            ),
+        ],
+    )
+    from algotrader_api.scripts_import.migrate_corporate_actions_source import (
+        backfill_source,
+    )
+    stats = backfill_source(db)
+    assert stats == {"backfilled": 1, "deleted": 1, "kept": 1}
+    con = sqlite3.connect(db)
+    rows = con.execute(
+        "SELECT figi, source FROM corporate_actions ORDER BY figi"
+    ).fetchall()
+    assert rows == [("BBG-X", "moex_iss")]
+    con.close()
