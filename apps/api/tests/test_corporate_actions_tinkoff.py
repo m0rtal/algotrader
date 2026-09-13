@@ -108,6 +108,9 @@ def test_fetch_dividends_returns_rows_per_event():
     assert rows[0].action_type == "dividend"
     assert rows[0].cash_amount == 387.0
     assert rows[0].note.startswith("tinkoff:")
+    # Source identifies the ingestion path that produced the row.
+    assert rows[0].source == "tinkoff:dividends"
+    assert rows[1].source == "tinkoff:dividends"
 
 
 def test_fetch_dividends_returns_empty_when_no_events():

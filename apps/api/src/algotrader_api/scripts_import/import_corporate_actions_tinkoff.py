@@ -50,6 +50,7 @@ def fetch_dividends_for_figi(
             factor=1.0,
             cash_amount=cash,
             note=f"tinkoff: {ev.currency}",
+            source="tinkoff:dividends",
         ))
     return out
 
