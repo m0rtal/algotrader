@@ -13,10 +13,10 @@ from algotrader_api.ingestion import pipeline as pipeline_mod
 @pytest.fixture
 def app_with_pipeline(data_dir, monkeypatch):
     """App with a pre-populated pipeline table."""
-    from algotrader_api.db import duck, sqlite as sqlitedb  # noqa: F811
+    from algotrader_api.db import sqlite as sqlitedb  # noqa: F811
 
     sqlitedb.close_all()
-    duck.close()
+
     monkeypatch.setenv("ALGOTRADER_DATA_DIR", data_dir)
     monkeypatch.setenv("ALGOTRADER_LOG_SAMPLE_HEALTH", "1.0")
 
@@ -39,7 +39,7 @@ def app_with_pipeline(data_dir, monkeypatch):
         yield c
 
     sqlitedb.close_all()
-    duck.close()
+
 
 
 @pytest.fixture(autouse=True)
@@ -49,13 +49,13 @@ def _isolate_db_connections():
     Called before data_dir fixture so module-level caches are cleared before
     any other fixture runs.
     """
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.db import sqlite as sqlitedb
 
     sqlitedb.close_all()
-    duck.close()
+
     yield
     sqlitedb.close_all()
-    duck.close()
+
 
 
 def test_get_pipeline_returns_two_phases(app_with_pipeline):
@@ -74,30 +74,30 @@ def test_get_pipeline_empty(app_with_pipeline, data_dir, monkeypatch):
     """Empty pipeline table returns empty phases list."""
     # Force a brand-new connection by closing all caches, since app_with_pipeline
     # closed its own connections at fixture teardown but data_dir is shared.
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.db import sqlite as sqlitedb
 
     sqlitedb.close_all()
-    duck.close()
+
 
     # Also clear the pipeline table in this test's data dir to ensure it's empty.
     rows = sqlitedb.execute(f"{data_dir}/state.db", "SELECT COUNT(*) AS n FROM pipeline", ())
     sqlitedb.execute(f"{data_dir}/state.db", "DELETE FROM pipeline", ())
     sqlitedb.close_all()
-    duck.close()
 
-    from algotrader_api.db import duck, sqlite as sqlitedb
+
+    from algotrader_api.db import sqlite as sqlitedb
     from algotrader_api.main import create_app
     from fastapi.testclient import TestClient
 
     sqlitedb.close_all()
-    duck.close()
+
     app = create_app()
     with TestClient(app) as c:
         r = c.get("/api/pipeline")
         assert r.status_code == 200
         assert r.json()["phases"] == []
     sqlitedb.close_all()
-    duck.close()
+
 
 
 def test_get_pipeline_propagates_correlation_id(app_with_pipeline):
@@ -107,13 +107,13 @@ def test_get_pipeline_propagates_correlation_id(app_with_pipeline):
 
 def test_admin_fetch_returns_503_when_disabled(data_dir, monkeypatch):
     """When ALGOTRADER_FETCH_DISABLED=1, admin/fetch returns 503."""
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.db import sqlite as sqlitedb
     from algotrader_api.main import create_app
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("ALGOTRADER_FETCH_DISABLED", "1")
     sqlitedb.close_all()
-    duck.close()
+
     app = create_app()
     with TestClient(app) as c:
         r = c.post("/api/admin/fetch")
@@ -121,18 +121,18 @@ def test_admin_fetch_returns_503_when_disabled(data_dir, monkeypatch):
         body = r.json()
         assert body["detail"]["error"] == "fetch_disabled"
     sqlitedb.close_all()
-    duck.close()
+
 
 
 def test_admin_fetch_returns_202_with_run_id(data_dir, monkeypatch):
     """Successful manual fetch returns 202 with run_id, then runs in background."""
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.db import sqlite as sqlitedb
     from algotrader_api.main import create_app
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("ALGOTRADER_INGEST_FAKE", "1")
     sqlitedb.close_all()
-    duck.close()
+
     app = create_app()
     with TestClient(app) as c:
         r = c.post("/api/admin/fetch")
@@ -144,18 +144,18 @@ def test_admin_fetch_returns_202_with_run_id(data_dir, monkeypatch):
         # token_last4: None when running in fake mode (no token needed)
         assert body["token_last4"] is None
     sqlitedb.close_all()
-    duck.close()
+
 
 
 def test_admin_fetch_rejects_when_no_token_in_db(data_dir, monkeypatch):
     """No fake mode + no token in DB → 400 broker_token_missing."""
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.db import sqlite as sqlitedb
     from algotrader_api.main import create_app
     from fastapi.testclient import TestClient
 
     monkeypatch.delenv("ALGOTRADER_INGEST_FAKE", raising=False)
     sqlitedb.close_all()
-    duck.close()
+
     app = create_app()
     with TestClient(app) as c:
         r = c.post("/api/admin/fetch")
@@ -163,7 +163,7 @@ def test_admin_fetch_rejects_when_no_token_in_db(data_dir, monkeypatch):
         body = r.json()
         assert body["detail"]["error"] == "broker_token_missing"
     sqlitedb.close_all()
-    duck.close()
+
 
 
 def test_admin_fetch_uses_fresh_token_without_restart(data_dir, monkeypatch):
@@ -179,13 +179,13 @@ def test_admin_fetch_uses_fresh_token_without_restart(data_dir, monkeypatch):
     This test pins the contract: removing the GET /api/admin/fetch/status
     endpoint OR caching the token will break it.
     """
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.db import sqlite as sqlitedb
     from algotrader_api.main import create_app
     from fastapi.testclient import TestClient
 
     monkeypatch.delenv("ALGOTRADER_INGEST_FAKE", raising=False)
     sqlitedb.close_all()
-    duck.close()
+
     app = create_app()
     with TestClient(app) as c:
         # No token, real mode → 400
@@ -193,7 +193,7 @@ def test_admin_fetch_uses_fresh_token_without_restart(data_dir, monkeypatch):
         assert r1.status_code == 400
         assert r1.json()["detail"]["error"] == "broker_token_missing"
     sqlitedb.close_all()
-    duck.close()
+
 
 
 def test_admin_fetch_with_token_present_passes_token_check(fresh_db, monkeypatch):
@@ -201,14 +201,14 @@ def test_admin_fetch_with_token_present_passes_token_check(fresh_db, monkeypatch
     goes past the broker_token check. The downstream make_client() will
     raise ImportError → 500 (because no SDK), but the broker_token branch
     is now exercised end-to-end."""
-    from algotrader_api.db import duck, secrets as secrets_repo, sqlite as sqlitedb
+    from algotrader_api.db import secrets as secrets_repo, sqlite as sqlitedb
     from algotrader_api.main import create_app
     from fastapi.testclient import TestClient
 
     monkeypatch.delenv("ALGOTRADER_INGEST_FAKE", raising=False)
     secrets_repo.set_secret(fresh_db, "broker_token", "t.live.WXYZ")
     sqlitedb.close_all()
-    duck.close()
+
     app = create_app()
     with TestClient(app) as c:
         r = c.post("/api/admin/fetch")
@@ -216,7 +216,7 @@ def test_admin_fetch_with_token_present_passes_token_check(fresh_db, monkeypatch
         # We just care that the route did NOT 400 (broker_token_missing).
         assert r.status_code != 400
     sqlitedb.close_all()
-    duck.close()
+
 
 
 def test_admin_fetch_runtime_error_in_make_client_is_logged(fresh_db, monkeypatch):
@@ -224,14 +224,14 @@ def test_admin_fetch_runtime_error_in_make_client_is_logged(fresh_db, monkeypatc
     and marks the pipeline phase as 'err' instead of crashing."""
     from unittest.mock import patch
 
-    from algotrader_api.db import duck, secrets as secrets_repo, sqlite as sqlitedb
+    from algotrader_api.db import secrets as secrets_repo, sqlite as sqlitedb
     from algotrader_api.main import create_app
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("ALGOTRADER_INGEST_FAKE", "1")
     secrets_repo.set_secret(fresh_db, "broker_token", "t.live.WXYZ")
     sqlitedb.close_all()
-    duck.close()
+
 
     # Patch the symbol that admin._run_phases looks up.
     def boom(*a, **k):
@@ -244,18 +244,18 @@ def test_admin_fetch_runtime_error_in_make_client_is_logged(fresh_db, monkeypatc
     # Should still return 202 (background task) — error is logged async.
     assert r.status_code == 202
     sqlitedb.close_all()
-    duck.close()
+
 
 
 def test_fetch_status_reports_token_set_state(data_dir):
     """GET /api/admin/fetch/status returns token_set + token_last4 (or None)."""
-    from algotrader_api.db import duck, secrets as secrets_repo, sqlite as sqlitedb
+    from algotrader_api.db import secrets as secrets_repo, sqlite as sqlitedb
     from algotrader_api.main import create_app
     from fastapi.testclient import TestClient
 
     db_file = f"{data_dir}/state.db"
     sqlitedb.close_all()
-    duck.close()
+
     app = create_app()
     with TestClient(app) as c:
         r = c.get("/api/admin/fetch/status")
@@ -270,20 +270,26 @@ def test_fetch_status_reports_token_set_state(data_dir):
         assert r2.json()["token_set"] is True
         assert r2.json()["token_last4"] == "WXYZ"
     sqlitedb.close_all()
-    duck.close()
+
 
 
 def test_admin_fetch_creates_pipeline_rows(data_dir, monkeypatch):
-    """After admin fetch starts, pipeline table gets at least one row."""
+    """After admin fetch starts, pipeline table gets at least one row.
+
+    After `remove-duckdb-and-parquet`, admin fetch delegates to the
+    canonical BackfillRunner. The pipeline records one phase:
+    `discover_universe` (the runner's own phases aren't visible in
+    the pipeline table the same way the old two-phase admin pipeline
+    was).
+    """
     import os
 
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.db import sqlite as sqlitedb
     from algotrader_api.main import create_app
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("ALGOTRADER_INGEST_FAKE", "1")
     sqlitedb.close_all()
-    duck.close()
     app = create_app()
     with TestClient(app) as c:
         # Pre-populate an instruments table so the bars phase can run
@@ -298,34 +304,35 @@ def test_admin_fetch_creates_pipeline_rows(data_dir, monkeypatch):
         r = c.post("/api/admin/fetch")
         run_id = r.json()["run_id"]
 
-        # Wait briefly for background task to finish — InMemoryTinkoffClient
+        # Wait briefly for background task to finish - InMemoryTinkoffClient
         # returns immediately, so the background task should complete fast.
         import time as time_mod
 
         for _ in range(50):
             phases = c.get("/api/pipeline").json()["phases"]
-            if any(p["status"] == "ok" and p["phase"] == "fetch_bars" for p in phases):
+            if any(
+                p["status"] == "ok" and p["phase"] == "discover_universe"
+                for p in phases
+            ):
                 break
             time_mod.sleep(0.05)
 
         phases = c.get("/api/pipeline").json()["phases"]
         by_phase = {p["phase"]: p for p in phases}
-        assert by_phase["fetch_bars"]["status"] == "ok"
         assert by_phase["discover_universe"]["status"] == "ok"
     sqlitedb.close_all()
-    duck.close()
 
 
 def test_admin_fetch_marks_phase_err_on_universe_failure(data_dir, monkeypatch):
     """If universe discovery fails, phase marked err but admin returns 202."""
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.db import sqlite as sqlitedb
     from algotrader_api.main import create_app
     from fastapi.testclient import TestClient
 
     # Use ALGOTRADER_INGEST_FAKE but don't preload — universe returns []
     monkeypatch.setenv("ALGOTRADER_INGEST_FAKE", "1")
     sqlitedb.close_all()
-    duck.close()
+
     app = create_app()
     with TestClient(app) as c:
         r = c.post("/api/admin/fetch")
@@ -347,25 +354,25 @@ def test_admin_fetch_marks_phase_err_on_universe_failure(data_dir, monkeypatch):
         assert by_phase["discover_universe"]["status"] == "ok"
         assert by_phase["discover_universe"]["rowsProcessed"] == 0
     sqlitedb.close_all()
-    duck.close()
+
 
 
 def test_admin_fetch_with_fetch_disabled_via_env_var(data_dir, monkeypatch):
     """ALGOTRADER_FETCH_DISABLED=1 → 503 (env var path, already covered)."""
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.db import sqlite as sqlitedb
     from algotrader_api.main import create_app
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("ALGOTRADER_FETCH_DISABLED", "1")
     sqlitedb.close_all()
-    duck.close()
+
     app = create_app()
     with TestClient(app) as c:
         r = c.post("/api/admin/fetch")
         assert r.status_code == 503
         assert r.json()["detail"]["error"] == "fetch_disabled"
     sqlitedb.close_all()
-    duck.close()
+
 
 
 def test_resolve_target_returns_sandbox_when_no_settings(data_dir):
@@ -378,11 +385,11 @@ def test_resolve_target_reads_broker_environment(data_dir):
     """BrokerSettings.environment=sandbox → helper returns 'sandbox'."""
     import json
     from pathlib import Path
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.db import sqlite as sqlitedb
     from algotrader_api.routes.admin import _resolve_target_from_settings
 
     sqlitedb.close_all()
-    duck.close()
+
     db_file = f"{data_dir}/state.db"
     # Run migrations so the settings table exists.
     migrations_dir = str(Path(__file__).resolve().parents[2] / "src/algotrader_api/db/migrations")
@@ -400,11 +407,11 @@ def test_resolve_target_returns_none_for_invalid_env(data_dir):
     """An environment outside the enum → helper returns None (no leak)."""
     import json
     from pathlib import Path
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    from algotrader_api.db import sqlite as sqlitedb
     from algotrader_api.routes.admin import _resolve_target_from_settings
 
     sqlitedb.close_all()
-    duck.close()
+
     db_file = f"{data_dir}/state.db"
     migrations_dir = str(Path(__file__).resolve().parents[2] / "src/algotrader_api/db/migrations")
     sqlitedb.run_migrations(db_file, migrations_dir)

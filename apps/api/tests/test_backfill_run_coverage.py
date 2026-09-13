@@ -79,7 +79,6 @@ async def test_run_emits_skipped_event_for_up_to_date_ticker(tmp_path):
     runner = BackfillRunner(
         client=_OKUniverseOKCandles(),
         db_path=str(db),
-        bars_dir=str(tmp_path),
         event_sink=_sink,
     )
     runner.event_sink = lambda ev: _async_noop(ev, events)
@@ -129,7 +128,6 @@ async def test_run_emits_ticker_error_event_when_get_candles_raises(tmp_path):
     runner = BackfillRunner(
         client=_BoomGetCandles(),
         db_path=str(db),
-        bars_dir=str(tmp_path),
         event_sink=lambda ev: _async_noop(ev, events),
     )
     await runner.run(history_years=1, incremental_threshold_days=2)
@@ -182,7 +180,6 @@ async def test_run_breaks_loop_when_stop_called_mid_run(tmp_path):
     runner = BackfillRunner(
         client=_OKUniverseOKCandles(),
         db_path=str(db),
-        bars_dir=str(tmp_path),
         event_sink=_sink,
     )
     runner.event_sink = _sink
@@ -204,7 +201,6 @@ def test_emit_swallows_sink_exceptions(tmp_path):
     runner = BackfillRunner(
         client=_OKUniverseOKCandles(),
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path),
         event_sink=noop_sink,
     )
 
@@ -230,7 +226,6 @@ def test_candle_date_handles_legacy_nested_time_dict(tmp_path):
     runner = BackfillRunner(
         client=_OKUniverseOKCandles(),
         db_path=str(db),
-        bars_dir=str(tmp_path),
         event_sink=noop_sink,
     )
     yesterday = date.today() - timedelta(days=1)
@@ -268,7 +263,6 @@ def test_candle_date_handles_invalid_date_string(tmp_path):
     runner = BackfillRunner(
         client=_OKUniverseOKCandles(),
         db_path=str(db),
-        bars_dir=str(tmp_path),
         event_sink=noop_sink,
     )
     yesterday = date.today() - timedelta(days=1)

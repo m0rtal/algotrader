@@ -48,8 +48,8 @@ def app_with_orphans(tmp_path, monkeypatch, bars_db):
     con.executescript(
         """
         CREATE TABLE IF NOT EXISTS instruments (
-            ticker TEXT PRIMARY KEY, figi TEXT UNIQUE, class TEXT, name TEXT,
-            currency TEXT, lot_size INTEGER, isin TEXT, sector TEXT,
+            ticker TEXT PRIMARY KEY, figi TEXT UNIQUE, class TEXT, name,
+            currency, lot_size, isin, sector,
             source_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS instrument_metadata (
@@ -59,6 +59,12 @@ def app_with_orphans(tmp_path, monkeypatch, bars_db):
             total_bars INTEGER,
             last_run_status TEXT,
             last_error TEXT
+        );
+        CREATE TABLE IF NOT EXISTS bars (
+            figi TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+            PRIMARY KEY (figi, ts)
         );
         """
     )
@@ -77,6 +83,13 @@ def app_with_orphans(tmp_path, monkeypatch, bars_db):
             ("FIGI-AFKS", 200, "2026-09-08"),
             ("FIGI-ABCD", 999, "2026-09-08"),
         ],
+    )
+    # Seed a real bars row for FIGI-AFKS so the orphan check leaves
+    # it as `ok`; FIGI-ABCD has no bars so it must flip to `error`.
+    con.executemany(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [("FIGI-AFKS", "2026-09-08", 100.0, 110.0, 95.0, 105.0, 1000)],
     )
     con.commit()
     con.close()

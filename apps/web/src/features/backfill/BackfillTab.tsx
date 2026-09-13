@@ -131,15 +131,24 @@ export function BackfillTab() {
         </div>
 
         {status.data && status.data.tickers_total > 0 && (
-          <div>
+          <div data-testid="backfill-progress" aria-live="polite">
             <div className="flex items-center justify-between text-xs text-[var(--muted-foreground)] mb-1">
               <span>Active run</span>
               <span>
                 {status.data.tickers_done} / {status.data.tickers_total} tickers ({pct}%)
               </span>
             </div>
-            <div className="h-2 w-full rounded bg-[var(--muted)] overflow-hidden">
-              <div className="h-2 bg-[var(--accent)] transition-all" style={{ width: `${pct}%` }} />
+            <div
+              className="h-2 w-full rounded bg-[var(--muted)] overflow-hidden"
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={pct}
+            >
+              <div
+                className="h-2 bg-[var(--accent)] transition-all"
+                style={{ width: `${pct}%` }}
+              />
             </div>
           </div>
         )}
@@ -173,32 +182,13 @@ export function BackfillTab() {
             <p className="text-sm text-red-400 self-center">{reset.error.message}</p>
           )}
         </div>
-        {/* Progress — driven by useBackfillStatus polling (5s refetch).
-          Text events live in the global LogStrip at the bottom of the
-          viewport; the page itself shows the run state, the share
-          done, and a single live counter. No duplication. */}
-      {running && (
-        <div data-testid="backfill-progress" aria-live="polite">
-          <div className="flex items-center justify-between text-xs text-[var(--muted-foreground)] mb-1">
-            <span>Active run</span>
-            <span>
-              {status.data?.tickers_done ?? 0} / {status.data?.tickers_total ?? 0} тикеров ({pct}%)
-            </span>
-          </div>
-          <div
-            className="h-2 w-full rounded bg-[var(--muted)] overflow-hidden"
-            role="progressbar"
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={pct}
-          >
-            <div
-              className="h-2 bg-[var(--accent)] transition-all"
-              style={{ width: `${pct}%` }}
-            />
-          </div>
-        </div>
-      )}
+        {/* The single progress bar lives above this block (line ~133),
+            gated on status.data.tickers_total > 0. The duplicate that
+            used to live here, gated on `running`, was removed on
+            2026-09-13 — the user only needs to see one counter on the
+            page. Text events live in the global LogStrip at the bottom
+            of the viewport; this section shows run state, share done,
+            and pending breakdown. */}
     </section>
 
       {/* Reset metadata confirmation dialog — uses the shared

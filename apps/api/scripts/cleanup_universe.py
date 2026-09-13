@@ -60,9 +60,8 @@ def _format_summary(stage: str, summary: CleanupSummary) -> str:
         f"[{stage}] instruments_dropped={summary.instruments_dropped}",
         f"metadata_dropped={summary.metadata_dropped}",
         f"logs_dropped={summary.logs_dropped}",
-        f"parquet_files_dropped={summary.parquet_files_dropped}",
-        f"parquet_bytes_freed={summary.parquet_bytes_freed}",
-        f"parquet_files_orphaned={summary.parquet_files_orphaned}",
+        f"bars_dropped={summary.bars_dropped}",
+        f"bars_bytes_freed={summary.bars_bytes_freed}",
     ]
     return " ".join(parts)
 
@@ -70,7 +69,6 @@ def _format_summary(stage: str, summary: CleanupSummary) -> str:
 async def main_async(dry_run: bool) -> int:
     settings = get_settings()
     sqlite_path = settings.sqlite_path
-    bars_dir = settings.bars_dir
 
     client = make_client(sqlite_path=sqlite_path)
     snapshot = await _broker_snapshot(client)
@@ -94,7 +92,7 @@ async def main_async(dry_run: bool) -> int:
     print(_format_summary("reconcile", reconcile_summary))
 
     prune_summary = prune_non_tradeable_classes(
-        sqlite_path, bars_dir, dry_run=dry_run
+        sqlite_path, dry_run=dry_run
     )
     print(_format_summary("prune", prune_summary))
 

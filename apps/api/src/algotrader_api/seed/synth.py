@@ -84,27 +84,68 @@ def generate_bars_for_ticker(ticker_info: dict, *, start_date: date, n_days: int
     return bars
 
 
-def seed_bars(bars_dir: str, *, start_date: date | None = None) -> int:
-    """Write parquet files for all tickers. Returns total bars written."""
-    import os
 
-    os.makedirs(bars_dir, exist_ok=True)
+
+def seed_bars_sqlite(sqlite_path: str, *, start_date: date | None = None) -> int:
+    """Seed the SQLite `bars` + `instruments` tables.
+
+    Replaces the legacy parquet seeder after `remove-duckdb-and-parquet`.
+    Generates one synthetic figi per ticker (UUID v5 from the ticker
+    string so the seed is deterministic) and bulk-inserts all candles
+    via `replace_bars_for_figi`.
+
+    Returns total bars written.
+    """
+    import uuid
+
+    from ..db.bars_sqlite import replace_bars_for_figi
+    from ..db.sqlite import execute as _sqlite_exec
+
     start = start_date or (date.today() - timedelta(days=365))
-    conn = duckdb.connect(":memory:")
-
     total = 0
+
+    # NS UUID v5 from "ALGOTRADER_SYNTH:<ticker>" for stability across runs.
+    NS = uuid.UUID("12345678-1234-5678-9abc-def012345678")
+
+    # Ensure schema is there (bars + instruments). Migrations run in
+    # main.py lifespan before seed_bars_sqlite is called; this is a
+    # belt-and-braces no-op.
+    try:
+        _sqlite_exec(
+            sqlite_path,
+            "INSERT OR IGNORE INTO instruments (ticker, figi, class, name, currency, lot_size) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("__synth_seed__", "__synth_seed__", "share", "seed", "rub", 1),
+        )
+        _sqlite_exec(
+            sqlite_path,
+            "DELETE FROM instruments WHERE figi = '__synth_seed__'",
+            (),
+        )
+    except Exception:
+        pass
+
     for info in TICKERS:
         bars = generate_bars_for_ticker(info, start_date=start)
-        conn.execute(
-            "CREATE OR REPLACE TABLE bars AS SELECT * FROM (VALUES "
-            + ",".join(
-                f"('{b['ticker']}', DATE '{b['ts']}', {b['open']}, {b['high']}, {b['low']}, {b['close']}, {b['volume']}, {b['adj_close']})"
-                for b in bars
-            )
-            + ") AS t(ticker, ts, open, high, low, close, volume, adj_close)"
+        figi = str(uuid.uuid5(NS, f"ALGOTRADER_SYNTH:{info['ticker']}"))
+        ticker = info["ticker"]
+        _sqlite_exec(
+            sqlite_path,
+            "INSERT OR IGNORE INTO instruments (ticker, figi, class, name, currency, lot_size) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (ticker, figi, "share", info["name"], "rub", 1),
         )
-        out = f"{bars_dir}/{info['ticker']}.parquet"
-        conn.execute(f"COPY bars TO '{out}' (FORMAT PARQUET, COMPRESSION 'zstd')")
-        total += len(bars)
-
+        candles = [
+            {
+                "ts": b["ts"],
+                "open": float(b["open"]),
+                "high": float(b["high"]),
+                "low": float(b["low"]),
+                "close": float(b["close"]),
+                "volume": int(b["volume"]),
+            }
+            for b in bars
+        ]
+        replace_bars_for_figi(sqlite_path, figi, candles)
+        total += len(candles)
     return total

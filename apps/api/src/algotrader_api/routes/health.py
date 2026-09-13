@@ -1,9 +1,8 @@
 """Health endpoint.
 
-Returns 200 if both SQLite paths (instrument_metadata + bars table)
-respond. Returns 503 if either is unreachable. The `bars_count` is
-the total number of rows in the SQLite `bars` table — no DuckDB or
-filesystem scan is involved.
+Returns 200 if SQLite responds. Returns 503 if unreachable. The
+`bars_count` is the total number of rows in the SQLite `bars` table
+- no DuckDB or filesystem scan is involved.
 """
 from __future__ import annotations
 
@@ -16,21 +15,12 @@ from ..observability.logging import get_logger
 router = APIRouter()
 logger = get_logger("algotrader_api.health")
 
-# paths injected via lifespan
-_bars_dir_holder: dict[str, str] = {}
+# Sqlite path injected via lifespan.
 _sqlite_path_holder: dict[str, str] = {}
-
-
-def set_bars_dir(path: str) -> None:
-    _bars_dir_holder["path"] = path
 
 
 def set_sqlite_path(path: str) -> None:
     _sqlite_path_holder["path"] = path
-
-
-def _get_bars_dir() -> str:
-    return _bars_dir_holder["path"]
 
 
 def _sqlite_path() -> str:
@@ -67,7 +57,6 @@ def health(response: Response) -> dict:
         "sqlite": sqlite_ok,
         "bars": bars_ok,
         "bars_count": bars_count,
-        "bars_dir": _get_bars_dir(),
     }
     if status != "ok":
         response.status_code = 503

@@ -23,11 +23,10 @@ def data_dir(tmp_path, monkeypatch):
 @pytest.fixture
 def client(data_dir):
     """TestClient with lifespan started."""
-    # Reset module-level cache for sqlite & duck connections
-    from algotrader_api.db import duck, sqlite as sqlitedb
+    # Reset module-level cache for sqlite connections
+    from algotrader_api.db import sqlite as sqlitedb
 
     sqlitedb.close_all()
-    duck.close()
 
     from algotrader_api.main import create_app
 
@@ -36,7 +35,7 @@ def client(data_dir):
         yield c
 
     sqlitedb.close_all()
-    duck.close()
+
 
 
 @pytest.fixture

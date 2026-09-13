@@ -439,10 +439,37 @@ describe('BackfillTab', () => {
       </Wrapper>,
     );
     const bar = await screen.findByTestId('backfill-progress');
-    expect(bar.textContent).toMatch(/30\s*\/\s*100 тикеров/);
+    expect(bar.textContent).toMatch(/30\s*\/\s*100 tickers/);
     expect(bar.textContent).toMatch(/\(30%\)/);
     // The role="progressbar" element exposes aria-valuenow for screen readers.
     const progressEl = screen.getByRole('progressbar');
     expect(progressEl.getAttribute('aria-valuenow')).toBe('30');
+  });
+  it('does not render two duplicate progress bars while running', async () => {
+    server.use(
+      http.get('/api/admin/backfill/status', () =>
+        HttpResponse.json({
+          state: 'backfilling',
+          run_id: 1,
+          tickers_done: 2366,
+          tickers_total: 3806,
+          total_bars: 50000,
+          last_run: null,
+        }),
+      ),
+    );
+    const Wrapper = makeWrapper();
+    render(
+      <Wrapper>
+        <BackfillTab />
+      </Wrapper>,
+    );
+    // Both bars used to render here — fixed 2026-09-13 to drop the
+    // duplicate that lived inside the Recent events panel. The page
+    // should now show exactly one 'Active run' progress block.
+    await waitFor(() => {
+      expect(screen.getByText(/2366 \/ 3806/)).toBeInTheDocument();
+    });
+    expect(screen.getAllByText(/Active run/).length).toBe(1);
   });
 });

@@ -1,7 +1,11 @@
 """Seed module."""
 import os
 
-from .synth import TICKERS, generate_bars_for_ticker, seed_bars
+from .synth import (
+    TICKERS,
+    generate_bars_for_ticker,
+    seed_bars_sqlite,
+)
 
 
 def should_seed_synth(sqlite_path: str | None = None) -> bool:
@@ -21,7 +25,7 @@ def should_seed_synth(sqlite_path: str | None = None) -> bool:
         os.environ.get("ALGOTRADER_DATA_DIR", ""), "state.db"
     )
     if not db_path or not os.path.exists(db_path):
-        # No app database yet — running fresh, seed synth to bootstrap UI.
+        # No app database yet - running fresh, seed synth to bootstrap UI.
         return True
     # Lazy import to avoid circular dep at module load.
     from ..db.secrets import get_broker_token
@@ -32,4 +36,9 @@ def should_seed_synth(sqlite_path: str | None = None) -> bool:
     return not bool(token)
 
 
-__all__ = ["TICKERS", "generate_bars_for_ticker", "seed_bars", "should_seed_synth"]
+__all__ = [
+    "TICKERS",
+    "generate_bars_for_ticker",
+    "seed_bars_sqlite",
+    "should_seed_synth",
+]

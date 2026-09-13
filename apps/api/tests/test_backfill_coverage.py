@@ -103,7 +103,6 @@ async def test_run_universe_discovery_failure_emits_done_event(tmp_path):
     runner = BackfillRunner(
         client=_BoomClient(),
         db_path=str(db),
-        bars_dir=str(tmp_path),
         event_sink=_sink,
     )
     events = []
@@ -128,7 +127,6 @@ async def test_run_per_ticker_error_logs_and_continues(tmp_path):
     runner = BackfillRunner(
         client=_AlwaysBoomCandles(),
         db_path=str(db),
-        bars_dir=str(tmp_path),
         event_sink=_sink,
     )
     events = []
@@ -154,7 +152,6 @@ def test_extract_last_bar_ts_handles_legacy_dict_with_ts_field(tmp_path):
     runner = BackfillRunner(
         client=_BoomClient(),
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path),
         event_sink=_sink,
     )
     yesterday = date.today() - timedelta(days=1)
@@ -175,7 +172,6 @@ def test_extract_last_bar_ts_skips_malformed_candles(tmp_path):
     runner = BackfillRunner(
         client=_BoomClient(),
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path),
         event_sink=_sink,
     )
     # No time field → skipped.
@@ -193,7 +189,6 @@ def test_extract_last_bar_ts_skips_when_all_candles_fail(tmp_path):
     runner = BackfillRunner(
         client=_BoomClient(),
         db_path=str(tmp_path / "state.db"),
-        bars_dir=str(tmp_path),
         event_sink=_sink,
     )
 
@@ -229,7 +224,6 @@ async def test_run_emits_done_event_with_status_ok(tmp_path):
     runner = BackfillRunner(
         client=_OKClient(),
         db_path=str(db),
-        bars_dir=str(tmp_path),
         event_sink=_sink,
     )
     events = []

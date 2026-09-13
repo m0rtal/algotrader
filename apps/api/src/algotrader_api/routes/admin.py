@@ -98,61 +98,55 @@ async def trigger_fetch() -> dict:
 
 
 async def _run_phases(run_id: int, db_path: str) -> None:
-    """Background task: run universe + bars phases against the live client."""
+    """Background task: delegate to the canonical backfill runner.
+
+    Pre-`remove-duckdb-and-parquet`, this phase ran both a universe
+    discovery AND a legacy `bars.run_bars_phase` that wrote per-ticker
+    parquet files. The backfill runner now handles both phases
+    (universe + bars in SQLite) so admin fetch is a thin trigger that
+    forwards to it.
+    """
     from ..config import get_settings
-    from ..ingestion import (
-        bars as bars_mod,
-        client as client_mod,
-        pipeline as pipeline_mod,
-        rate_limit,
-        retry,
-        universe,
-    )
+    from ..db.secrets import get_broker_token as _get_token
+    from ..ingestion import client as client_mod, pipeline as pipeline_mod
 
     settings = get_settings()
-    # use_fake gate: ALGOTRADER_INGEST_FAKE=1 forces the in-memory client even
-    # when a real broker token is present. This is the path used in dev/test
-    # where the tinkoff-investments SDK isn't installed.
     use_fake = os.environ.get("ALGOTRADER_INGEST_FAKE") == "1"
-    target = _resolve_target_from_settings(settings.sqlite_path)
+    token = _get_token(db_path) if not use_fake else None
+    if not use_fake and not token:
+        pipeline_mod.end_phase(
+            db_path, run_id, status="err", detail="broker_token_missing"
+        )
+        return
+
     try:
         client = client_mod.make_client(
-            sqlite_path=db_path, use_fake=use_fake, target=target
+            sqlite_path=db_path, use_fake=use_fake, target=None
         )
     except RuntimeError as e:
         logger.error("admin.client.failed", error=str(e))
         pipeline_mod.end_phase(db_path, run_id, status="err", detail=str(e))
         return
 
-    rate_limiter = rate_limit.RateLimiter()
-    retry_policy = retry.AdaptiveRetry()
-
     try:
-        # Phase 1: discover universe
-        rows = await universe.discover_universe(client)
-        universe.upsert_instruments(db_path, rows)
-        pipeline_mod.end_phase(db_path, run_id, status="ok", rows_processed=len(rows))
+        from ..ingestion.backfill import BackfillRunner
 
-        # Phase 2: fetch bars
-        bars_run = pipeline_mod.start_phase(db_path, "fetch_bars")
-        instruments_rows = sqlitedb.execute(
-            db_path, "SELECT ticker, figi, class FROM instruments"
+        runner = BackfillRunner(
+            client=client,
+            db_path=db_path,
+            event_sink=_event_sink,
         )
-        instruments = [dict(r) for r in instruments_rows]
-        total_rows, rate_hits = await bars_mod.run_bars_phase(
-            client,
-            instruments=instruments,
-            bars_dir=settings.bars_dir,
+        # Use the runner's history_years config to fetch fresh data
+        # into the SQLite `bars` table. The runner already updates
+        # `instrument_metadata`, so the operator-facing dashboard stays
+        # consistent.
+        await runner.run(
             history_years=settings.history_years,
-            rate_limiter=rate_limiter,
-            retry_policy=retry_policy,
+            incremental_threshold_days=2,
         )
+        rows = runner.total_bars
         pipeline_mod.end_phase(
-            db_path,
-            bars_run,
-            status="ok",
-            rows_processed=total_rows,
-            detail=f"rate_limit_hits={rate_hits}",
+            db_path, run_id, status="ok", rows_processed=rows or 0
         )
     except Exception as e:
         logger.error("admin.run.failed", error=str(e))
@@ -162,6 +156,11 @@ async def _run_phases(run_id: int, db_path: str) -> None:
             await client.aclose()
         except Exception:
             pass
+
+
+async def _event_sink(event: object) -> None:
+    """No-op sink for admin fetch (real-time progress is served by /api/backfill/events)."""
+    return
 
 
 def _now_iso() -> str:

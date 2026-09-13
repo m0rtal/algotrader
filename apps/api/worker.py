@@ -1,8 +1,10 @@
-"""Worker entrypoint — separate process for Tinkoff data ingestion.
+"""Worker entrypoint - separate process for Tinkoff data ingestion.
 
 Two modes:
 - scheduled: invoked by systemd timer at 23:00 MSK daily
 - manual: invoked by POST /api/admin/fetch via subprocess
+- backfill: invoked by systemd timer at 02:00 MSK for the full
+  universe + historical bars lifecycle via BackfillRunner.
 
 Exit codes:
 - 0: success
@@ -10,7 +12,7 @@ Exit codes:
 - 2: phase failed (will be retried by systemd)
 
 Usage:
-    python -m algotrader_api.worker [scheduled|manual]
+    python -m algotrader_api.worker [scheduled|manual|backfill]
 """
 from __future__ import annotations
 
@@ -30,14 +32,9 @@ from algotrader_api.config import get_settings  # noqa: E402
 from algotrader_api.db.migrations import MIGRATIONS_DIR  # noqa: E402
 from algotrader_api.db import sqlite as sqlitedb  # noqa: E402
 from algotrader_api.ingestion import (  # noqa: E402
-    bars,
     client as client_mod,
     pipeline as pipeline_mod,
-    rate_limit,
-    retry,
-    universe,
 )
-from algotrader_api.observability.correlation import correlation_id  # noqa: E402
 from algotrader_api.observability.logging import get_logger, setup_logging  # noqa: E402
 from algotrader_api.observability.tracing import setup_tracing, shutdown_tracing  # noqa: E402
 
@@ -45,10 +42,19 @@ logger = get_logger("algotrader_api.worker")
 
 
 async def run_worker(mode: str) -> int:
+    """Scheduled/manual mode: delegate to the BackfillRunner.
+
+    Pre-`remove-duckdb-and-parquet`, this orchestrated a separate
+    universe + `bars.run_bars_phase` (parquet writes) flow. The
+    BackfillRunner now owns the whole lifecycle (universe discovery +
+    bars writes into SQLite) so the worker just instantiates and
+    drives it.
+    """
+    from algotrader_api.ingestion.backfill import BackfillRunner
+
     settings = get_settings()
     sqlitedb.run_migrations(settings.sqlite_path, MIGRATIONS_DIR)
 
-    # Initialize observability (correlation_id is auto-assigned per run)
     setup_logging(level=settings.log_level, health_sample_rate=1.0)  # no sampling in worker
     setup_tracing(
         service_name="algotrader-worker",
@@ -56,7 +62,7 @@ async def run_worker(mode: str) -> int:
         resource_attributes={"mode": mode, "component": "data-fetch"},
     )
 
-    logger.info("worker.start", mode=mode, sqlite=settings.sqlite_path, bars=settings.bars_dir)
+    logger.info("worker.start", mode=mode, sqlite=settings.sqlite_path)
 
     # Token check
     token = client_mod.read_token_file()
@@ -71,66 +77,39 @@ async def run_worker(mode: str) -> int:
         logger.error("worker.client.init_failed", error=str(e))
         return 2
 
-    rate_limiter = rate_limit.RateLimiter()
-    retry_policy = retry.AdaptiveRetry()
-
     rc = 0
     try:
-        # Phase 1: discover universe
-        universe_run = pipeline_mod.start_phase(settings.sqlite_path, "discover_universe")
+        run_id = pipeline_mod.start_phase(settings.sqlite_path, "fetch_universe_bars")
+        events: list = []
+
+        async def collect(ev):
+            events.append(ev)
+
+        runner = BackfillRunner(
+            client=client,
+            db_path=settings.sqlite_path,
+            event_sink=collect,
+        )
         try:
-            universe_rows = await universe.discover_universe(client)
-            universe.upsert_instruments(settings.sqlite_path, universe_rows)
+            await runner.run(
+                history_years=settings.history_years,
+                incremental_threshold_days=2,
+            )
             pipeline_mod.end_phase(
                 settings.sqlite_path,
-                universe_run,
+                run_id,
                 status="ok",
-                rows_processed=len(universe_rows),
+                rows_processed=runner.total_bars,
             )
         except Exception as e:
-            logger.error("worker.universe.failed", error=str(e))
+            logger.error("worker.run.failed", error=str(e))
             pipeline_mod.end_phase(
                 settings.sqlite_path,
-                universe_run,
+                run_id,
                 status="err",
                 detail=str(e),
             )
             rc = 2
-
-        # Phase 2: fetch bars (only if universe succeeded)
-        if rc == 0:
-            bars_run = pipeline_mod.start_phase(settings.sqlite_path, "fetch_bars")
-            try:
-                # Read instruments from SQLite
-                all_rows = sqlitedb.execute(
-                    settings.sqlite_path,
-                    "SELECT ticker, figi, class FROM instruments",
-                )
-                instruments = [dict(r) for r in all_rows]
-                total_rows, rate_hits = await bars.run_bars_phase(
-                    client,
-                    instruments=instruments,
-                    bars_dir=settings.bars_dir,
-                    history_years=settings.history_years,
-                    rate_limiter=rate_limiter,
-                    retry_policy=retry_policy,
-                )
-                pipeline_mod.end_phase(
-                    settings.sqlite_path,
-                    bars_run,
-                    status="ok",
-                    rows_processed=total_rows,
-                    detail=f"rate_limit_hits={rate_hits}",
-                )
-            except Exception as e:
-                logger.error("worker.bars.failed", error=str(e))
-                pipeline_mod.end_phase(
-                    settings.sqlite_path,
-                    bars_run,
-                    status="err",
-                    detail=str(e),
-                )
-                rc = 2
     finally:
         try:
             await client.aclose()
@@ -150,7 +129,7 @@ def run_backfill() -> int:
     never file), runs the runner with default settings, exits 0 on
     success or non-zero on failure (for systemd to retry).
 
-    Live SSE is unnecessary here — systemd captures stdout/stderr via
+    Live SSE is unnecessary here - systemd captures stdout/stderr via
     journald, and operator UI uses the HTTP /api/admin/backfill/status
     endpoint on the API server.
     """
@@ -160,7 +139,6 @@ def run_backfill() -> int:
 
     settings = get_settings()
     db_path = settings.sqlite_path
-    bars_dir = settings.bars_dir
 
     token = get_broker_token(db_path)
     if not token:
@@ -188,7 +166,6 @@ def run_backfill() -> int:
     runner = BackfillRunner(
         client=client,
         db_path=db_path,
-        bars_dir=bars_dir,
         event_sink=collect,
     )
 

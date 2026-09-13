@@ -96,12 +96,21 @@ def replace_bars_for_figi(
     sqlite_path: str,
     figi: str,
     candles: Iterable[dict],
+    *,
+    replace: bool = True,
 ) -> int:
     """Insert or replace all candles for `figi`.
 
     Each candle may be a dict (SDK's `MarketDataService` output) or a
     dataclass-like object (raw gRPC response). Returns the number of
     rows written. Empty list is a no-op.
+
+    When `replace=True` (the default), existing rows for `figi` are
+    deleted before inserting - this matches the original semantic.
+    When `replace=False`, rows are inserted via `INSERT OR IGNORE`,
+    so duplicates are silently skipped. Use `replace=False` for
+    incremental writes where new candles arrive across multiple
+    backfill chunks and you want to accumulate.
 
     The function runs everything in a single transaction so a
     concurrent reader via SQLite WAL sees either the pre-call or
@@ -118,12 +127,18 @@ def replace_bars_for_figi(
     conn = get_connection(sqlite_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute("DELETE FROM bars WHERE figi = ?", (figi,))
-        conn.executemany(
-            "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
+        if replace:
+            conn.execute("DELETE FROM bars WHERE figi = ?", (figi,))
+            insert_sql = (
+                "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )
+        else:
+            insert_sql = (
+                "INSERT OR IGNORE INTO bars (figi, ts, open, high, low, close, volume) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )
+        conn.executemany(insert_sql, rows)
         conn.execute(
             "UPDATE instrument_metadata SET "
             "  total_bars = (SELECT COUNT(*) FROM bars WHERE figi = ?), "

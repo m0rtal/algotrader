@@ -2,14 +2,13 @@
 
 Each endpoint returns an honest empty / default value for its schema so
 the UI falls into its built-in "n/a" state instead of seeing a 404.
-Endpoints with a real backing store (bars in DuckDB, settings in SQLite,
-tickers derived from DuckDB) map to the underlying query.
+Endpoints with a real backing store (bars in SQLite, settings in
+SQLite) map to the underlying query.
 """
 from __future__ import annotations
 
 from fastapi import APIRouter
 
-from ..db import duck
 from ..db.sqlite import execute as sqlite_exec
 from ..observability.logging import get_logger
 
@@ -17,30 +16,18 @@ logger = get_logger("algotrader_api.data_reads")
 
 router = APIRouter(prefix="/api", tags=["data-reads"])
 
-# Bars dir + sqlite path injected via app state — set in main.py lifespan.
-_bars_dir_holder: dict[str, str] = {}
+# Sqlite path injected via app state - set in main.py lifespan.
 _sqlite_path_holder: dict[str, str] = {}
-
-
-def set_bars_dir(path: str) -> None:
-    _bars_dir_holder["path"] = path
 
 
 def set_sqlite_path(path: str) -> None:
     _sqlite_path_holder["path"] = path
 
 
-def _get_bars_dir() -> str:
-    p = _bars_dir_holder.get("path")
-    if not p:
-        raise RuntimeError("bars dir not configured — call set_bars_dir() in lifespan")
-    return p
-
-
 def _get_sqlite_path() -> str:
     p = _sqlite_path_holder.get("path")
     if not p:
-        raise RuntimeError("sqlite path not configured — call set_sqlite_path() in lifespan")
+        raise RuntimeError("sqlite path not configured - call set_sqlite_path() in lifespan")
     return p
 
 
@@ -109,7 +96,7 @@ def get_backtest_folds() -> list:
 def get_logs(limit: int = 50, since_minutes: int = 60) -> list:
     """Recent ingestion log lines (operator-facing event stream).
 
-    Reads `ingestion_logs` table written by the backfill runner — this
+    Reads `ingestion_logs` table written by the backfill runner - this
     is the canonical source of "what just happened" events since the
     generic `logs` table is intentionally empty in this build.
     Mapped to the UI LogStrip shape `{ts, tone, text}`:
@@ -149,63 +136,45 @@ def get_logs(limit: int = 50, since_minutes: int = 60) -> list:
 def get_tickers() -> list:
     """Per-ticker metadata for the Bars tab.
 
-    Reads ticker counts from DuckDB (bars view across all backfilled
-    parquet files) and enriches with instrument metadata from SQLite
-    `instruments` table (name, sector, currency, lot_size). Tickers
-    with bars but no instruments row still surface — they just show
-    placeholder name/sector (which is exactly the legacy / partial
-    backfill case). `fileSize` is the parquet file's byte size on
-    disk so the operator sees a real MB total in the header strip
-    rather than "0.0 MB". `price`, `gaps` remain placeholder.
+    `fileSize` is preserved (always 0) so the UI header strip keeps
+    rendering - there is no on-disk file to size any more.
     """
-    import os
-
-    bars_dir = _get_bars_dir()
-    overview = duck.query_ticker_overview(bars_dir, sqlite_path=_get_sqlite_path())
-    by_ticker = {
-        r["ticker"]: r for r in sqlite_exec(
-            _get_sqlite_path(),
-            "SELECT ticker, name, sector, currency, lot_size FROM instruments",
-            (),
-        ) if r["ticker"]
-    }
-    # One os.listdir call gives us the (name → bytes) map for every
-    # parquet in the bars dir. The overview keys are either ticker
-    # (modern files) or figi (legacy files); both stem forms appear
-    # in the file map because filename = figi = stem for legacy and
-    # filename = ticker = stem for modern.
-    sizes_by_stem: dict[str, int] = {}
-    try:
-        for name in os.listdir(bars_dir):
-            if not name.endswith(".parquet"):
-                continue
-            sizes_by_stem[os.path.splitext(name)[0]] = os.path.getsize(
-                os.path.join(bars_dir, name)
-            )
-    except OSError:  # pragma: no cover — bars_dir missing or unreadable
-        sizes_by_stem = {}
+    overview_rows = sqlite_exec(
+        _get_sqlite_path(),
+        """
+        SELECT
+            b.figi                                   AS figi,
+            COUNT(*)                                 AS bars,
+            MIN(b.ts)                                AS first_ts,
+            MAX(b.ts)                                AS last_ts
+        FROM bars b
+        WHERE b.figi IS NOT NULL
+        GROUP BY b.figi
+        """,
+        (),
+    )
+    instrument_rows = sqlite_exec(
+        _get_sqlite_path(),
+        "SELECT ticker, name, sector, currency, lot_size, figi FROM instruments",
+        (),
+    )
+    by_figi = {r["figi"]: r for r in instrument_rows if r["figi"]}
+    by_ticker = {r["ticker"]: r for r in instrument_rows if r["ticker"]}
 
     out: list[dict] = []
-    for r in overview:
-        if r["ticker"] is None:
-            continue
-        meta = by_ticker.get(r["ticker"])
-        # Overview now records the resolved figure id from legacy
-        # figi-style parquet files in `source_figi`. When that is
-        # set, look up by figi (stem = figi for legacy files);
-        # otherwise the ticker itself is the stem (modern files).
-        stem = r.get("source_figi") or r["ticker"]
-        file_size = sizes_by_stem.get(stem, 0)
+    for r in overview_rows:
+        meta = by_figi.get(r["figi"]) or by_ticker.get(r["figi"])
+        symbol = meta["ticker"] if meta else r["figi"]
         out.append(
             {
-                "symbol": r["ticker"],
+                "symbol": symbol,
                 "name": meta["name"] if meta else "",
                 "sector": meta["sector"] if meta and meta["sector"] else "",
                 "price": 0,
                 "bars": int(r["bars"]),
                 "firstDate": str(r["first_ts"]),
                 "lastDate": str(r["last_ts"]),
-                "fileSize": file_size,
+                "fileSize": 0,
                 "gaps": 0,
                 "currency": meta["currency"] if meta and meta["currency"] else "",
                 "lotSize": int(meta["lot_size"]) if meta and meta["lot_size"] else 0,
