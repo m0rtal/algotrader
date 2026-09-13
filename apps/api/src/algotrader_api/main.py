@@ -15,7 +15,7 @@ from .observability.correlation import CorrelationMiddleware
 from .observability.logging import get_logger, setup_logging
 from .observability.middleware import LatencyMiddleware
 from .observability.tracing import setup_tracing, shutdown_tracing
-from .routes import admin, bars, data_reads, health, pipeline as pipeline_route, settings as settings_route, signals as signals_route
+from .routes import admin, bars, data_quality as data_quality_route, data_reads, health, pipeline as pipeline_route, settings as settings_route, signals as signals_route
 from .seed import seed_bars_sqlite, should_seed_synth
 
 logger = get_logger("algotrader_api.main")
@@ -174,6 +174,7 @@ def create_app() -> FastAPI:
     app.include_router(admin.router)
     from .routes.backfill import router as backfill_router
     app.include_router(backfill_router)
+    app.include_router(data_quality_route.router)
 
     # OpenTelemetry FastAPI instrumentation
     FastAPIInstrumentor.instrument_app(app)
