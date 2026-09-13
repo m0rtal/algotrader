@@ -1,0 +1,19 @@
+[
+  {"figi": "BBG004730N88", "ex_date": "2020-06-19", "factor": 2.0,   "note": "SBER 2-for-1 split"},
+  {"figi": "BBG004730RP0", "ex_date": "2021-07-30", "factor": 10.0,  "note": "GAZP 10-for-1 (denomination + split)"},
+  {"figi": "BBG006L8GMD5", "ex_date": "2014-06-18", "factor": 4.0,   "note": "YNDX 4-for-1 split"},
+  {"figi": "BBG004731032", "ex_date": "2014-06-11", "factor": 2.0,   "note": "LKOH 2-for-1 split"},
+  {"figi": "BBG004730RP0", "ex_date": "1998-09-30", "factor": 1003.0,"note": "GAZP pre-IPO split (denomination factor)"},
+  {"figi": "BBG004730ZJ9", "ex_date": "2011-11-15", "factor": 5.0,   "note": "VTBR 5-for-1 (denomination)"},
+  {"figi": "BBG00475K6X5", "ex_date": "2014-06-16", "factor": 2.0,   "note": "MGNT 2-for-1 split"},
+  {"figi": "BBG004RVFFC5", "ex_date": "2014-06-19", "factor": 2.0,   "note": "NVTK 2-for-1 split"},
+  {"figi": "BBG004S68BG3", "ex_date": "2014-06-16", "factor": 3.0,   "note": "MTSS 3-for-1 split"},
+  {"figi": "BBG000BPH459", "ex_date": "2022-08-31", "factor": 2.0,   "note": "MSFT 2-for-1 (already in JSON; included for figi-mirror consistency)"},
+  {"figi": "BBG000B9XRY4", "ex_date": "2014-06-09", "factor": 7.0,   "note": "AAPL 7-for-1 split"},
+  {"figi": "BBG000BVPXY8", "ex_date": "2022-06-09", "factor": 20.0,  "note": "GOOGL 20-for-1 split"},
+  {"figi": "BBG000BBCT29", "ex_date": "2020-08-31", "factor": 5.0,   "note": "TSLA 5-for-1 split"},
+  {"figi": "BBG000R818Y1", "ex_date": "2010-01-21", "factor": 2.0,   "note": "AMZN 2-for-1 split (historical)"},
+  {"figi": "BBG004S681W1", "ex_date": "2019-04-19", "factor": 2.0,   "note": "NLMK 2-for-1 split"},
+  {"figi": "BBG000V0M7P4", "ex_date": "2017-06-27", "factor": 2.0,   "note": "MAGN 2-for-1 split"},
+  {"figi": "BBG004S685W3", "ex_date": "2011-04-15", "factor": 3.0,   "note": "ROSN 3-for-1 split"}
+]
