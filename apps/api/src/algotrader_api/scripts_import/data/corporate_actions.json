@@ -1,0 +1,9 @@
+[
+  {"figi": "FIGI-SBER", "action_type": "split",    "ex_date": "2020-06-19", "factor": 2.0,  "cash_amount": null,   "note": "SBER 2-for-1 split"},
+  {"figi": "FIGI-GAZP", "action_type": "split",    "ex_date": "2021-07-30", "factor": 10.0, "cash_amount": null,   "note": "GAZP 10-for-1 split"},
+  {"figi": "FIGI-LKOH", "action_type": "dividend", "ex_date": "2024-07-08", "factor": 1.0,  "cash_amount": 387.0, "note": "LKOH 387 RUB/share dividend"},
+  {"figi": "FIGI-YNDX", "action_type": "split",    "ex_date": "2014-06-18", "factor": 4.0,  "cash_amount": null,   "note": "YNDX 4-for-1 split"},
+  {"figi": "FIGI-MSFT", "action_type": "split",    "ex_date": "2022-08-31", "factor": 2.0,  "cash_amount": null,   "note": "MSFT 2-for-1 split"},
+  {"figi": "FIGI-AAPL", "action_type": "split",    "ex_date": "2020-08-31", "factor": 4.0,  "cash_amount": null,   "note": "AAPL 4-for-1 split"},
+  {"figi": "FIGI-AAPL", "action_type": "dividend", "ex_date": "2024-02-09", "factor": 1.0,  "cash_amount": 0.24,  "note": "AAPL $0.24 dividend"}
+]
