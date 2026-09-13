@@ -23,6 +23,7 @@ class HealthIssue(str, Enum):
     HAS_GAPS = "has-gaps"
     RATE_LIMITED_FAILURES = "rate-limited-failures"
     INCOMPLETE_HISTORY = "incomplete-history"
+    BAR_CORRUPTION = "bar-corruption"
 
 
 @dataclass
@@ -51,6 +52,7 @@ _PENALTY = {
     HealthIssue.HAS_GAPS: 20,
     HealthIssue.RATE_LIMITED_FAILURES: 30,
     HealthIssue.INCOMPLETE_HISTORY: 25,
+    HealthIssue.BAR_CORRUPTION: 40,
 }
 _INCOMPLETE_HISTORY_RATIO = 0.95
 
@@ -168,6 +170,67 @@ def _recent_failures(
     return [dict(r) for r in rows]
 
 
+# SQL fragment reused by single-figi and bulk corruption counts. A bar is
+# "corrupt" when its OHLCV violates one of the rules in
+# `data_quality.integrity.validate_bar` that can be checked at the SQL
+# boundary (volume < 0, all-zero OHLC, or high/low not bounding the other
+# three prices). Duplicated here rather than imported because the integrity
+# module is intentionally import-side-effect-free and we want one SQL
+# pass, not a per-row Python validate.
+_CORRUPTION_SQL = (
+    "COUNT(*) FROM bars WHERE figi = ? AND ("
+    "high < MAX(open, low, close) "
+    "OR low  > MIN(open, high, close) "
+    "OR volume < 0 "
+    "OR (open = 0 AND high = 0 AND low = 0 AND close = 0)"
+    ")"
+)
+
+
+def _count_corrupted_bars(con: sqlite3.Connection, figi: str) -> int:
+    """Return the number of bars for `figi` that violate integrity rules.
+
+    Counted via SQL rather than per-row Python `validate_bar` because the
+    bars table holds millions of rows; one query is materially cheaper.
+    """
+    return int(con.execute(
+        f"SELECT {_CORRUPTION_SQL}",
+        (figi,),
+    ).fetchone()[0])
+
+
+def _corrupted_bars_bulk(
+    con: sqlite3.Connection, figis: list[str]
+) -> dict[str, int]:
+    """Bulk-count corrupted bars per figi in a single GROUP BY query.
+
+    Preserves the O(1)-queries invariant of `compute_all` (3776-figi
+    universe on prod). Returns 0 for figis with no rows.
+    """
+    out: dict[str, int] = {f: 0 for f in figis}
+    if not figis:
+        return out
+    placeholders = ",".join("?" for _ in figis)
+    rows = con.execute(
+        f"""
+        SELECT figi,
+               SUM(
+                 (high < MAX(open, low, close))
+                 OR (low  > MIN(open, high, close))
+                 OR (volume < 0)
+                 OR (open = 0 AND high = 0 AND low = 0 AND close = 0)
+               ) AS n_bad
+        FROM bars
+        WHERE figi IN ({placeholders})
+        GROUP BY figi
+        """,
+        tuple(figis),
+    ).fetchall()
+    for r in rows:
+        out[r["figi"]] = int(r["n_bad"] or 0)
+    return out
+
+
 def _compute_issues_and_penalty(
     last_bar: date | None,
     actual_bars: int,
@@ -175,6 +238,7 @@ def _compute_issues_and_penalty(
     gaps: list[date],
     failures: list[dict],
     today: date,
+    corrupted_bars: int = 0,
 ) -> tuple[list[HealthIssue], int]:
     issues: list[HealthIssue] = []
     penalty = 0
@@ -202,6 +266,10 @@ def _compute_issues_and_penalty(
         issues.append(HealthIssue.RATE_LIMITED_FAILURES)
         penalty += _PENALTY[HealthIssue.RATE_LIMITED_FAILURES]
 
+    if corrupted_bars > 0:
+        issues.append(HealthIssue.BAR_CORRUPTION)
+        penalty += _PENALTY[HealthIssue.BAR_CORRUPTION]
+
     return issues, penalty
 
 
@@ -222,13 +290,15 @@ def compute_health(
         first_bar, last_bar, actual_bars = _bars_range(con, figi)
         gaps = _detect_gaps(con, figi)
         failures = _recent_failures(con, figi)
+        corrupted_bars = _count_corrupted_bars(con, figi)
         expected_bars = (
             _weekdays_excluding_holidays(first_bar, today, con)
             if first_bar
             else 0
         )
         issues, penalty = _compute_issues_and_penalty(
-            last_bar, actual_bars, expected_bars, gaps, failures, today
+            last_bar, actual_bars, expected_bars, gaps, failures, today,
+            corrupted_bars=corrupted_bars,
         )
         score = max(0, 100 - penalty)
         return HealthReport(
@@ -286,6 +356,7 @@ def compute_all(db_path: str, today: date | None = None) -> dict[str, HealthRepo
         ).fetchall()
         figis = [r["figi"] for r in rows]
         failures_map = _recent_failures_bulk(con, figis, today)
+        corrupted_map = _corrupted_bars_bulk(con, figis)
         holiday_rows = con.execute("SELECT date FROM moex_holidays").fetchall()
         holidays = {r["date"] for r in holiday_rows}
     finally:
@@ -304,7 +375,8 @@ def compute_all(db_path: str, today: date | None = None) -> dict[str, HealthRepo
             else 0
         )
         issues, penalty = _compute_issues_and_penalty(
-            last_bar, actual, expected, [], failures_map.get(figi, []), today
+            last_bar, actual, expected, [], failures_map.get(figi, []), today,
+            corrupted_bars=corrupted_map.get(figi, 0),
         )
         out[figi] = HealthReport(
             figi=figi,

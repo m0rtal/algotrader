@@ -240,3 +240,81 @@ def test_health_report_marks_incomplete_history_with_holidays(db):
     # So worst case is 100 - 25 - 20 = 55; assert the -25 floor landed.
     assert report.health_score <= 75
     # And the new issue must contribute at least 25 points of penalty.
+
+
+def test_health_report_marks_bar_corruption(db):
+    """A figi with any bar that violates integrity rules must surface
+    HealthIssue.BAR_CORRUPTION with a -40 penalty.
+    """
+    figi = "FIGI-CORRUPT"
+    today = date(2026, 9, 12)
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES ('CRP', ?, 'share', 'Corrupt', 'rub', 1)",
+        (figi,),
+    )
+    # Mix valid and corrupted bars. Use dates that are recent enough to avoid
+    # triggering MISSING_RECENT / INCOMPLETE_HISTORY so the test isolates the
+    # BAR_CORRUPTION penalty.
+    valid_dates = [(today - timedelta(days=i)).isoformat() for i in range(30, 4, -1)]
+    corrupted_dates = [(today - timedelta(days=i)).isoformat() for i in range(4, -1, -1)]
+    rows: list[tuple[str, str, float, float, float, float, int]] = []
+    for d in valid_dates:
+        rows.append((figi, d, 100.0, 110.0, 95.0, 105.0, 1000))   # ok
+    for d in corrupted_dates:
+        rows.append((figi, d, 90.0, 85.0, 80.0, 82.0, 1000))      # high<open (corrupt)
+    con.executemany(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    con.commit()
+    con.close()
+
+    report = compute_health(db, figi, today=today)
+    assert HealthIssue.BAR_CORRUPTION in report.issues
+    # 100 baseline - 40 (BAR_CORRUPTION). Other issues may not fire given
+    # the seed: last bar = today, expected_bars ≈ 25 weekdays, actual ≈ 30.
+    # We assert the -40 floor landed.
+    assert report.health_score <= 60
+
+
+def test_compute_all_surfaces_bar_corruption_bulk(db):
+    """compute_all must also flag BAR_CORRUPTION for every figi with bad bars.
+
+    The bulk path must do the corruption count in O(1) queries (one GROUP BY
+    on bars), not one SELECT per figi.
+    """
+    from algotrader_api.data_quality.health import compute_all
+
+    today = date(2026, 9, 12)
+    figi_ok = "FIGI-OK"
+    figi_bad = "FIGI-BAD"
+    con = sqlite3.connect(db)
+    con.executemany(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES (?, ?, 'share', ?, 'rub', 1)",
+        [("OK", figi_ok, "OK"), ("BAD", figi_bad, "Bad")],
+    )
+    recent_iso = (today - timedelta(days=1)).isoformat()
+    # OK figi: a single valid bar.
+    con.execute(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+        "VALUES (?, ?, 100, 110, 95, 105, 1000)",
+        (figi_ok, recent_iso),
+    )
+    # BAD figi: a corrupted bar (high < open).
+    con.execute(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+        "VALUES (?, ?, 100, 80, 70, 90, 1000)",
+        (figi_bad, recent_iso),
+    )
+    con.commit()
+    con.close()
+
+    reports = compute_all(db, today=today)
+    assert figi_ok in reports
+    assert figi_bad in reports
+    assert HealthIssue.BAR_CORRUPTION not in reports[figi_ok].issues
+    assert HealthIssue.BAR_CORRUPTION in reports[figi_bad].issues
