@@ -195,17 +195,60 @@ def main() -> int:
         "mode",
         nargs="?",
         default="scheduled",
-        choices=["scheduled", "manual", "backfill"],
+        choices=["scheduled", "manual", "backfill", "guardian"],
         help=(
             "Invocation mode. 'scheduled'/'manual' are one-shot fetch flows; "
             "'backfill' runs the persistent universe + historical backfill "
-            "lifecycle (systemd-timer driven)."
+            "lifecycle (systemd-timer driven); 'guardian' runs the daily "
+            "data-quality sweep (universe sync + per-ticker health + "
+            "auto-recovery)."
         ),
     )
     args = parser.parse_args()
     if args.mode == "backfill":
         return run_backfill()
+    if args.mode == "guardian":
+        return run_guardian()
     return asyncio.run(run_worker(args.mode))
+
+
+async def _drive_guardian(db_path: str) -> int:
+    """Run the daily guardian. Exit 1 if anomalies were raised so
+    systemd can alert."""
+    from algotrader_api.data_quality.service import run_daily_guardian
+
+    summary = await run_daily_guardian(db_path)
+    rc = 1 if summary.anomalies_raised else 0
+    logger.info(
+        "worker.guardian.complete",
+        rc=rc,
+        figis_checked=summary.figis_checked,
+        figis_recovered=summary.figis_recovered,
+        anomalies=summary.anomalies_raised,
+        duration_seconds=summary.duration_seconds,
+    )
+    return rc
+
+
+def run_guardian() -> int:
+    """Daily data-quality sweep: universe sync → health → recovery → pipeline row."""
+    settings = get_settings()
+    sqlitedb.run_migrations(settings.sqlite_path, MIGRATIONS_DIR)
+
+    setup_logging(level=settings.log_level, health_sample_rate=1.0)
+    setup_tracing(
+        service_name="algotrader-worker",
+        otlp_endpoint=settings.otel_endpoint,
+        resource_attributes={"mode": "guardian", "component": "data-quality"},
+    )
+
+    logger.info("worker.guardian.start", sqlite=settings.sqlite_path)
+
+    try:
+        rc = asyncio.run(_drive_guardian(settings.sqlite_path))
+    finally:
+        shutdown_tracing()
+    return rc
 
 
 if __name__ == "__main__":
