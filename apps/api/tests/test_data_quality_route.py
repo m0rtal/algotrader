@@ -94,3 +94,29 @@ def test_get_data_quality_resolves_figi_alias(client, db):
     body = r.json()
     assert body["figi"] == "FIGI-GOOD"
     assert body["ticker"] == "GOOD"
+
+
+def test_get_data_quality_serializes_incomplete_history(client, db):
+    """Sparse figi: actual < expected * 0.95 → INCOMPLETE_HISTORY surfaces as
+    "incomplete-history" in the wire-format issues list."""
+    import sqlite3
+    today = date(2026, 9, 12)
+    sparse = [(today - timedelta(days=i)).isoformat() for i in range(120, 0, -8)]
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES ('SPARSE', 'FIGI-SPARSE', 'share', 'Sparse', 'rub', 1)"
+    )
+    con.executemany(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+        "VALUES ('FIGI-SPARSE', ?, 1, 1, 1, 1, 1)",
+        [(d,) for d in sparse],
+    )
+    con.commit()
+    con.close()
+    _wire(client, db)
+    r = client.get("/api/data-quality/SPARSE")
+    assert r.status_code == 200
+    body = r.json()
+    assert "incomplete-history" in body["issues"]
+    assert body["health_score"] <= 75  # -25 penalty for INCOMPLETE_HISTORY
