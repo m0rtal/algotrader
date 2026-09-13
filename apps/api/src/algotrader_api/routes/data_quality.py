@@ -11,6 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
+from ..data_quality.completeness import reset_exhausted_marker
 from ..data_quality.health import HealthReport, compute_health
 from ..db.bars_sqlite import resolve_figi_for_ticker
 from ..observability.logging import get_logger
@@ -66,3 +67,43 @@ def get_data_quality(symbol: str) -> dict:
         )
     report = compute_health(sqlite_path, figi)
     return _report_to_dict(report)
+
+
+@router.post("/admin/data-quality/reset-exhausted/{symbol}")
+def reset_exhausted(symbol: str) -> dict:
+    """Issue #3 operator escape hatch.
+
+    Clears the ``completeness_exhausted`` or ``stale_recovery_exhausted``
+    marker on ``symbol`` so the next guardian cycle processes it again.
+    Successful broker fetches auto-clear the marker (see
+    ``data_quality.completeness.backfill_gaps``); this endpoint is for
+    the case where the operator has fixed the upstream cause (broker
+    outage, misconfigured filter, etc.) and wants to force re-processing
+    without waiting for a successful fetch.
+
+    Returns the previous status so the caller can confirm what was
+    cleared, or 404 if the figi has no exhausted marker to clear.
+    """
+    sqlite_path = _get_sqlite_path()
+    figi = _resolve_figi(sqlite_path, symbol)
+    if not figi:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "unknown_symbol", "symbol": symbol},
+        )
+    previous = reset_exhausted_marker(sqlite_path, figi)
+    if previous is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "no_exhausted_marker",
+                "figi": figi,
+                "message": "no exhausted marker set on this figi — nothing to clear",
+            },
+        )
+    logger.info(
+        "admin.data_quality.exhausted_reset",
+        figi=figi,
+        previous_status=previous,
+    )
+    return {"figi": figi, "previous_status": previous, "status": "ready"}

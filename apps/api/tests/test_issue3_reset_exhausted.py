@@ -187,8 +187,17 @@ async def test_backfill_gaps_clears_exhausted_on_broker_success(tmp_path):
             "SELECT last_run_status FROM instrument_metadata WHERE figi = ?",
             (figi,),
         ).fetchone()[0]
-        assert status == "ready", \
-            f"exhausted marker not cleared: last_run_status={status!r}"
+        # The clear runs BEFORE replace_bars_for_figi (sentinel must
+        # be readable while it's still set). After the bars write,
+        # replace_bars_for_figi sets last_run_status='ok' in the same
+        # transaction. So the post-call state is either 'ok' (broker
+        # returned bars) or whatever the sentinel was (broker returned
+        # nothing -> we never cleared). The point of this test is that
+        # we did NOT leave the sentinel set — that's a regression.
+        assert status != "completeness_exhausted", \
+            f"exhausted marker still set: last_run_status={status!r}"
+        assert status == "ok", \
+            f"expected 'ok' after successful broker fetch, got {status!r}"
     finally:
         con.close()
 
@@ -241,26 +250,36 @@ async def test_backfill_gaps_does_not_clear_when_broker_returns_nothing(tmp_path
 
 
 def test_admin_reset_route_clears_marker(client, fresh_db):
-    """End-to-end: POST /api/admin/data-quality/reset-exhausted/SBER"""
+    """End-to-end: POST /api/admin/data-quality/reset-exhausted/SBER.
+
+    Uses a synthetic ticker the seed module doesn't include
+    (``RESET-TEST-1``) so the route resolves to a fresh figi with
+    our seeded metadata row rather than colliding with the seed
+    module's pre-populated SBER entry.
+    """
+    ticker = "RESET-TEST-1"
+    figi = "FIGI-RESET-TEST-1"
     con = sqlite3.connect(fresh_db)
     con.execute(
         "INSERT OR IGNORE INTO instruments "
         "(ticker, figi, class, name, currency, lot_size) "
-        "VALUES ('SBER', 'FIGI-EXH-1', 'share', 'Sber', 'RUB', 10)"
+        "VALUES (?, ?, 'share', 'Reset Test', 'RUB', 1)",
+        (ticker, figi),
     )
     con.execute(
         "INSERT INTO instrument_metadata (figi, last_run_status, total_bars) "
-        "VALUES ('FIGI-EXH-1', 'completeness_exhausted', 0)"
+        "VALUES (?, 'completeness_exhausted', 0)",
+        (figi,),
     )
     con.commit()
     con.close()
 
-    resp = client.post("/api/admin/data-quality/reset-exhausted/SBER")
+    resp = client.post(f"/api/admin/data-quality/reset-exhausted/{ticker}")
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["previous_status"] == "completeness_exhausted"
     assert body["status"] == "ready"
-    assert body["figi"] == "FIGI-EXH-1"
+    assert body["figi"] == figi
 
 
 def test_admin_reset_route_404_on_clean_figi(client, fresh_db):
@@ -270,20 +289,24 @@ def test_admin_reset_route_404_on_clean_figi(client, fresh_db):
     a marker that was never set; 404 makes the missing-marker case
     explicit (and triggers a different alert in their tooling).
     """
+    ticker = "CLEAN-TEST-1"
+    figi = "FIGI-CLEAN-TEST-1"
     con = sqlite3.connect(fresh_db)
     con.execute(
         "INSERT OR IGNORE INTO instruments "
         "(ticker, figi, class, name, currency, lot_size) "
-        "VALUES ('CLEAN', 'FIGI-OK', 'share', 'Clean', 'RUB', 1)"
+        "VALUES (?, ?, 'share', 'Clean Test', 'RUB', 1)",
+        (ticker, figi),
     )
     con.execute(
         "INSERT INTO instrument_metadata (figi, last_run_status, total_bars) "
-        "VALUES ('FIGI-OK', 'ready', 100)"
+        "VALUES (?, 'ready', 100)",
+        (figi,),
     )
     con.commit()
     con.close()
 
-    resp = client.post("/api/admin/data-quality/reset-exhausted/CLEAN")
+    resp = client.post(f"/api/admin/data-quality/reset-exhausted/{ticker}")
     assert resp.status_code == 404
     assert resp.json()["detail"]["error"] == "no_exhausted_marker"
 
