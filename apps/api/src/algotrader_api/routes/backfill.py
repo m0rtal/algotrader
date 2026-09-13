@@ -350,12 +350,38 @@ def _pending_count(sqlite_path: str, *, incremental_threshold_days: int = 2) -> 
 
 @router.get("/backfill/pending")
 async def backfill_pending() -> dict:
-    """Per-class breakdown of what the next scheduled run would fetch."""
+    """Per-class breakdown of what the next scheduled run would fetch.
+
+    Adds a health-bucket summary (computed from
+    `data_quality.compute_all`) so the operator sees at a glance
+    whether the daily guardian has kept the universe healthy.
+    """
     settings = get_settings()
-    return _pending_count(
+    counts = _pending_count(
         settings.sqlite_path,
         incremental_threshold_days=_settings_incremental_threshold(),
     )
+    from ..data_quality.health import compute_all
+
+    reports = compute_all(settings.sqlite_path)
+    by_health = {"100": 0, "99-90": 0, "89-50": 0, "<50": 0}
+    worst: list[dict] = []
+    for r in reports.values():
+        s = r.health_score
+        if s == 100:
+            by_health["100"] += 1
+        elif s >= 90:
+            by_health["99-90"] += 1
+        elif s >= 50:
+            by_health["89-50"] += 1
+        else:
+            by_health["<50"] += 1
+        if s < 100:
+            worst.append(
+                {"figi": r.figi, "ticker": r.ticker, "health_score": s}
+            )
+    worst.sort(key=lambda x: x["health_score"])
+    return {**counts, "by_health": by_health, "worst": worst[:5]}
 
 
 @router.post("/backfill/force-reset")

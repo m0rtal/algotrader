@@ -293,3 +293,31 @@ def test_backfill_start_with_fake_token_and_ingest_fake(
     import time as time_mod
 
     time_mod.sleep(0.5)
+
+
+def test_pending_includes_health_bucket(client, fresh_db):
+    """`/pending` adds `by_health` and `worst` keys."""
+    import sqlite3
+    from datetime import date, timedelta
+
+    today = date.today()
+    con = sqlite3.connect(fresh_db)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES ('GOOD', 'FIGI-GOOD', 'share', 'G', 'rub', 1)"
+    )
+    healthy = [(today - timedelta(days=i)).isoformat() for i in range(30, -1, -1)]
+    con.executemany(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+        "VALUES ('FIGI-GOOD', ?, 1, 1, 1, 1, 1)",
+        [(d,) for d in healthy],
+    )
+    con.commit()
+    con.close()
+
+    r = client.get("/api/admin/backfill/pending")
+    body = r.json()
+    assert "by_health" in body
+    assert body["by_health"]["100"] >= 1
+    assert "worst" in body
+    assert isinstance(body["worst"], list)
