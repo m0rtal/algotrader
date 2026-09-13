@@ -1,10 +1,6 @@
-# data-fetch Specification
+# data-fetch Specification (delta)
 
-## Purpose
-
-The data-fetch capability defines how market data is acquired, stored, and kept healthy in the algotrader SQLite database. The data-fetch spec covers universe discovery (which instruments are ingested), historical bars (raw daily OHLCV), incremental updates (the guardian that keeps data fresh), and data quality (per-figi health reports and recovery queue).
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: Historical completeness is detected as a per-figi sub-problem
 
