@@ -174,14 +174,6 @@ async def run_daily_guardian(
                 extra={"figi": figi, "message": "figi has been failing 3+ cycles; operator investigation needed"},
             )
 
-        # 5. Completeness backfill pass — chain after recovery, before
-        # the final summary row. Same `reports` dict feeds both passes;
-        # the completeness pass only acts on figis with
-        # INCOMPLETE_HISTORY, the rest are silent no-ops.
-        completeness_summary = await run_completeness_pass(
-            db_path, client, runner, reports,
-        )
-
         # 6. Pipeline row for the completeness pass — same schema as
         # the guardian_daily row below (migration 002_pipeline.sql):
         # id, phase, started_at, finished_at, rows_processed, status, detail.
