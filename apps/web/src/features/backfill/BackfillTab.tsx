@@ -96,35 +96,35 @@ export function BackfillTab() {
       {/* Top: data + scheduler plan */}
       <section className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4 space-y-4">
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold">Backfill</h2>
-          <span className="text-xs text-[var(--muted-foreground)]">Daily 02:00 MSK scheduler</span>
+          <h2 className="text-lg font-semibold">Бэкфилл</h2>
+          <span className="text-xs text-[var(--muted-foreground)]">Ежедневно в 02:00 МСК</span>
         </div>
 
         <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
-          <Stat label="Instruments" value={String(pending.data?.total ?? '…')} />
-          <Stat label="Up to date" value={String(pending.data?.up_to_date ?? 0)} />
-          <Stat label="Bars on disk" value={String(status.data?.total_bars ?? 0)} />
-          <Stat label="State" value={status.data?.state ?? '…'} />
+          <Stat label="Инструменты" value={String(pending.data?.total ?? '…')} />
+          <Stat label="Актуальные" value={String(pending.data?.up_to_date ?? 0)} />
+          <Stat label="Баров на диске" value={String(status.data?.total_bars ?? 0)} />
+          <Stat label="Состояние" value={status.data?.state ?? '…'} />
         </div>
 
         <div>
-          <h3 className="text-sm font-medium mb-2">Next run will fetch</h3>
+          <h3 className="text-sm font-medium mb-2">Следующий запуск</h3>
           {pending.data && pending.data.new + pending.data.stale + pending.data.error === 0 ? (
             <p className="text-sm text-green-400">
-              All {pending.data.total} tickers are up to date. The scheduler has nothing to do.
+              Все {pending.data.total} тикеров актуальны. Планировщику делать нечего.
             </p>
           ) : (
             <>
               <p className="text-sm text-[var(--muted-foreground)] mb-2">
                 {/* v8 ignore next */}
                 {pending.data
-                  ? `${pending.data.new + pending.data.stale + pending.data.error} of ${pending.data.total} tickers need attention.`
-                  : 'Counting…'}
+                  ? `${pending.data.new + pending.data.stale + pending.data.error} из ${pending.data.total} тикеров требуют обновления.`
+                  : 'Считаю…'}
               </p>
               <div className="grid grid-cols-3 gap-2 text-xs">
-                <Stat label="New (no history)" value={String(pending.data?.new ?? 0)} />
-                <Stat label="Stale (>2 days)" value={String(pending.data?.stale ?? 0)} />
-                <Stat label="Errored (retry)" value={String(pending.data?.error ?? 0)} />
+                <Stat label="Новые" value={String(pending.data?.new ?? 0)} />
+                <Stat label="Устаревшие (>2 дн)" value={String(pending.data?.stale ?? 0)} />
+                <Stat label="С ошибками" value={String(pending.data?.error ?? 0)} />
               </div>
             </>
           )}
@@ -133,9 +133,9 @@ export function BackfillTab() {
         {status.data && status.data.tickers_total > 0 && (
           <div data-testid="backfill-progress" aria-live="polite">
             <div className="flex items-center justify-between text-xs text-[var(--muted-foreground)] mb-1">
-              <span>Active run</span>
+              <span>Активный запуск</span>
               <span>
-                {status.data.tickers_done} / {status.data.tickers_total} tickers ({pct}%)
+                {status.data.tickers_done} / {status.data.tickers_total} тикеров ({pct}%)
               </span>
             </div>
             <div
@@ -160,7 +160,7 @@ export function BackfillTab() {
             onClick={() => start.mutate()}
             className="rounded border border-[var(--accent)] bg-[var(--accent)]/15 px-3 py-1.5 text-sm font-medium text-[var(--accent)] hover:bg-[var(--accent)]/25 disabled:opacity-50"
           >
-            Start backfill
+            Запустить бэкфилл
           </button>
           <button
             type="button"
@@ -168,7 +168,7 @@ export function BackfillTab() {
             onClick={() => stop.mutate()}
             className="rounded border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
           >
-            Stop current run
+            Остановить
           </button>
           <button
             type="button"
@@ -176,7 +176,7 @@ export function BackfillTab() {
             onClick={() => setShowResetConfirm(true)}
             className="rounded border border-[var(--border)] px-3 py-1.5 text-sm text-red-400 disabled:opacity-50"
           >
-            Reset metadata (force full re-fetch)
+            Сбросить метаданные (полная перезагрузка)
           </button>
           {reset.isError && (
             <p className="text-sm text-red-400 self-center">{reset.error.message}</p>
@@ -197,14 +197,14 @@ export function BackfillTab() {
           once the pending count is loaded so we never show "?". */}
       <ConfirmDialog
         open={showResetConfirm && !!pending.data}
-        title="Force full re-backfill?"
+        title="Сбросить метаданные и перезагрузить всё?"
         body={
           pending.data
-            ? `This wipes every instrument_metadata row, so the next scheduled run (and any subsequent manual trigger) will re-fetch the full history for all ${pending.data.total} instruments. Use this only after a corporate action that restated the series, or if you suspect on-disk bars are corrupt. Routine maintenance is automatic — the daily 02:00 MSK scheduler catches new tickers and stale ones without manual intervention.`
-            : 'Loading the instrument count…'
+            ? `Это удалит все строки instrument_metadata, поэтому следующий запланированный запуск (и любой последующий ручной триггер) перезагрузит всю историю для всех ${pending.data.total} инструментов. Используйте это только после корпоративного события, изменившего серию, или если подозреваете, что бары на диске повреждены. Плановое обслуживание автоматическое — ежедневный запуск в 02:00 МСК ловит новые и устаревшие тикеры без ручного вмешательства.`
+            : 'Загружаю количество инструментов…'
         }
-        confirmLabel="Reset metadata"
-        cancelLabel="Cancel"
+        confirmLabel="Сбросить метаданные"
+        cancelLabel="Отмена"
         danger
         onConfirm={() => {
           setShowResetConfirm(false);

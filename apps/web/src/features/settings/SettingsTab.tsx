@@ -57,7 +57,7 @@ export function SettingsTab() {
       const last4 = res.values.broker.tokenLast4 || '—';
       const env = res.values.broker.environment;
       const acc = res.values.broker.accountId;
-      showToast(`Сохранено · ${env} · account ${acc} · token ••••${last4}`, 'ok');
+      showToast(`Сохранено · ${env} · аккаунт ${acc} · токен ••••${last4}`, 'ok');
     } catch (e) {
       const err = e as Error & { status?: number };
       if (err.status === 409) {

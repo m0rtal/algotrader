@@ -14,7 +14,7 @@ export function Settings() {
           </Link>
           <span className="text-sm font-semibold">НАСТРОЙКИ</span>
         </div>
-        <span className="text-xs text-text-muted">Sandbox · v1.0</span>
+        <span className="text-xs text-text-muted">Песочница · v1.0</span>
       </header>
       <main className="flex-1 overflow-y-auto pb-10">
         <SettingsTab />

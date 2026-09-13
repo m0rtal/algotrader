@@ -28,11 +28,11 @@ const defaultStatus = {
 };
 
 const defaultPending = {
-  new: 0,
-  stale: 0,
-  up_to_date: 0,
+  new: 3,
+  stale: 1,
+  up_to_date: 12,
   error: 0,
-  total: 0,
+  total: 16,
 };
 
 function makeWrapper() {
@@ -81,38 +81,38 @@ describe('BackfillTab', () => {
       </Wrapper>,
     );
     await waitFor(() => {
-      expect(screen.getByText(/02:00 MSK scheduler/i)).toBeInTheDocument();
+      expect(screen.getByText(/Ежедневно в 02:00 МСК/i)).toBeInTheDocument();
     });
     await waitFor(() => {
       expect(screen.getByText(/idle/i)).toBeInTheDocument();
     });
   });
 
-  it('renders Stop current run button as disabled when idle', () => {
+  it('renders Остановить button as disabled when idle', () => {
     const Wrapper = makeWrapper();
     render(
       <Wrapper>
         <BackfillTab />
       </Wrapper>,
     );
-    const stopBtn = screen.queryByRole('button', { name: /Stop current run/i });
+    const stopBtn = screen.queryByRole('button', { name: /Остановить/i });
     expect(stopBtn).toBeInTheDocument();
     expect(stopBtn).toBeDisabled();
   });
 
-  it('renders Start backfill button enabled when idle', async () => {
+  it('renders Запустить бэкфилл button enabled when idle', async () => {
     const Wrapper = makeWrapper();
     render(
       <Wrapper>
         <BackfillTab />
       </Wrapper>,
     );
-    const startBtn = await screen.findByRole('button', { name: /Start backfill/i });
+    const startBtn = await screen.findByRole('button', { name: /Запустить бэкфилл/i });
     expect(startBtn).toBeInTheDocument();
     expect(startBtn).not.toBeDisabled();
   });
 
-  it('clicking Start backfill POSTs to /admin/backfill/start and refreshes status', async () => {
+  it('clicking Запустить бэкфилл POSTs to /admin/backfill/start and refreshes status', async () => {
     let startCalled = 0;
     server.use(
       http.post('/api/admin/backfill/start', () => {
@@ -126,7 +126,7 @@ describe('BackfillTab', () => {
         <BackfillTab />
       </Wrapper>,
     );
-    const startBtn = await screen.findByRole('button', { name: /Start backfill/i });
+    const startBtn = await screen.findByRole('button', { name: /Запустить бэкфилл/i });
     fireEvent.click(startBtn);
     await waitFor(() => {
       expect(startCalled).toBe(1);
@@ -140,7 +140,7 @@ describe('BackfillTab', () => {
         <BackfillTab />
       </Wrapper>,
     );
-    await waitFor(() => screen.getByText(/02:00 MSK scheduler/i));
+    await waitFor(() => screen.getByText(/Ежедневно в 02:00 МСК/i));
   });
 
   it('renders the scheduler plan in real numbers', async () => {
@@ -151,12 +151,12 @@ describe('BackfillTab', () => {
       </Wrapper>,
     );
     await waitFor(() => {
-      expect(screen.getByText(/Instruments/i)).toBeInTheDocument();
-      expect(screen.getByText(/Up to date/i)).toBeInTheDocument();
-      expect(screen.getByText(/Bars on disk/i)).toBeInTheDocument();
-      expect(screen.getByText(/New \(no history\)/i)).toBeInTheDocument();
-      expect(screen.getByText(/Stale \(>2 days\)/i)).toBeInTheDocument();
-      expect(screen.getByText(/Errored \(retry\)/i)).toBeInTheDocument();
+      expect(screen.getByText(/Инструменты/i)).toBeInTheDocument();
+      expect(screen.getByText(/Актуальные/i)).toBeInTheDocument();
+      expect(screen.getByText(/Баров на диске/i)).toBeInTheDocument();
+      expect(screen.getByText(/Новые/i)).toBeInTheDocument();
+      expect(screen.getByText(/Устаревшие/i)).toBeInTheDocument();
+      expect(screen.getByText(/С ошибками/i)).toBeInTheDocument();
     });
   });
 
@@ -169,15 +169,15 @@ describe('BackfillTab', () => {
         <BackfillTab />
       </Wrapper>,
     );
-    await waitFor(() => screen.getByText(/Reset metadata/i));
-    fireEvent.click(screen.getByText(/Reset metadata/i));
-    await waitFor(() => screen.getByText(/Force full re-backfill/i));
-    const confirmBtns = screen.getAllByRole('button', { name: /Reset metadata/i });
+    await waitFor(() => screen.getByText(/Сбросить метаданные/i));
+    fireEvent.click(screen.getByText(/Сбросить метаданные/i));
+    await waitFor(() => screen.getByText(/Сбросить метаданные и перезагрузить всё/i));
+    const confirmBtns = screen.getAllByRole('button', { name: /Сбросить метаданные/i });
     // The second one is inside the dialog.
     fireEvent.click(confirmBtns[confirmBtns.length - 1]!);
     // Dialog closes, no error toast.
     await waitFor(() => {
-      expect(screen.queryByText(/Force full re-backfill/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Сбросить метаданные и перезагрузить всё/i)).not.toBeInTheDocument();
     });
   });
 
@@ -188,12 +188,12 @@ describe('BackfillTab', () => {
         <BackfillTab />
       </Wrapper>,
     );
-    await waitFor(() => screen.getByText(/Reset metadata/i));
-    fireEvent.click(screen.getByText(/Reset metadata/i));
-    await waitFor(() => screen.getByText(/Force full re-backfill/i));
-    fireEvent.click(screen.getByText(/^Cancel$/i));
+    await waitFor(() => screen.getByText(/Сбросить метаданные/i));
+    fireEvent.click(screen.getByText(/Сбросить метаданные/i));
+    await waitFor(() => screen.getByText(/Сбросить метаданные и перезагрузить всё/i));
+    fireEvent.click(screen.getByText(/^Отмена$/i));
     await waitFor(() => {
-      expect(screen.queryByText(/Force full re-backfill/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Сбросить метаданные и перезагрузить всё/i)).not.toBeInTheDocument();
     });
   });
 
@@ -209,10 +209,10 @@ describe('BackfillTab', () => {
         <BackfillTab />
       </Wrapper>,
     );
-    await waitFor(() => screen.getByText(/Reset metadata/i));
-    fireEvent.click(screen.getByText(/Reset metadata/i));
-    await waitFor(() => screen.getByText(/Force full re-backfill/i));
-    fireEvent.click(screen.getByText(/^Reset metadata$/i));
+    await waitFor(() => screen.getByText(/Сбросить метаданные/i));
+    fireEvent.click(screen.getByText(/Сбросить метаданные/i));
+    await waitFor(() => screen.getByText(/Сбросить метаданные и перезагрузить всё/i));
+    fireEvent.click(screen.getByText(/^Сбросить метаданные$/i));
     // The error message bubbles up next to the buttons.
     await waitFor(() => {
       expect(screen.getByText(/500/i)).toBeInTheDocument();
@@ -221,7 +221,7 @@ describe('BackfillTab', () => {
 
   // ─── Running states — server.use() overrides ─────────────────────
 
-  it('shows Stop button enabled when backfilling', async () => {
+  it('shows Остановить button enabled when backfilling', async () => {
     server.use(
       http.get('/api/admin/backfill/status', () =>
         HttpResponse.json({
@@ -241,11 +241,11 @@ describe('BackfillTab', () => {
       </Wrapper>,
     );
     await waitFor(() => {
-      expect(screen.getByText(/Stop\b/)).toBeInTheDocument();
+      expect(screen.getByText(/Остановить/)).toBeInTheDocument();
     });
   });
 
-  it('shows Stop button when status.state is discovering', async () => {
+  it('shows Остановить button when status.state is discovering', async () => {
     server.use(
       http.get('/api/admin/backfill/status', () =>
         HttpResponse.json({
@@ -265,7 +265,7 @@ describe('BackfillTab', () => {
       </Wrapper>,
     );
     await waitFor(() => {
-      const stopBtn = screen.queryByText(/Stop current run/i);
+      const stopBtn = screen.queryByText(/Остановить/i);
       expect(stopBtn).toBeTruthy();
       expect((stopBtn as HTMLButtonElement).disabled).toBe(false);
     });
@@ -336,10 +336,10 @@ describe('BackfillTab', () => {
       </Wrapper>,
     );
     // The Stat labels render unconditionally; the data-side text shows
-    // 'Counting…' because pending.data is undefined while the query is
+    // 'Считаю…' because pending.data is undefined while the query is
     // pending.
-    expect(screen.getByText(/Instruments/i)).toBeInTheDocument();
-    expect(screen.getByText(/Counting…/i)).toBeInTheDocument();
+    expect(screen.getByText(/Инструменты/i)).toBeInTheDocument();
+    expect(screen.getByText(/Считаю…/i)).toBeInTheDocument();
   });
 
   // ─── Stop mutation ───────────────────────────────────────────────
@@ -385,18 +385,18 @@ describe('BackfillTab', () => {
     );
     await waitFor(
       () => {
-        const btn = screen.queryByText(/Stop current run/i) as HTMLButtonElement | null;
+        const btn = screen.queryByText(/Остановить/i) as HTMLButtonElement | null;
         expect(btn).toBeTruthy();
         expect(btn!.disabled).toBe(false);
       },
       { timeout: 3000 },
     );
-    fireEvent.click(screen.getByText(/Stop current run/i));
+    fireEvent.click(screen.getByText(/Остановить/i));
     // After stop, the button is disabled again because state returned
     // to idle via the refetched status.
     await waitFor(
       () => {
-        const btn = screen.queryByText(/Stop current run/i) as HTMLButtonElement | null;
+        const btn = screen.queryByText(/Остановить/i) as HTMLButtonElement | null;
         expect(btn).toBeTruthy();
         expect(btn!.disabled).toBe(true);
       },
@@ -414,7 +414,7 @@ describe('BackfillTab', () => {
       </Wrapper>,
     );
     await waitFor(() => {
-      expect(screen.getByText(/Daily 02:00 MSK scheduler/i)).toBeInTheDocument();
+      expect(screen.getByText(/Ежедневно в 02:00 МСК/i)).toBeInTheDocument();
     });
     expect(screen.queryByTestId('backfill-progress')).toBeNull();
   });
@@ -439,7 +439,7 @@ describe('BackfillTab', () => {
       </Wrapper>,
     );
     const bar = await screen.findByTestId('backfill-progress');
-    expect(bar.textContent).toMatch(/30\s*\/\s*100 tickers/);
+    expect(bar.textContent).toMatch(/30\s*\/\s*100 тикеров/);
     expect(bar.textContent).toMatch(/\(30%\)/);
     // The role="progressbar" element exposes aria-valuenow for screen readers.
     const progressEl = screen.getByRole('progressbar');
@@ -466,10 +466,10 @@ describe('BackfillTab', () => {
     );
     // Both bars used to render here — fixed 2026-09-13 to drop the
     // duplicate that lived inside the Recent events panel. The page
-    // should now show exactly one 'Active run' progress block.
+    // should now show exactly one 'Активный запуск' progress block.
     await waitFor(() => {
       expect(screen.getByText(/2366 \/ 3806/)).toBeInTheDocument();
     });
-    expect(screen.getAllByText(/Active run/).length).toBe(1);
+    expect(screen.getAllByText(/Активный запуск/).length).toBe(1);
   });
 });
