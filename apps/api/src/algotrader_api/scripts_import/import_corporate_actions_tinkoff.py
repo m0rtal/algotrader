@@ -79,8 +79,9 @@ def import_corporate_actions_tinkoff(
     """
     if client is None:
         from t_tech.invest import Client  # pragma: no cover — live broker path
-        from algotrader_api.config import Settings  # pragma: no cover
-        token = Settings().tinkoff_token  # pragma: no cover
+        from ..config import Settings  # pragma: no cover
+        from ..db.secrets import get_broker_token  # pragma: no cover
+        token = get_broker_token(Settings().sqlite_path) or ""  # pragma: no cover
         client = Client(token)  # pragma: no cover
     rows: list[CorporateActionRow] = []
     for figi in _tradeable_figis(db_path):
