@@ -1,0 +1,19 @@
+name: branch-name-check
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch name
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          if [[ ! "$BRANCH" =~ ^(feature|fix|chore|docs|hotfix)/[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "✗ Branch '$BRANCH' must match ^(feature|fix|chore|docs|hotfix)/<name>$"
+            echo "  Allowed prefixes: feature/, fix/, chore/, docs/, hotfix/"
+            echo "  Name part: lowercase alphanumeric + hyphens, must start with a letter or digit"
+            exit 1
+          fi
+          echo "✓ Branch '$BRANCH' matches the convention"
