@@ -73,12 +73,12 @@ def import_corporate_actions_tinkoff(
     """Iterate every tradeable figi, fetch dividends from Tinkoff,
     merge into corporate_actions.
 
-    If `client` is None, opens a real `tinkoff.invest.Client` using the
+    If `client` is None, opens a real `t_tech.invest.Client` using the
     production token from the algotrader secrets table. Tests pass a
     MagicMock.
     """
     if client is None:
-        from tinkoff.invest import Client  # pragma: no cover — live broker path
+        from t_tech.invest import Client  # pragma: no cover — live broker path
         from algotrader_api.config import Settings  # pragma: no cover
         token = Settings().tinkoff_token  # pragma: no cover
         client = Client(token)  # pragma: no cover
