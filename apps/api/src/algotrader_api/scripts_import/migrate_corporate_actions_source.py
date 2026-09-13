@@ -35,7 +35,7 @@ def _infer_source(note: str | None) -> str:
     `note="tinkoff: {currency}"` exactly with the colon after tinkoff, so
     startswith is unambiguous.
     """
-    if note is None:
+    if note is None:  # pragma: no cover — defensive: CorporateActionRow.note defaults to ""
         return "curated"
     if note.startswith("moex:iss"):
         return "moex_iss"
