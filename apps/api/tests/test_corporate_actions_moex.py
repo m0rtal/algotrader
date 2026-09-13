@@ -98,6 +98,9 @@ def test_fetch_dividends_parses_iss_payload():
     assert rows[0].action_type == "dividend"
     # figi is the secid (caller maps back via instruments table)
     assert rows[0].figi == "SBER"
+    # Source identifies the ingestion path that produced the row.
+    assert rows[0].source == "moex:iss:dividends"
+    assert rows[1].source == "moex:iss:dividends"
 
 
 def test_fetch_dividends_skips_zero_value():

@@ -90,6 +90,7 @@ def fetch_dividends_for_secid(
             factor=1.0,
             cash_amount=v,
             note="moex:iss",
+            source="moex:iss:dividends",
         ))
     return out
 

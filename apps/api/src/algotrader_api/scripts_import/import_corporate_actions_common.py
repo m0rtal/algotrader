@@ -27,6 +27,11 @@ class CorporateActionRow:
     factor: float
     cash_amount: Optional[float]
     note: str = ""
+    # `source` records the ingestion path that produced this row (e.g.
+    # 'moex:iss:dividends', 'tinkoff:dividends', 'moex_iss_snapshots',
+    # 'curated'). Defaults to '' for backward compatibility with callers
+    # that don't set it; importers are expected to fill it in.
+    source: str = ""
 
     def __post_init__(self):
         if self.action_type not in ALLOWED_ACTION_TYPES:
