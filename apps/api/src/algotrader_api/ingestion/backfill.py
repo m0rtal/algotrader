@@ -139,10 +139,17 @@ class BackfillRunner:
         self,
         history_years: int = 5,
         incremental_threshold_days: int = 2,
+        *,
+        limit_to: list[str] | None = None,
     ) -> None:
         """Run the full lifecycle: discover → backfill → done.
 
         Errors per ticker are logged but don't abort the run.
+
+        `limit_to` (used by the data-quality recovery loop) restricts
+        the backfill queue to the given figis. When set, we skip
+        the discover step because we already know what we want to
+        process.
         """
         self._stop_flag.clear()
         with self._lock:
@@ -153,26 +160,34 @@ class BackfillRunner:
 
         await self._emit("status", {"state": self.state.value, "phase": "start"})
 
-        # Step 1: discover the universe. Always runs; idempotent.
-        try:
-            total = await self._discover_universe()
-            self.tickers_total = total
+        # Step 1: discover the universe (skipped when caller already
+        # narrowed the queue to a recovery list).
+        if limit_to is None:
+            try:
+                total = await self._discover_universe()
+                self.tickers_total = total
+                await self._emit(
+                    "status",
+                    {"state": self.state.value, "tickers_total": total},
+                )
+            except Exception as e:  # pragma: no cover — universe discovery failure only fires during live broker run
+                await self._log("error", figi=None, message=f"universe discovery failed: {e}")
+                await self._emit("done", {"tickers_done": 0, "tickers_total": 0, "status": "error"})
+                with self._lock:
+                    self.state = BackfillState.IDLE
+                return
+        else:
+            self.tickers_total = len(limit_to)
             await self._emit(
                 "status",
-                {"state": self.state.value, "tickers_total": total},
+                {"state": self.state.value, "tickers_total": len(limit_to)},
             )
-        except Exception as e:  # pragma: no cover — universe discovery failure only fires during live broker run
-            await self._log("error", figi=None, message=f"universe discovery failed: {e}")
-            await self._emit("done", {"tickers_done": 0, "tickers_total": 0, "status": "error"})
-            with self._lock:
-                self.state = BackfillState.IDLE
-            return
 
         # Step 2: backfill each instrument.
         with self._lock:
             self.state = BackfillState.BACKFILLING
 
-        instruments = self._list_instruments()
+        instruments = self._list_instruments(limit_to=limit_to)
         for inst in instruments:
             if self._stop_flag.is_set():
                 break
@@ -476,7 +491,9 @@ class BackfillRunner:
 
     # ─── DB helpers ──────────────────────────────────────────────────
 
-    def _list_instruments(self) -> list[dict]:
+    def _list_instruments(
+        self, limit_to: list[str] | None = None
+    ) -> list[dict]:
         """Read the tradeable universe for the backfill loop.
 
         Filters at the SQL boundary: only rows whose `class` is in
@@ -485,6 +502,10 @@ class BackfillRunner:
         backfill queue — even if a stale row survived a previous
         build, this query won't pick it up.
 
+        `limit_to` (used by the data-quality recovery loop) restricts
+        the result to a figi whitelist. When None, the full
+        tradeable universe is returned.
+
         Class-specific `get_candles` wiring lives in
         `ingestion/client.py`; this function only knows the
         tradeable set, not how each class is fetched.
@@ -492,14 +513,21 @@ class BackfillRunner:
         from ..domain.tradeable import TRADEABLE_CLASSES
 
         placeholders = ",".join("?" for _ in TRADEABLE_CLASSES)
+        sql = (
+            f"SELECT ticker, figi, class FROM instruments "
+            f"WHERE class IN ({placeholders})"
+        )
+        params: list = list(TRADEABLE_CLASSES)
+        if limit_to:
+            qs = ",".join("?" for _ in limit_to)
+            sql += f" AND figi IN ({qs})"
+            params.extend(limit_to)
         con = sqlite3.connect(self.db_path)
         con.row_factory = sqlite3.Row
-        rows = con.execute(
-            f"SELECT ticker, figi, class FROM instruments "
-            f"WHERE class IN ({placeholders})",
-            tuple(TRADEABLE_CLASSES),
-        ).fetchall()
-        con.close()
+        try:
+            rows = con.execute(sql, tuple(params)).fetchall()
+        finally:
+            con.close()
         return [dict(r) for r in rows]
 
     def _get_metadata(self, figi: str) -> dict | None:

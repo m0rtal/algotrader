@@ -859,3 +859,81 @@ async def test_backfill_one_mirrors_candles_into_sqlite_bars_table(tmp_path):
     assert len(rows) >= 1
     assert rows[0][0] == "2024-06-01"
     assert rows[0][1] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_run_accepts_limit_to_figis(tmp_path):
+    """Recovery loop passes a figi whitelist; runner only fetches those."""
+    import sqlite3
+    con = sqlite3.connect(str(tmp_path / "state.db"))
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS instruments (
+            ticker TEXT PRIMARY KEY, figi TEXT UNIQUE, class TEXT,
+            name TEXT, currency TEXT, lot_size INTEGER, isin TEXT,
+            sector TEXT
+        );
+        """
+    )
+    con.executemany(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES (?, ?, 'share', ?, 'rub', 1)",
+        [("A", "FIGI-A", "A"), ("B", "FIGI-B", "B"), ("C", "FIGI-C", "C")],
+    )
+    con.commit()
+    con.close()
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    async def noop(ev):
+        pass
+
+    runner = BackfillRunner(
+        client=MagicMock(), db_path=str(tmp_path / "state.db"), event_sink=noop,
+    )
+    runner._discover_universe = AsyncMock(return_value=3)
+    runner._backfill_one = AsyncMock(return_value=10)
+    await runner.run(history_years=5, incremental_threshold_days=2, limit_to=["FIGI-B"])
+    # Only FIGI-B should have been processed.
+    assert runner._backfill_one.await_count == 1
+    called_figi = (
+        runner._backfill_one.await_args.kwargs.get("figi")
+        or runner._backfill_one.await_args.args[0]
+    )
+    assert called_figi == "FIGI-B"
+
+
+@pytest.mark.asyncio
+async def test_run_without_limit_to_processes_full_universe(tmp_path):
+    """Without limit_to, _list_instruments is called with None."""
+    import sqlite3
+    from unittest.mock import AsyncMock, MagicMock
+
+    con = sqlite3.connect(str(tmp_path / "state.db"))
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS instruments (
+            ticker TEXT PRIMARY KEY, figi TEXT UNIQUE, class TEXT,
+            name TEXT, currency TEXT, lot_size INTEGER, isin TEXT,
+            sector TEXT
+        );
+        """
+    )
+    con.executemany(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES (?, ?, 'share', ?, 'rub', 1)",
+        [("A", "FIGI-A", "A"), ("B", "FIGI-B", "B")],
+    )
+    con.commit()
+    con.close()
+
+    async def noop(ev):
+        pass
+
+    runner = BackfillRunner(
+        client=MagicMock(), db_path=str(tmp_path / "state.db"), event_sink=noop,
+    )
+    runner._discover_universe = AsyncMock(return_value=2)
+    runner._backfill_one = AsyncMock(return_value=10)
+    await runner.run(history_years=5, incremental_threshold_days=2)
+    assert runner._backfill_one.await_count == 2
