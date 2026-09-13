@@ -98,3 +98,96 @@ def test_compute_all_warns_on_empty_holidays_table(caplog):
         msgs = [rec.message for rec in caplog.records]
         assert any("moex_holidays" in m and "empty" in m.lower() for m in msgs), \
             f"expected empty-holidays warning, got: {msgs}"
+
+
+# ── defensive-branch coverage (QA #18) ──────────────────────────────
+
+
+def test_seed_helper_skips_when_table_does_not_exist(tmp_path):
+    """Pre-migration-006 databases: ``moex_holidays`` doesn't exist yet.
+
+    The ``OperationalError`` branch in ``_seed_moex_holidays_if_missing``
+    must return silently rather than raise — the migration runner
+    itself must not crash because the table it was about to seed
+    doesn't exist yet (it gets created by migration 006 *during*
+    this run, so the race only triggers on a DB that pre-dates 006).
+    """
+    import sqlite3
+    from algotrader_api.db.sqlite import _seed_moex_holidays_if_missing
+
+    db_path = str(tmp_path / "state.db")
+    # Open a DB WITHOUT running migrations — no moex_holidays table.
+    con = sqlite3.connect(db_path)
+    # Should not raise.
+    _seed_moex_holidays_if_missing(con, db_path)
+    con.close()
+
+
+def test_seed_helper_skips_when_table_already_populated(tmp_path):
+    """Direct coverage of the ``row[0] > 0`` early-return.
+
+    When the table is non-empty (operator ran the import script,
+    or a previous ``run_migrations`` already seeded) the helper
+    must not call ``import_moex_holidays`` again. We assert the
+    row count is preserved exactly — no duplicates, no re-seed.
+    """
+    from algotrader_api.db.sqlite import _seed_moex_holidays_if_missing
+
+    db_path = str(tmp_path / "state.db")
+    run_migrations(db_path, str(MIGRATIONS_DIR))
+
+    con = sqlite3.connect(db_path)
+    before = con.execute("SELECT COUNT(*) FROM moex_holidays").fetchone()[0]
+    _seed_moex_holidays_if_missing(con, db_path)
+    after = con.execute("SELECT COUNT(*) FROM moex_holidays").fetchone()[0]
+    con.close()
+
+    assert before > 0  # migration seeded
+    assert before == after  # second call was a no-op
+
+
+def test_seed_helper_returns_silently_on_import_failure(tmp_path, monkeypatch):
+    """Coverage of the ``except Exception`` branch on the import.
+
+    If ``import_moex_holidays`` raises (missing JSON, broken path,
+    etc.) the helper must return silently rather than crash the
+    migration runner — the table will simply remain empty and the
+    ``_warn_if_holidays_empty`` defensive guard will surface the
+    issue at compute time.
+    """
+    import builtins
+
+    from algotrader_api.db.sqlite import _seed_moex_holidays_if_missing
+
+    db_path = str(tmp_path / "state.db")
+    run_migrations(db_path, str(MIGRATIONS_DIR))
+    con = sqlite3.connect(db_path)
+    # Wipe so the seed branch is taken (not the >0 early-return).
+    con.execute("DELETE FROM moex_holidays")
+    con.commit()
+
+    # Force the import to raise — the helper's except-clause must
+    # catch it. We patch builtins.__import__ to fail only for the
+    # ``import_moex_holidays`` module name.
+    original_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if "import_moex_holidays" in name:
+            raise ImportError("simulated broken JSON")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    try:
+        # Should NOT raise.
+        _seed_moex_holidays_if_missing(con, db_path)
+    finally:
+        con.close()
+
+    # The table is still empty — exactly the scenario the
+    # ``_warn_if_holidays_empty`` guard catches downstream.
+    con = sqlite3.connect(db_path)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM moex_holidays").fetchone()[0] == 0
+    finally:
+        con.close()
