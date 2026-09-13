@@ -84,25 +84,6 @@ def _bars_range(con: sqlite3.Connection, figi: str) -> tuple[date | None, date |
     return first, last, int(row[2])
 
 
-def _weekdays_between(start: date, end: date) -> int:
-    """Count business days between start and end inclusive.
-
-    Retained as a backward-compat shim; both internal call sites now use
-    ``_weekdays_excluding_holidays`` / ``_weekdays_minus_holiday_set``
-    for holiday-aware counting. Body is pragma-covered because there are
-    no remaining callers in the codebase.
-    """
-    if end < start:  # pragma: no cover — defensive guard
-        return 0
-    n = 0  # pragma: no cover
-    cur = start  # pragma: no cover
-    while cur <= end:  # pragma: no cover
-        if cur.weekday() < 5:  # pragma: no cover  # Mon-Fri
-            n += 1  # pragma: no cover
-        cur += timedelta(days=1)  # pragma: no cover
-    return n  # pragma: no cover
-
-
 def _weekdays_excluding_holidays(
     start: date, end: date, con: sqlite3.Connection
 ) -> int:

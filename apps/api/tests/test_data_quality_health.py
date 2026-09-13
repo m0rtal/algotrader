@@ -240,4 +240,3 @@ def test_health_report_marks_incomplete_history_with_holidays(db):
     # So worst case is 100 - 25 - 20 = 55; assert the -25 floor landed.
     assert report.health_score <= 75
     # And the new issue must contribute at least 25 points of penalty.
-    assert report.health_score <= 75  # explicit re-assertion of the brief's contract
