@@ -279,3 +279,119 @@ async def test_run_daily_guardian_chains_completeness_pass(db, monkeypatch):
     completeness_row = next(r for r in rows if r[0] == "completeness_backfill")
     assert "examined=" in completeness_row[2]
     assert "gaps=" in completeness_row[2]
+
+
+# ── issue #5: single-flight lock ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_daily_guardian_serializes_concurrent_runs(db, monkeypatch):
+    """Two concurrent invocations must not both write a pipeline row.
+
+    Without the lock, both workers pass through ``compute_all`` and
+    ``recover_stale`` and both INSERT a ``guardian_daily`` row —
+    operator sees phantom doubles and stale-recovery counters drift.
+    With the ``BEGIN IMMEDIATE`` lock on the ``guardian_lock``
+    table, the second worker raises ``GuardianLocked`` and the
+    pipeline table has exactly one ``guardian_daily`` row.
+    """
+    from algotrader_api.data_quality.service import (
+        GuardianLocked,
+        run_daily_guardian,
+    )
+
+    # Slow down the first worker so the second's lock attempt races.
+    barrier = asyncio.Event()
+
+    async def slow_universe(*args, **kwargs):
+        await barrier.wait()
+        return []
+
+    monkeypatch.setattr(
+        "algotrader_api.ingestion.universe.discover_universe",
+        slow_universe,
+    )
+    monkeypatch.setattr(
+        "algotrader_api.ingestion.universe.upsert_instruments",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        "algotrader_api.data_quality.service._make_client_from_settings",
+        MagicMock(),
+    )
+
+    runner = MagicMock()
+    runner.run = MagicMock()
+
+    first = asyncio.create_task(run_daily_guardian(db, runner))
+    # Let the first task reach the barrier (i.e. inside the lock).
+    await asyncio.sleep(0.05)
+    second = asyncio.create_task(run_daily_guardian(db, runner))
+
+    # Release the first task; it should complete normally.
+    barrier.set()
+    summary = await first
+    assert summary.figis_checked == 2  # HEALTHY + STALE in fixture
+
+    # The second task must raise GuardianLocked.
+    with pytest.raises(GuardianLocked):
+        await second
+
+    # Exactly one guardian_daily row was written.
+    con = sqlite3.connect(db)
+    try:
+        count = con.execute(
+            "SELECT COUNT(*) FROM pipeline WHERE phase='guardian_daily'"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert count == 1, (
+        f"expected single guardian_daily pipeline row, got {count} "
+        f"(concurrent workers bypassed the lock)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_daily_guardian_releases_lock_on_failure(db, monkeypatch):
+    """A failed pass must release the lock so the next cycle can run.
+
+    Without explicit release on the error path, a one-time exception
+    would deadlock the guardian until manual intervention. The fix
+    wraps the orchestrator body in try/finally so the lock is
+    released regardless of how the body exits.
+    """
+    from algotrader_api.data_quality.service import (
+        GuardianLocked,
+        run_daily_guardian,
+    )
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("simulated universe failure")
+
+    monkeypatch.setattr(
+        "algotrader_api.ingestion.universe.discover_universe",
+        boom,
+    )
+    monkeypatch.setattr(
+        "algotrader_api.data_quality.service._make_client_from_settings",
+        MagicMock(),
+    )
+
+    runner = MagicMock()
+    runner.run = MagicMock()
+
+    with pytest.raises(RuntimeError):
+        await run_daily_guardian(db, runner)
+
+    # Second invocation must acquire the lock cleanly — proving the
+    # first one's failure path released it.
+    monkeypatch.setattr(
+        "algotrader_api.ingestion.universe.discover_universe",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "algotrader_api.ingestion.universe.upsert_instruments",
+        MagicMock(),
+    )
+    summary = await run_daily_guardian(db, runner)
+    assert summary.figis_checked == 2
