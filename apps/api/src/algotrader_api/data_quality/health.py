@@ -22,6 +22,7 @@ class HealthIssue(str, Enum):
     SPARSE_HISTORY = "sparse-history"
     HAS_GAPS = "has-gaps"
     RATE_LIMITED_FAILURES = "rate-limited-failures"
+    INCOMPLETE_HISTORY = "incomplete-history"
 
 
 @dataclass
@@ -49,7 +50,9 @@ _PENALTY = {
     HealthIssue.SPARSE_HISTORY: 20,
     HealthIssue.HAS_GAPS: 20,
     HealthIssue.RATE_LIMITED_FAILURES: 30,
+    HealthIssue.INCOMPLETE_HISTORY: 25,
 }
+_INCOMPLETE_HISTORY_RATIO = 0.95
 
 
 def _open(db_path: str) -> sqlite3.Connection:
@@ -82,16 +85,63 @@ def _bars_range(con: sqlite3.Connection, figi: str) -> tuple[date | None, date |
 
 
 def _weekdays_between(start: date, end: date) -> int:
-    """Count business days between start and end inclusive."""
+    """Count business days between start and end inclusive.
+
+    Retained as a backward-compat shim; both internal call sites now use
+    ``_weekdays_excluding_holidays`` / ``_weekdays_minus_holiday_set``
+    for holiday-aware counting. Body is pragma-covered because there are
+    no remaining callers in the codebase.
+    """
     if end < start:  # pragma: no cover — defensive guard
         return 0
-    n = 0
-    cur = start
-    while cur <= end:
-        if cur.weekday() < 5:  # Mon-Fri
-            n += 1
-        cur += timedelta(days=1)
-    return n
+    n = 0  # pragma: no cover
+    cur = start  # pragma: no cover
+    while cur <= end:  # pragma: no cover
+        if cur.weekday() < 5:  # pragma: no cover  # Mon-Fri
+            n += 1  # pragma: no cover
+        cur += timedelta(days=1)  # pragma: no cover
+    return n  # pragma: no cover
+
+
+def _weekdays_excluding_holidays(
+    start: date, end: date, con: sqlite3.Connection
+) -> int:
+    """Count weekdays between start and end (inclusive), minus MOEX holidays in range.
+
+    Holidays are loaded from the `moex_holidays` table created by migration 006.
+    Returns 0 when end < start (defensive).
+    """
+    if end < start:  # pragma: no cover — defensive guard
+        return 0
+    weekdays = sum(
+        1 for i in range((end - start).days + 1)
+        if (start + timedelta(days=i)).weekday() < 5
+    )
+    rows = con.execute(
+        "SELECT date FROM moex_holidays WHERE date BETWEEN ? AND ?",
+        (start.isoformat(), end.isoformat()),
+    ).fetchall()
+    return weekdays - len(rows)
+
+
+def _weekdays_minus_holiday_set(start: date, end: date, holidays: set[str]) -> int:
+    """Same as ``_weekdays_excluding_holidays`` but takes a pre-loaded holiday set.
+
+    Used by the bulk ``compute_all`` path which loads all holidays once
+    instead of issuing one query per figi.
+    """
+    if end < start:  # pragma: no cover — defensive guard
+        return 0
+    weekdays = sum(
+        1 for i in range((end - start).days + 1)
+        if (start + timedelta(days=i)).weekday() < 5
+    )
+    # Count only holidays strictly inside [start, end].
+    in_range = sum(
+        1 for i in range((end - start).days + 1)
+        if (start + timedelta(days=i)).isoformat() in holidays
+    )
+    return weekdays - in_range
 
 
 def _detect_gaps(
@@ -156,6 +206,13 @@ def _compute_issues_and_penalty(
         issues.append(HealthIssue.SPARSE_HISTORY)
         penalty += _PENALTY[HealthIssue.SPARSE_HISTORY]
 
+    if (
+        expected_bars > 0
+        and actual_bars < expected_bars * _INCOMPLETE_HISTORY_RATIO
+    ):
+        issues.append(HealthIssue.INCOMPLETE_HISTORY)
+        penalty += _PENALTY[HealthIssue.INCOMPLETE_HISTORY]
+
     if gaps:
         issues.append(HealthIssue.HAS_GAPS)
         penalty += _PENALTY[HealthIssue.HAS_GAPS]
@@ -185,7 +242,9 @@ def compute_health(
         gaps = _detect_gaps(con, figi)
         failures = _recent_failures(con, figi)
         expected_bars = (
-            _weekdays_between(first_bar, today) if first_bar else 0
+            _weekdays_excluding_holidays(first_bar, today, con)
+            if first_bar
+            else 0
         )
         issues, penalty = _compute_issues_and_penalty(
             last_bar, actual_bars, expected_bars, gaps, failures, today
@@ -246,6 +305,8 @@ def compute_all(db_path: str, today: date | None = None) -> dict[str, HealthRepo
         ).fetchall()
         figis = [r["figi"] for r in rows]
         failures_map = _recent_failures_bulk(con, figis, today)
+        holiday_rows = con.execute("SELECT date FROM moex_holidays").fetchall()
+        holidays = {r["date"] for r in holiday_rows}
     finally:
         con.close()
 
@@ -256,7 +317,11 @@ def compute_all(db_path: str, today: date | None = None) -> dict[str, HealthRepo
         first_bar = date.fromisoformat(r["first_bar"]) if r["first_bar"] else None
         last_bar = date.fromisoformat(r["last_bar"]) if r["last_bar"] else None
         actual = int(r["actual_bars"])
-        expected = _weekdays_between(first_bar, today) if first_bar else 0
+        expected = (
+            _weekdays_minus_holiday_set(first_bar, today, holidays)
+            if first_bar
+            else 0
+        )
         issues, penalty = _compute_issues_and_penalty(
             last_bar, actual, expected, [], failures_map.get(figi, []), today
         )

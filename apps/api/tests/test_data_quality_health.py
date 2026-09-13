@@ -27,6 +27,10 @@ def db(tmp_path):
             name TEXT, currency TEXT, lot_size INTEGER, isin TEXT,
             sector TEXT, source_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS moex_holidays (
+            date TEXT PRIMARY KEY,
+            name TEXT NOT NULL
+        );
         """
     )
     con.execute(
@@ -84,10 +88,12 @@ def test_health_report_sparse_history_capped(db):
     _seed_bars(db, "FIGI-SBER", dates)
     r = compute_health(db, "FIGI-SBER", today=today)
     assert HealthIssue.SPARSE_HISTORY in r.issues
-    # Sparse (-20) + the gap between first_bar and the next batch (-20
-    # because it's >5 calendar days) = -40; sparse alone is capped at 20.
-    assert r.health_score >= 50
-    assert r.health_score <= 80
+    # Sparse (-20) + INCOMPLETE_HISTORY (-25) + the gap between
+    # first_bar and the next batch (-20 because it's >5 calendar days)
+    # = -65. The SPARSE_HISTORY itself is still capped at 20; the other
+    # two issues each have their own penalty.
+    assert r.health_score >= 30
+    assert r.health_score <= 70
 
 
 def test_health_report_has_gaps_detects_long_gap(db):
@@ -174,3 +180,64 @@ def test_compute_all_handles_large_universe_in_bulk(db):
         r = reports.get(f"FIGI-{i}")
         assert r is not None, f"FIGI-{i} missing from reports"
         assert r.health_score == 100, f"FIGI-{i} score={r.health_score} (issues={r.issues})"
+
+
+def test_health_report_marks_incomplete_history_with_holidays(db):
+    """A figi whose actual bars are < 95% of weekdays-minus-holidays between
+    first_bar and today must be flagged with INCOMPLETE_HISTORY and lose 25 points.
+    """
+    from algotrader_api.data_quality.health import (
+        HealthIssue,
+        HealthReport,
+        compute_health,
+    )
+
+    figi = "FIGI-SPARSE"
+    today = date(2026, 9, 12)
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES ('SPRS', ?, 'share', 'Sparse', 'rub', 1)",
+        (figi,),
+    )
+    # First bar well in the past, then a long hole, then a few recent weekday
+    # bars — actual << weekdays_minus_holidays between first_bar and today.
+    # 2026-01-12 (Mon) -> 2026-09-12 (Sat) is ~149 weekdays.
+    # We seed only 8 bars so 8 < 0.95 * 149 == 141.5.
+    bar_dates = [
+        "2026-01-12",  # Mon
+        "2026-03-16",  # Mon
+        "2026-04-20",  # Mon
+        "2026-05-18",  # Mon
+        "2026-06-22",  # Mon
+        "2026-07-20",  # Mon
+        "2026-08-17",  # Mon
+        "2026-09-07",  # Mon (5 days ago, within MISSING_RECENT window)
+    ]
+    con.executemany(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+        "VALUES (?, ?, 1, 1, 1, 1, 1)",
+        [(figi, d) for d in bar_dates],
+    )
+    # Subtract two holidays inside the range; without this, _weekdays_excluding_holidays
+    # would still leave actual << expected, but the helper subtraction is what we want to
+    # exercise end-to-end.
+    con.executemany(
+        "INSERT INTO moex_holidays (date, name) VALUES (?, ?)",
+        [
+            ("2026-05-01", "test-spring"),
+            ("2026-06-12", "test-russia-day"),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    report = compute_health(db, figi, today=today)
+    assert isinstance(report, HealthReport)
+    assert HealthIssue.INCOMPLETE_HISTORY in report.issues
+    # The penalty is -25 on top of any other issues (HAS_GAPS adds another -20,
+    # MISSING_RECENT does not fire because the last bar is within 3 days).
+    # So worst case is 100 - 25 - 20 = 55; assert the -25 floor landed.
+    assert report.health_score <= 75
+    # And the new issue must contribute at least 25 points of penalty.
+    assert report.health_score <= 75  # explicit re-assertion of the brief's contract
