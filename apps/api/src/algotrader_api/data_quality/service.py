@@ -1,6 +1,6 @@
 """Daily data-quality guardian orchestrator.
 
-Sequence: universe sync → health → recovery → anomalies → pipeline row.
+Sequence: universe sync → health → recovery → completeness → anomalies → pipeline row.
 
 Designed for cron at 23:00 MSK via systemd. The worker.py
 guardian mode calls `run_daily_guardian(db_path)` directly.
@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from ..db.sqlite import execute as _sqlite_exec
 from ..ingestion import universe as _universe
 from ..ingestion.backfill import BackfillRunner
+from .completeness import run_completeness_pass
 from .health import compute_all
 from .recovery import recover_stale
 
@@ -36,7 +37,7 @@ def _make_client_from_settings():
 async def run_daily_guardian(
     db_path: str, runner: BackfillRunner | None = None
 ) -> GuardianSummary:
-    """Run the daily guardian: universe sync → health → recovery → anomalies.
+    """Run the daily guardian: universe sync → health → recovery → completeness → anomalies.
 
     `runner` is provided by the caller (the systemd worker). When
     None, we build one from settings + the live broker client.
@@ -70,8 +71,31 @@ async def run_daily_guardian(
             message="figi has been failing 3+ cycles; operator investigation needed",
         )
 
-    # 5. Pipeline row. Schema (from migration 002_pipeline.sql):
+    # 5. Completeness backfill pass — chain after recovery, before
+    # the final summary row. Same `reports` dict feeds both passes;
+    # the completeness pass only acts on figis with
+    # INCOMPLETE_HISTORY, the rest are silent no-ops.
+    completeness_summary = await run_completeness_pass(
+        db_path, client, runner, reports,
+    )
+
+    # 6. Pipeline row for the completeness pass — same schema as
+    # the guardian_daily row below (migration 002_pipeline.sql):
     # id, phase, started_at, finished_at, rows_processed, status, detail.
+    _sqlite_exec(
+        db_path,
+        "INSERT INTO pipeline (phase, started_at, finished_at, rows_processed, status, detail) "
+        "VALUES ('completeness_backfill', datetime('now'), datetime('now'), ?, 'ok', ?)",
+        (
+            completeness_summary.bars_added,
+            f"examined={completeness_summary.figis_examined} "
+            f"gaps={completeness_summary.gaps_found} "
+            f"bars_added={completeness_summary.bars_added} "
+            f"exhausted={completeness_summary.exhausted}",
+        ),
+    )
+
+    # 7. Final summary pipeline row.
     _sqlite_exec(
         db_path,
         "INSERT INTO pipeline (phase, started_at, finished_at, rows_processed, status, detail) "
