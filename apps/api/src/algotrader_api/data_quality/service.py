@@ -67,15 +67,16 @@ def _acquire_guardian_lock(db_path: str) -> None:
     """Acquire the single-flight lock. Raises ``GuardianLocked`` if held.
 
     Uses a SQLite ``BEGIN IMMEDIATE`` transaction so the second
-    worker's INSERT serialises behind the first's commit — the
-    SQLITE_BUSY/SQLITE_LOCKED handling is at the connection layer
-    and surfaces as a sqlite3.OperationalError we translate to
+    worker's INSERT serialises behind the first's commit. The
+    second worker's INSERT sees the row already exists, the
+    helper detects the holder_pid mismatch, and raises
     ``GuardianLocked``.
 
     The lock row has ``CHECK (id = 1)`` and is inserted with
     ``OR IGNORE`` so re-running on a DB that already holds the
     lock from a crashed process returns no row, which we treat
-    as "locked".
+    as "locked" — a manual ``DELETE FROM guardian_lock`` clears
+    the stale sentinel.
     """
     import sqlite3
 
@@ -94,13 +95,13 @@ def _acquire_guardian_lock(db_path: str) -> None:
             con.rollback()
             raise GuardianLocked("guardian_lock row missing after INSERT")
         if row[0] != os.getpid():
-            # Row was already there from a previous (crashed?) run.
-            # Force-take it: the orchestrator body re-checks state
-            # and the worst case is a stale lock is cleared.
-            con.execute(
-                "UPDATE guardian_lock SET holder_pid = ?, started_at = datetime('now') "
-                "WHERE id = 1",
-                (os.getpid(),),
+            # Another worker holds the lock — refuse. Do NOT force-take:
+            # the holder is live (the test pre-release pattern proves
+            # this), and stealing the lock would defeat the purpose of
+            # single-flight. The concurrent worker should abort cleanly.
+            con.rollback()
+            raise GuardianLocked(
+                f"guardian lock held by pid={row[0]} since {row[1]}"
             )
         con.commit()
     except sqlite3.OperationalError as exc:
