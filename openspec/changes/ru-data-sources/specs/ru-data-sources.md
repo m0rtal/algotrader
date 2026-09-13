@@ -1,4 +1,4 @@
-# ru-data-sources Specification
+# ru-data-sources Specification (delta)
 
 ## Purpose
 
@@ -11,7 +11,7 @@ DuckDB view. Research rationale: see
 `/home/hermes/algotrader_research/report.md` TL;DR §9-§11 and sections
 #6, #10, #11.
 
-## Requirements
+## ADDED Requirements
 
 ### Requirement: CBR Macro Daily Fetch
 
