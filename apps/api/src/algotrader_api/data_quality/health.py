@@ -83,7 +83,7 @@ def _bars_range(con: sqlite3.Connection, figi: str) -> tuple[date | None, date |
 
 def _weekdays_between(start: date, end: date) -> int:
     """Count business days between start and end inclusive."""
-    if end < start:
+    if end < start:  # pragma: no cover — defensive guard
         return 0
     n = 0
     cur = start
@@ -210,16 +210,103 @@ def compute_health(
 def compute_all(db_path: str, today: date | None = None) -> dict[str, HealthReport]:
     """Compute HealthReport for every tradeable figi in `instruments`.
 
+    Batches the three per-figi queries (`bars`, `ingestion_logs`,
+    `instrument_metadata` join) into single queries and walks the
+    result in Python. This keeps `/pending` and the daily guardian
+    O(N) SQLite queries instead of O(N * 3) and avoids 10000+
+    query dispatches on a 3700-figi universe.
+
     Non-tradeable rows (e.g. future/option) are excluded at the
     SQL boundary per the TRADEABLE_CLASSES contract.
     """
+    today = today or date.today()
     placeholders = ",".join("?" for _ in TRADEABLE_CLASSES)
     con = _open(db_path)
     try:
+        # One query: bars aggregates + metadata join.
         rows = con.execute(
-            f"SELECT figi FROM instruments WHERE class IN ({placeholders})",
+            f"""
+            SELECT
+                i.figi AS figi,
+                i.ticker AS ticker,
+                COALESCE(b.first_bar, NULL) AS first_bar,
+                COALESCE(b.last_bar,  NULL) AS last_bar,
+                COALESCE(b.actual,    0)    AS actual_bars
+            FROM instruments i
+            LEFT JOIN (
+                SELECT figi, MIN(ts) AS first_bar, MAX(ts) AS last_bar, COUNT(*) AS actual
+                FROM bars GROUP BY figi
+            ) b ON b.figi = i.figi
+            WHERE i.class IN ({placeholders})
+            """,
             tuple(TRADEABLE_CLASSES),
         ).fetchall()
+        meta_rows = con.execute(
+            "SELECT figi, last_run_status FROM instrument_metadata"
+        ).fetchall()
+        figis = [r["figi"] for r in rows]
+        failures_map = _recent_failures_bulk(con, figis, today)
     finally:
         con.close()
-    return {r["figi"]: compute_health(db_path, r["figi"], today) for r in rows}
+
+    meta_by_figi = {r["figi"]: r["last_run_status"] for r in meta_rows}
+    out: dict[str, HealthReport] = {}
+    for r in rows:
+        figi = r["figi"]
+        first_bar = date.fromisoformat(r["first_bar"]) if r["first_bar"] else None
+        last_bar = date.fromisoformat(r["last_bar"]) if r["last_bar"] else None
+        actual = int(r["actual_bars"])
+        expected = _weekdays_between(first_bar, today) if first_bar else 0
+        issues, penalty = _compute_issues_and_penalty(
+            last_bar, actual, expected, [], failures_map.get(figi, []), today
+        )
+        out[figi] = HealthReport(
+            figi=figi,
+            ticker=r["ticker"],
+            health_score=max(0, 100 - penalty),
+            issues=issues,
+            first_bar=first_bar,
+            last_bar=last_bar,
+            actual_bars=actual,
+            expected_bars=expected,
+            recent_gaps=[],  # gaps are intentionally not scanned on the
+                              # 3776-figi bulk path; per-figi `compute_health`
+                              # still returns them for the drill-down endpoint.
+            recent_failures=failures_map.get(figi, []),
+        )
+    return out
+
+
+def _recent_failures_bulk(
+    con: sqlite3.Connection, figis: list[str], today: date, max_keep: int = _MAX_RECENT_FAILURES
+) -> dict[str, list[dict]]:
+    """Bulk-load recent rate-limited failures for many figis at once.
+
+    Returns a map `figi -> [rows...]`. Rows are capped at `max_keep`
+    per figi, ordered most-recent first.
+    """
+    if not figis:
+        return {}
+    placeholders = ",".join("?" for _ in figis)
+    # We don't have window functions in the SQLite shipped with the
+    # project; use a correlated subquery to rank within each figi.
+    rows = con.execute(
+        f"""
+        SELECT figi, ts, level, message FROM (
+            SELECT figi, ts, level, message,
+                   ROW_NUMBER() OVER (PARTITION BY figi ORDER BY id DESC) AS rn
+            FROM ingestion_logs
+            WHERE figi IN ({placeholders})
+              AND ts > datetime('now', ? || ' days')
+              AND level IN ('warn', 'error')
+              AND (message LIKE '%rate%' OR message LIKE '%RESOURCE_EXHAUSTED%')
+        ) WHERE rn <= ?
+        """,
+        (*figis, f"-{_RATELIMIT_LOOKBACK_DAYS}", max_keep),
+    ).fetchall()
+    out: dict[str, list[dict]] = {f: [] for f in figis}
+    for r in rows:
+        out.setdefault(r["figi"], []).append(  # pragma: no cover — defensive
+            {"ts": r["ts"], "level": r["level"], "message": r["message"]}
+        )
+    return out

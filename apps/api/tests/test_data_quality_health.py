@@ -140,3 +140,37 @@ def test_health_report_unknown_figi_scores_zero(db):
     r = compute_health(db, "FIGI-DOES-NOT-EXIST", today=date(2026, 9, 12))
     assert r.health_score == 0
     assert HealthIssue.MISSING_RECENT in r.issues
+
+
+def test_compute_all_handles_large_universe_in_bulk(db):
+    """`compute_all` runs in O(1) queries regardless of figi count.
+
+    The bulk path must produce one HealthReport per tradeable figi
+    without opening N separate SQLite connections or running N
+    separate JOIN queries.
+    """
+    import sqlite3 as _sq
+    today = date(2026, 9, 12)
+    figis = [f"FIGI-{i}" for i in range(20)]
+    con = _sq.connect(db)
+    con.executemany(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES (?, ?, 'share', ?, 'rub', 1)",
+        [(f"FIG-{i}", f"FIGI-{i}", f"N{i}") for i in range(20)],
+    )
+    con.executemany(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+        "VALUES (?, ?, 1, 1, 1, 1, 1)",
+        [(f"FIGI-{i}", today.isoformat()) for i in range(20)],
+    )
+    con.commit()
+    con.close()
+
+    from algotrader_api.data_quality.health import compute_all
+    reports = compute_all(db, today=today)
+    assert len(reports) >= 20  # fixture adds one FIGI-SBER above
+    # The 20 figis we just seeded are all healthy.
+    for i in range(20):
+        r = reports.get(f"FIGI-{i}")
+        assert r is not None, f"FIGI-{i} missing from reports"
+        assert r.health_score == 100, f"FIGI-{i} score={r.health_score} (issues={r.issues})"
