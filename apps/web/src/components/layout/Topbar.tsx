@@ -2,7 +2,6 @@ import { useUiStore } from '@stores/uiStore';
 
 export function Topbar() {
   const toggleSidebar = useUiStore((s) => s.toggleSidebar);
-  const toggleRail = useUiStore((s) => s.toggleRail);
   return (
     // Each topbar item is `whitespace-nowrap` + `shrink-0` so the
     // value never wraps or truncates inside its own pill. The flex
@@ -10,10 +9,9 @@ export function Topbar() {
     // narrower breakpoints in this priority order:
     //   ≥ sm  (≥ 640px)  : Сессия + IMOEX + Sandbox
     //   ≥ md  (≥ 768px)  : + Обновлено
-    //   ≥ lg  (≥ 1024px) : + /settings link, drawer toggles hide
     // Below sm only IMOEX stays (the most important number on a
-    // trading dashboard); the rail/settings icon stays as the
-    // anchor on the right.
+    // trading dashboard); the /settings link stays as the anchor
+    // on the right at every viewport size.
     <div className="flex items-center justify-between px-3 sm:px-5 h-12 bg-surface border-b border-border gap-2 sm:gap-4 min-w-0">
       <div className="flex items-center gap-2 sm:gap-2.5 font-semibold text-sm shrink-0">
         {/* Hamburger toggles — visible only on <lg where Sidebar/Rail
@@ -47,18 +45,9 @@ export function Topbar() {
           <span className="text-text mono">19:34 МСК</span>
         </span>
         <span className="hidden sm:inline whitespace-nowrap shrink-0">Sandbox</span>
-        <button
-          type="button"
-          onClick={toggleRail}
-          aria-label="Открыть панель модели"
-          aria-controls="dashboard-rail"
-          className="lg:hidden px-2 py-1 text-text-muted hover:text-text focus-visible:text-accent shrink-0"
-        >
-          ⚙
-        </button>
         <a
           href="/settings"
-          className="hidden lg:inline shrink-0 text-text-muted hover:text-text text-base"
+          className="shrink-0 text-text-muted hover:text-text text-base px-2 py-1 focus-visible:text-accent"
           title="Настройки"
           aria-label="Open settings"
         >
