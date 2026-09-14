@@ -87,6 +87,14 @@ class RealTinkoffClient:
             self._client = None
             self._services = None
 
+    async def __aenter__(self) -> "RealTinkoffClient":
+        # Trigger lazy open of the gRPC channel so the first RPC works.
+        await self._ensure()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
+
     async def get_accounts(self) -> list[dict]:
         services = await self._ensure()
         response = await services.users.get_accounts()

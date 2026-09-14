@@ -330,7 +330,7 @@ def _step_universe_sync(db_path: str) -> tuple[bool, str]:
         from algotrader_api.ingestion import universe as _universe  # noqa: F401
         from algotrader_api.ingestion.universe_sync import run_universe_sync
 
-        client = client_mod.make_client(sqlite_path=db_path, use_fake=True)
+        client = client_mod.make_client(sqlite_path=db_path, )
         rows = asyncio.run(run_universe_sync(db_path, client))
         return True, f"universe: {rows} instruments synced from broker"
     except Exception as exc:  # noqa: BLE001
@@ -348,7 +348,7 @@ def _step_daily_backfill(db_path: str) -> tuple[bool, str]:
     try:
         from algotrader_api.ingestion.backfill import BackfillRunner
 
-        client = client_mod.make_client(sqlite_path=db_path, use_fake=True)
+        client = client_mod.make_client(sqlite_path=db_path, )
         runner = BackfillRunner(client=client, db_path=db_path,
                                 event_sink=_async_noop_sink)
         asyncio.run(runner.run(history_years=0,
@@ -372,7 +372,7 @@ def _step_full_history(db_path: str) -> tuple[bool, str]:
     try:
         from algotrader_api.ingestion.backfill import BackfillRunner
 
-        client = client_mod.make_client(sqlite_path=db_path, use_fake=True)
+        client = client_mod.make_client(sqlite_path=db_path, )
         runner = BackfillRunner(client=client, db_path=db_path,
                                 event_sink=_async_noop_sink)
         count = asyncio.run(runner.run_full_history())
@@ -390,7 +390,7 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
         )
         from algotrader_api.ingestion.backfill import BackfillRunner
 
-        client = client_mod.make_client(sqlite_path=db_path, use_fake=True)
+        client = client_mod.make_client(sqlite_path=db_path, )
         runner = BackfillRunner(client=client, db_path=db_path,
                                 event_sink=_async_noop_sink)
         gaps = find_gaps(db_path)
@@ -443,7 +443,7 @@ def _step_dividends(db_path: str) -> tuple[bool, str]:
         from algotrader_api.dividends.freshness import (
             dividends_freshness_check,
         )
-        client = client_mod.make_client(sqlite_path=db_path, use_fake=True)
+        client = client_mod.make_client(sqlite_path=db_path)
         written = fetch_and_persist(db_path, client=client)
         if written == 0:
             dividends_freshness_check(db_path, stale_threshold_days=7)
