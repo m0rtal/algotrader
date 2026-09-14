@@ -131,7 +131,9 @@ echo "[auto_merge] merging PR #${PR_NUMBER}" >&2
 gh pr merge "${PR_NUMBER}" \
   --repo "${REPO}" \
   --admin \
-  --squash
+  --squash \
+  --delete-branch-remote \
+  --body "Auto-merged by algotrader-issue-resolver cron ($(date -Iseconds))."
 
 # --- Step 4 (Phase 0.5): close issues referenced via Closes/Fixes/Resolves ---
 #

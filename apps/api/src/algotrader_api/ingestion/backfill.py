@@ -237,6 +237,108 @@ class BackfillRunner:
             },
         )
 
+    # ─── full-history walk ────────────────────────────────────────────
+
+    async def run_full_history(
+        self,
+        *,
+        from_offset_days: int = 30,
+        limit_to: list[str] | None = None,
+    ) -> int:
+        """Walk every tradeable figi from ``first_bar_ts - from_offset_days``
+        to ``yesterday``, restricted-period-aware, idempotent.
+
+        Returns the count of figis processed (not the count of bars
+        written — ``_backfill_one`` handles per-ticker bar counts).
+
+        Algorithm:
+        1. List instruments via ``self._list_instruments(limit_to=limit_to)``.
+        2. For each instrument:
+           - Query ``MIN(ts)`` for the figi from ``bars`` (or ``None``
+             if 0 bars).
+           - If 0 bars: skip (nothing to anchor on; operator triggers
+             manual import via the Data tab).
+           - Otherwise: ``from_ = min_ts - from_offset_days``;
+             ``to_ = today - 1d``.
+           - Call ``self._backfill_one(figi=figi, ticker=ticker,
+             from_=from_, to_=to_)``.
+           - Increment ``self.tickers_done``.
+
+        Restricted periods are handled INSIDE ``_backfill_one`` (existing
+        behavior — it skips them). Do NOT add restricted-period logic
+        here; that would be double-counting.
+        """
+        self._stop_flag.clear()
+        today = date.today()
+        to_ = today - timedelta(days=1)
+        instruments = self._list_instruments(limit_to=limit_to)
+        # Reset per-run counters so a follow-up full-history call
+        # reflects only the most recent walk.
+        with self._lock:
+            self.tickers_done = 0
+            self.tickers_total = len(instruments)
+        await self._emit(
+            "status",
+            {"state": BackfillState.BACKFILLING.value, "tickers_total": len(instruments)},
+        )
+        processed = 0
+        for inst in instruments:
+            if self._stop_flag.is_set():
+                break
+            figi = inst["figi"]
+            ticker = inst.get("ticker")
+            # Query min(ts) for this figi from bars. None = no rows.
+            con = sqlite3.connect(self.db_path)
+            try:
+                row = con.execute(
+                    "SELECT MIN(ts) FROM bars WHERE figi = ?",
+                    (figi,),
+                ).fetchone()
+            finally:
+                con.close()
+            min_ts_str = row[0] if row and row[0] else None
+            if min_ts_str is None:
+                # Nothing to anchor on; operator triggers manual import.
+                await self._log(
+                    "info",
+                    figi=figi,
+                    message="full-history: skipped (no bars in DB)",
+                )
+                continue
+            try:
+                min_ts = date.fromisoformat(str(min_ts_str)[:10])
+            except (TypeError, ValueError):  # pragma: no cover — defensive
+                await self._log(
+                    "warn",
+                    figi=figi,
+                    message=f"full-history: invalid min ts {min_ts_str!r}",
+                )
+                continue
+            from_ = min_ts - timedelta(days=from_offset_days)
+            try:
+                bars_written = await self._backfill_one(
+                    figi=figi, ticker=ticker, from_=from_, to=to_
+                )
+                self.total_bars += bars_written
+            except Exception as e:  # noqa: BLE001 — defensive; per-ticker errors are logged inside _backfill_one  # pragma: no cover
+                await self._log("error", figi=figi, message=f"full-history unhandled: {e}")
+            self.tickers_done += 1
+            processed += 1
+        with self._lock:
+            self.state = (
+                BackfillState.IDLE if self._stop_flag.is_set() else BackfillState.DONE
+            )
+        await self._emit(
+            "done",
+            {
+                "tickers_done": self.tickers_done,
+                "tickers_total": self.tickers_total,
+                "total_bars": self.total_bars,
+                "status": "stopped" if self._stop_flag.is_set() else "ok",
+            },
+        )
+        return processed
+
     # ─── universe discovery ──────────────────────────────────────────
 
     async def _discover_universe(self) -> int:

@@ -273,8 +273,11 @@ _DAILY_CHAIN_PHASES = (
     "migrations",
     "universe_sync",
     "daily_backfill",
+    "full_history",
+    "gap_recovery",
     "corporate_actions",
     "dividends",
+    "freshness_check",
     "guardian",
 )
 
@@ -339,9 +342,7 @@ def _step_daily_backfill(db_path: str) -> tuple[bool, str]:
 
     Pre/post bars_count assertion: if the runner returns without
     adding bars (rate-limit, dead ticker, broker hiccup), the
-    assertion fails and the chain aborts. This closes the silent-
-    skip hole where the previous no-op returned True while 0 bars
-    were written.
+    assertion fails and the chain aborts.
     """
     pre_count = snapshot_bars_count(db_path)
     try:
@@ -350,63 +351,125 @@ def _step_daily_backfill(db_path: str) -> tuple[bool, str]:
         client = client_mod.make_client(sqlite_path=db_path, use_fake=True)
         runner = BackfillRunner(client=client, db_path=db_path,
                                 event_sink=_async_noop_sink)
-        asyncio.run(runner.run(
-            history_years=0,  # incremental only
-            incremental_threshold_days=1,  # only figis whose last
-                                           # bar is older than today
-        ))
+        asyncio.run(runner.run(history_years=0,
+                               incremental_threshold_days=1))
         pre, post, delta = assert_bars_increased(
             db_path, phase="daily_backfill", pre_count=pre_count,
         )
         return True, f"daily backfill: pre={pre} post={post} delta=+{delta}"
     except AssertionError as exc:
         return False, str(exc)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return False, f"daily backfill failed: {exc}"
 
 
-def _step_corporate_actions(db_path: str) -> tuple[bool, str]:
-    """Re-run split derivation against the freshly-updated bars."""
+def _step_full_history(db_path: str) -> tuple[bool, str]:
+    """Walk every figi from first_bar_ts-30d to yesterday.
+
+    Idempotent. The existing recover_stale logic in the guardian
+    handles what this can't (tickers with no bars at all).
+    """
     try:
-        # Late binding to avoid circular import via scripts_import.__init__.
+        from algotrader_api.ingestion.backfill import BackfillRunner
+
+        client = client_mod.make_client(sqlite_path=db_path, use_fake=True)
+        runner = BackfillRunner(client=client, db_path=db_path,
+                                event_sink=_async_noop_sink)
+        count = asyncio.run(runner.run_full_history())
+        return True, f"full history: {count} figis processed"
+    except Exception as exc:
+        return False, f"full history failed: {exc}"
+
+
+def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
+    """Detect missing trading days per figi and fill them via
+    BackfillRunner._backfill_one with explicit from_/to_."""
+    try:
+        from algotrader_api.data_quality.gap_recovery import (
+            find_gaps, recover_gaps,
+        )
+        from algotrader_api.ingestion.backfill import BackfillRunner
+
+        client = client_mod.make_client(sqlite_path=db_path, use_fake=True)
+        runner = BackfillRunner(client=client, db_path=db_path,
+                                event_sink=_async_noop_sink)
+        gaps = find_gaps(db_path)
+        if not gaps:
+            return True, "gap recovery: no gaps"
+        result = recover_gaps(db_path, runner, gaps)
+        return True, (
+            f"gap recovery: {sum(result.values())} bars filled "
+            f"across {len(gaps)} gaps"
+        )
+    except Exception as exc:
+        return False, f"gap recovery failed: {exc}"
+
+
+def _step_corporate_actions(db_path: str) -> tuple[bool, str]:
+    """Re-run split derivation against the freshly-updated bars,
+    then apply_all_pending to forward-adjust bars."""
+    try:
         import importlib
+        import sqlite3
         derive_splits = importlib.import_module(
             "algotrader_api.scripts_import.derive_splits"
         )
+        from algotrader_api.data_quality.forward_adjustment import (
+            apply_all_pending,
+        )
         written = derive_splits.run_derivation(db_path)
-        return True, f"splits derived: {written}"
-    except Exception as exc:  # noqa: BLE001
+        conn = sqlite3.connect(db_path)
+        try:
+            adjusted = apply_all_pending(conn)
+        finally:
+            conn.close()
+        return True, f"splits derived={written} bars adjusted={adjusted}"
+    except Exception as exc:
         return False, f"corporate actions failed: {exc}"
 
 
 def _step_dividends(db_path: str) -> tuple[bool, str]:
-    """Refresh dividends from Tinkoff + MOEX ISS. Both importers are
-    optional — if not configured, skip without error."""
+    """Fetch and persist dividends from the Tinkoff investAPI.
+
+    Aborts the chain when 0 rows land AND the table is empty or
+    stale. Returns (True, detail) when 0 new rows land but recent
+    data is present.
+    """
     try:
-        tinkoff_count = 0
-        moex_count = 0
-        try:
-            import importlib
-            mod = importlib.import_module(
-                "algotrader_api.scripts_import.import_corporate_actions_tinkoff"
-            )
-            if hasattr(mod, "import_dividends"):
-                tinkoff_count = mod.import_dividends(db_path)
-        except Exception:
-            pass
-
-        try:
-            mod = importlib.import_module(
-                "algotrader_api.scripts_import.import_corporate_actions_moex"
-            )
-            if hasattr(mod, "import_dividends"):
-                moex_count = mod.import_dividends(db_path)
-        except Exception:
-            pass
-
-        return True, f"dividends: tinkoff={tinkoff_count}, moex={moex_count}"
-    except Exception as exc:  # noqa: BLE001
+        from algotrader_api.scripts_import.import_dividends_tinkoff import (
+            fetch_and_persist,
+        )
+        from algotrader_api.dividends.freshness import (
+            dividends_freshness_check,
+        )
+        client = client_mod.make_client(sqlite_path=db_path, use_fake=True)
+        written = fetch_and_persist(db_path, client=client)
+        if written == 0:
+            dividends_freshness_check(db_path, stale_threshold_days=7)
+        return True, f"dividends: tinkoff={written} (no new)"
+    except AssertionError as exc:
+        return False, f"dividends stale: {exc}"
+    except Exception as exc:
         return False, f"dividends failed: {exc}"
+
+
+def _step_freshness_check(db_path: str) -> tuple[bool, str]:
+    """Pipeline-level freshness assertion across all data domains.
+
+    Raises if the most-recent chain run is older than 24h AND any
+    domain is stale. The cron is daily; this is a sanity gate for
+    operator awareness.
+    """
+    try:
+        from algotrader_api.dividends.freshness import (
+            pipeline_freshness_check,
+        )
+        pipeline_freshness_check(db_path, max_chain_age_hours=24)
+        return True, "freshness: ok"
+    except AssertionError as exc:
+        return False, f"freshness: {exc}"
+    except Exception as exc:
+        return False, f"freshness failed: {exc}"
 
 
 def _step_guardian(db_path: str) -> tuple[bool, str]:
@@ -427,8 +490,11 @@ _STEP_FUNCS = {
     "migrations": _step_migrations,
     "universe_sync": _step_universe_sync,
     "daily_backfill": _step_daily_backfill,
+    "full_history": _step_full_history,
+    "gap_recovery": _step_gap_recovery,
     "corporate_actions": _step_corporate_actions,
     "dividends": _step_dividends,
+    "freshness_check": _step_freshness_check,
     "guardian": _step_guardian,
 }
 
