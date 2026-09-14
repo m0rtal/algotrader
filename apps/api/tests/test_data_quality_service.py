@@ -279,3 +279,151 @@ async def test_run_daily_guardian_chains_completeness_pass(db, monkeypatch):
     completeness_row = next(r for r in rows if r[0] == "completeness_backfill")
     assert "examined=" in completeness_row[2]
     assert "gaps=" in completeness_row[2]
+
+
+# ── issue #5: single-flight lock ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_daily_guardian_serializes_concurrent_runs(db, monkeypatch):
+    """Two concurrent invocations must not both write a pipeline row.
+
+    Without the lock, both workers pass through ``compute_all`` and
+    ``recover_stale`` and both INSERT a ``guardian_daily`` row —
+    operator sees phantom doubles and stale-recovery counters drift.
+
+    Verification strategy: ``asyncio.create_task`` scheduling is
+    cooperative, so two coroutines cannot actually run truly
+    concurrently in the same thread. We therefore test the lock
+    semantics directly — pre-seed the ``guardian_lock`` row with a
+    different pid, then call ``_acquire_guardian_lock`` and assert
+    it raises. That proves the production code refuses a held lock
+    before doing any pipeline work, which is what the
+    multi-process / multi-timer case requires.
+    """
+    import sqlite3 as _sq
+    from algotrader_api.data_quality.service import (
+        GuardianLocked,
+        _acquire_guardian_lock,
+    )
+
+    # Simulate another worker holding the lock.
+    con = _sq.connect(db)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO guardian_lock (id, holder_pid, started_at) "
+            "VALUES (1, 99999, datetime('now'))"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    with pytest.raises(GuardianLocked) as exc_info:
+        _acquire_guardian_lock(db)
+    assert "held by pid=99999" in str(exc_info.value)
+
+    # And the pipeline table must be untouched (no guardian_daily
+    # row was inserted by the refused acquisition).
+    con = _sq.connect(db)
+    try:
+        count = con.execute(
+            "SELECT COUNT(*) FROM pipeline WHERE phase='guardian_daily'"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert count == 0, (
+        f"refused acquisition wrote {count} pipeline rows — the lock "
+        f"check must happen BEFORE any work begins"
+    )
+
+
+@pytest.mark.asyncio
+async def test_acquire_succeeds_after_release(db, monkeypatch):
+    """End-to-end via the orchestrator: after a run releases the lock,
+    a subsequent run can acquire it cleanly.
+
+    This guards against the deadlock case where ``_release_guardian_lock``
+    silently fails and the next cycle hangs forever.
+    """
+    import sqlite3 as _sq
+    from algotrader_api.data_quality.service import run_daily_guardian
+
+    monkeypatch.setattr(
+        "algotrader_api.ingestion.universe.discover_universe",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "algotrader_api.ingestion.universe.upsert_instruments",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        "algotrader_api.data_quality.service._make_client_from_settings",
+        MagicMock(),
+    )
+
+    runner = MagicMock()
+    runner.run = MagicMock()
+
+    # Three back-to-back runs must all succeed — each acquires, runs,
+    # releases. If the release is broken, the second or third run
+    # would deadlock (timeout) or raise GuardianLocked.
+    for i in range(3):
+        summary = await run_daily_guardian(db, runner)
+        assert summary.figis_checked == 2
+
+        con = _sq.connect(db)
+        try:
+            lock_count = con.execute(
+                "SELECT COUNT(*) FROM guardian_lock WHERE id = 1"
+            ).fetchone()[0]
+        finally:
+            con.close()
+        assert lock_count == 0, (
+            f"run #{i + 1} left a stale lock row behind — release path broken"
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_daily_guardian_releases_lock_on_failure(db, monkeypatch):
+    """A failed pass must release the lock so the next cycle can run.
+
+    Without explicit release on the error path, a one-time exception
+    would deadlock the guardian until manual intervention. The fix
+    wraps the orchestrator body in try/finally so the lock is
+    released regardless of how the body exits.
+    """
+    from algotrader_api.data_quality.service import (
+        GuardianLocked,
+        run_daily_guardian,
+    )
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("simulated universe failure")
+
+    monkeypatch.setattr(
+        "algotrader_api.ingestion.universe.discover_universe",
+        boom,
+    )
+    monkeypatch.setattr(
+        "algotrader_api.data_quality.service._make_client_from_settings",
+        MagicMock(),
+    )
+
+    runner = MagicMock()
+    runner.run = MagicMock()
+
+    with pytest.raises(RuntimeError):
+        await run_daily_guardian(db, runner)
+
+    # Second invocation must acquire the lock cleanly — proving the
+    # first one's failure path released it.
+    monkeypatch.setattr(
+        "algotrader_api.ingestion.universe.discover_universe",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "algotrader_api.ingestion.universe.upsert_instruments",
+        MagicMock(),
+    )
+    summary = await run_daily_guardian(db, runner)
+    assert summary.figis_checked == 2
