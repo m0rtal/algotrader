@@ -232,3 +232,61 @@ async def test_run_emits_done_event_with_status_ok(tmp_path):
     done_events = [e for e in events if e.type == "done"]
     assert done_events
     assert done_events[0].payload["status"] == "ok"
+
+@pytest.mark.asyncio
+async def test_run_processes_figis_in_parallel(tmp_path):
+    """BackfillRunner should process multiple figis concurrently.
+
+    With concurrency, total wall time for N figis × sleep(S) should be
+    much less than N × S. If backfill is purely sequential the test
+    fails the timing assertion.
+    """
+    import time
+
+    db = tmp_path / "state.db"
+    _seed_migrations(db, _migrations_dir())
+    _seed_instruments(db)
+    # Add more instruments for the parallelism to matter
+    con = sqlite3.connect(str(db))
+    for i in range(3, 11):  # BBG003..BBG010 = 10 figis total (SBER, GAZP + 8)
+        con.execute(
+            "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) VALUES (?, ?, ?, ?, ?, ?)",
+            (f"T{i}", f"BBG{i:03d}", "share", f"T{i}", "RUB", 1),
+        )
+    con.commit()
+    con.close()
+
+    sleep_per_call = 0.5  # seconds
+
+    class _SlowClient:
+        async def get_shares(self):
+            return [{"figi": "BBG001", "ticker": "SBER", "class": "share", "name": "Sber"}]
+
+        async def get_bonds(self): return []
+        async def get_etfs(self): return []
+        async def get_futures(self): return []
+        async def get_options(self): return []
+
+        async def get_candles(self, **kw):
+            await asyncio.sleep(sleep_per_call)
+            return [{"ts": (date.today() - timedelta(days=1)).isoformat(),
+                     "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}]
+
+        async def aclose(self):
+            pass
+
+    async def _sink(ev):
+        pass
+
+    runner = BackfillRunner(client=_SlowClient(), db_path=str(db), event_sink=_sink)
+
+    start = time.time()
+    await runner.run(history_years=0, incremental_threshold_days=1)
+    elapsed = time.time() - start
+
+    # With concurrency (semaphore=10), 10 figis * 0.5s should finish in well
+    # under 5s (vs 5s+ sequential). Generous bound.
+    assert elapsed < 4.0, (
+        f"backfill took {elapsed:.1f}s for 10 figis × 0.5s each — "
+        f"appears sequential. Expected <4s with concurrency."
+    )

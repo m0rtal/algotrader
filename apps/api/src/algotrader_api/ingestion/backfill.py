@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
+import asyncio
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -188,10 +189,18 @@ class BackfillRunner:
             self.state = BackfillState.BACKFILLING
 
         instruments = self._list_instruments(limit_to=limit_to)
-        for inst in instruments:
-            if self._stop_flag.is_set():
-                break
+
+        # Parallelize broker calls. Tinkoff allows 600 req/min per token;
+        # use a semaphore of 10 to stay well under the limit while
+        # collapsing ~25min wall time on 3809 figis down to ~3min.
+        # Metadata lookups stay serial (cheap sqlite queries).
+        parallel_limit = 10
+        sem = asyncio.Semaphore(parallel_limit)
+
+        async def _backfill_one_bounded(inst: dict) -> tuple[str, int, str | None]:
+            """Run _backfill_one inside the semaphore. Returns (figi, bars, err)."""
             figi = inst["figi"]
+            ticker = inst.get("ticker")
             metadata = self._get_metadata(figi)
             strategy, from_, to = decide_strategy(
                 metadata_row=metadata,
@@ -200,26 +209,35 @@ class BackfillRunner:
                 incremental_threshold_days=incremental_threshold_days,
             )
             if strategy == "skip":
-                self.tickers_done += 1
                 await self._emit(
                     "ticker_progress",
                     {
                         "figi": figi,
-                        "ticker": inst.get("ticker"),
+                        "ticker": ticker,
                         "status": "skipped",
                         "bars_written": 0,
                     },
                 )
-                continue
-            try:
-                bars_written = await self._backfill_one(
-                    figi=figi, ticker=inst.get("ticker"), from_=from_, to=to
-                )
-                self.tickers_done += 1
-                self.total_bars += bars_written
-            except Exception as e:  # noqa: BLE001 — defensive, never abort  # pragma: no cover — per-ticker exceptions only fire during live run
-                # Per-ticker errors are already logged in _backfill_one.
-                await self._log("error", figi=figi, message=f"unhandled: {e}")
+                return (figi, 0, None)
+            async with sem:
+                if self._stop_flag.is_set():
+                    return (figi, 0, None)
+                try:
+                    bars = await self._backfill_one(
+                        figi=figi, ticker=ticker, from_=from_, to=to
+                    )
+                    return (figi, bars, None)
+                except Exception as e:  # noqa: BLE001
+                    await self._log("error", figi=figi, message=f"unhandled: {e}")
+                    return (figi, 0, str(e))
+
+        results = await asyncio.gather(
+            *[_backfill_one_bounded(inst) for inst in instruments],
+            return_exceptions=False,
+        )
+        for figi, bars, _err in results:
+            self.tickers_done += 1
+            self.total_bars += bars
 
         # Step 3: finished.
         final_state = BackfillState.DONE
