@@ -1,7 +1,8 @@
 -- Forward-adjustment bars. Replaces the legacy backward-adjustment VIEW
 -- with a TABLE that is precomputed when a split lands (see
 -- data_quality/forward_adjustment.py).
-DROP VIEW IF EXISTS bars_adjusted;
+DROP VIEW  IF EXISTS bars_adjusted;
+DROP TABLE IF EXISTS bars_adjusted;
 CREATE TABLE bars_adjusted (
     figi        TEXT    NOT NULL,
     ts          TEXT    NOT NULL,                 -- YYYY-MM-DD
