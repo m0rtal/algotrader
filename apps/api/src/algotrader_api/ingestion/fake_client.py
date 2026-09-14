@@ -27,9 +27,11 @@ class _Storage:
     futures: list[dict] = field(default_factory=list)
     options: list[dict] = field(default_factory=list)
     candles_by_figi: dict[str, list[dict]] = field(default_factory=dict)
+    dividends_by_figi: dict[str, list[dict]] = field(default_factory=dict)
     calls: dict[str, list[tuple]] = field(default_factory=lambda: {
         "get_accounts": [], "get_shares": [], "get_bonds": [], "get_etfs": [],
         "get_futures": [], "get_options": [], "get_candles": [],
+        "get_dividends": [],
     })
     closed: bool = False
     # Per-method call counters for rate-limit assertions
@@ -75,6 +77,10 @@ class InMemoryTinkoffClient:
     def set_candles(self, figi: str, candles: list[dict]) -> None:
         with self._lock:
             self._storage.candles_by_figi[figi] = list(candles)
+
+    def set_dividends(self, figi: str, dividends: list[dict]) -> None:
+        with self._lock:
+            self._storage.dividends_by_figi[figi] = list(dividends)
 
     # ─── TinkoffClient interface ──────────────────────────────────────
     async def get_accounts(self) -> list[dict]:
@@ -142,6 +148,20 @@ class InMemoryTinkoffClient:
         # Filter by date range to mirror real Tinkoff API behavior.
         # Candles with ts < date_from or ts > date_to are excluded.
         return [c for c in all_candles if date_from <= c["ts"] <= date_to]
+
+    async def get_dividends(
+        self,
+        figi: str,
+        from_: Any,
+        to: Any,
+    ) -> list[dict]:
+        with self._lock:
+            self._storage.calls["get_dividends"].append((figi, from_, to))
+            self._storage.call_counts["get_dividends"] = (
+                self._storage.call_counts.get("get_dividends", 0) + 1
+            )
+            rows = list(self._storage.dividends_by_figi.get(figi, []))
+        return rows
 
     async def aclose(self) -> None:
         with self._lock:

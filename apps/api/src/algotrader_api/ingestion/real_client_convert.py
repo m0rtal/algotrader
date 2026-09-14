@@ -108,6 +108,72 @@ def _acct_to_dict(a: Any) -> dict:
     }
 
 
+def _dividend_to_dict(d: Any, *, figi: str = "") -> dict:
+    """Convert one t-tech ``Dividend`` (or pre-converted dict) to a flat dict.
+
+    There is no ``dividend_id`` field on the protobuf; the natural key for a
+    dividend event is ``(figi, last_buy_date)``. The wrapper passes the figi
+    in via the kwarg; the unit-test path can leave it empty and override
+    ``dividend_id`` itself.
+
+    MoneyValue/Quotation have ``.units`` (int64) and ``.nano`` (int32);
+    total = units + nano / 1e9.
+
+    Dates are normalised to ``YYYY-MM-DD`` strings; the original datetimes
+    are preserved as ISO 8601 under ``declared_at`` and ``created_at``.
+    """
+    # Accept either the raw dataclass or a pre-converted dict.
+    last_buy_date = getattr(d, "last_buy_date", None)
+    payment_date = getattr(d, "payment_date", None)
+    record_date = getattr(d, "record_date", None)
+    declared_date = getattr(d, "declared_date", None)
+    created_at = getattr(d, "created_at", None)
+    dividend_net = getattr(d, "dividend_net", None)
+    close_price = getattr(d, "close_price", None)
+    yield_value = getattr(d, "yield_value", None)
+
+    def _money_field(m: Any) -> float:
+        if m is None:
+            return 0.0
+        if isinstance(m, dict):
+            return float(m.get("units", 0)) + float(m.get("nano", 0)) / 1e9
+        units = getattr(m, "units", 0)
+        nano = getattr(m, "nano", 0)
+        return float(units) + float(nano) / 1e9
+
+    def _to_iso_date(dd: Any) -> str:
+        if dd is None:
+            return ""
+        if hasattr(dd, "date"):
+            return dd.date().isoformat()
+        if hasattr(dd, "year") and hasattr(dd, "month") and hasattr(dd, "day"):
+            return f"{dd.year:04d}-{dd.month:02d}-{dd.day:02d}"
+        return str(dd)
+
+    def _to_iso_ts(dd: Any) -> str:
+        if dd is None:
+            return ""
+        if hasattr(dd, "isoformat"):
+            return dd.isoformat()
+        return str(dd)
+
+    return {
+        "figi": figi,
+        "dividend_id": f"{figi}:{_to_iso_date(last_buy_date)}",
+        "ex_date": _to_iso_date(last_buy_date),
+        "pay_date": _to_iso_date(payment_date),
+        "record_date": _to_iso_date(record_date),
+        "declared_at": _to_iso_ts(declared_date),
+        "currency": "rub",  # sandbox is RUB-only; production can override later
+        "amount_per_share": _money_field(dividend_net),
+        "close_price": _money_field(close_price),
+        "yield_value": _money_field(yield_value),
+        "dividend_type": getattr(d, "dividend_type", "") or "",
+        "regularity": getattr(d, "regularity", "") or "",
+        "created_at": _to_iso_ts(created_at),
+    }
+
+
 def _candle_to_dict(c: Any) -> dict:
     """Convert one gRPC candle (or pre-converted dict) to a parquet row.
 

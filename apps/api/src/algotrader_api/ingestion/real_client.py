@@ -37,6 +37,7 @@ from .real_client_convert import (
     _acct_to_dict,
     _bond_to_dict,
     _candle_to_dict,
+    _dividend_to_dict,
     _etf_to_dict,
     _future_to_dict,
     _option_to_dict,
@@ -161,3 +162,27 @@ class RealTinkoffClient:
             interval=interval_enum,
         )
         return [_candle_to_dict(c) for c in response.candles]
+
+    async def get_dividends(
+        self,
+        figi: str,
+        from_: Any,
+        to: Any,
+    ) -> list[dict]:
+        """Fetch dividend events for ``figi`` between ``from_`` and ``to``.
+
+        Thin wrapper around ``InstrumentsService.get_dividends``; the SDK
+        takes the figi, an optional date range and an optional
+        ``instrument_id`` and returns ``GetDividendsResponse(dividends=[...])``.
+        We pass the figi as both ``figi`` and ``instrument_id`` because the
+        proto accepts either and the SDK has been observed to return empty
+        when only one is supplied on some sandbox builds.
+        """
+        services = await self._ensure()
+        response = await services.instruments.get_dividends(
+            figi=figi,
+            from_=_to_datetime(from_),
+            to=_to_datetime(to),
+            instrument_id=figi,
+        )
+        return [_dividend_to_dict(d, figi=figi) for d in response.dividends]
