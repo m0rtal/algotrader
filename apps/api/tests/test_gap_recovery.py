@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 
+import asyncio
+
 import pytest
 
 from algotrader_api.data_quality.gap_recovery import (
@@ -159,17 +161,17 @@ def test_find_gaps_skips_figis_with_zero_bars(db):
 
 @dataclass
 class FakeRunner:
-    """Duck-typed runner for recover_gaps — records every run_one call."""
+    """Duck-typed runner for recover_gaps — records every _backfill_one call."""
     calls: list[tuple[str, str, date, date]] = field(default_factory=list)
     return_value: int = 7  # bars_added reported on each call
 
-    def run_one(self, figi: str, ticker: str, from_: date, to_: date) -> int:
-        self.calls.append((figi, ticker, from_, to_))
+    async def _backfill_one(self, *, figi: str, ticker: str | None, from_: date, to: date) -> int:
+        self.calls.append((figi, ticker, from_, to))
         return self.return_value
 
 
 def test_recover_gaps_calls_runner_for_each_gap(db):
-    """recover_gaps calls run_one once per gap with correct args; sums bars_added."""
+    """recover_gaps calls _backfill_one once per gap with correct args; sums bars_added."""
     figi_a = "FIGI-A"
     figi_b = "FIGI-B"
     cur = get_connection(db).cursor()
@@ -187,9 +189,9 @@ def test_recover_gaps_calls_runner_for_each_gap(db):
         BarGap(figi=figi_b, from_=date(2024, 3, 12), to_=date(2024, 3, 12)),
     ]
 
-    added = recover_gaps(db, runner, gaps)
+    added = asyncio.run(recover_gaps(db, runner, gaps))
 
-    # One run_one call per gap, with ticker resolved from instruments.
+    # One _backfill_one call per gap, with ticker resolved from instruments.
     assert runner.calls == [
         (figi_a, "AAA", date(2024, 3, 5), date(2024, 3, 7)),
         (figi_b, "BBB", date(2024, 3, 12), date(2024, 3, 12)),
@@ -201,5 +203,5 @@ def test_recover_gaps_calls_runner_for_each_gap(db):
 def test_recover_gaps_empty_list_returns_empty_dict(db):
     """recover_gaps([]) -> {} and no runner calls."""
     runner = FakeRunner()
-    assert recover_gaps(db, runner, []) == {}
+    assert asyncio.run(recover_gaps(db, runner, [])) == {}
     assert runner.calls == []
