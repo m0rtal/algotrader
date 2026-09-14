@@ -37,8 +37,18 @@ from algotrader_api.ingestion import (  # noqa: E402
 )
 from algotrader_api.observability.logging import get_logger, setup_logging  # noqa: E402
 from algotrader_api.observability.tracing import setup_tracing, shutdown_tracing  # noqa: E402
+from algotrader_api.pipeline.assertions import (
+    assert_bars_increased,
+    snapshot_bars_count,
+)
+from algotrader_api.ingestion.backfill import BackfillRunner  # noqa: E402,F401
 
 logger = get_logger("algotrader_api.worker")
+
+
+async def _async_noop_sink(_event) -> None:
+    """No-op EventSink for the daily-chain BackfillRunner (drops events)."""
+    return None
 
 
 async def run_worker(mode: str) -> int:
@@ -308,78 +318,49 @@ def _step_migrations(db_path: str) -> tuple[bool, str]:
 
 
 def _step_universe_sync(db_path: str) -> tuple[bool, str]:
-    """Count instruments — actual broker sync is triggered manually via
-    the Data tab when broker connectivity is available."""
+    """Real universe sync: discover tradeable instruments via broker
+    and upsert into SQLite. The Data tab still offers a manual sync
+    button for operator-triggered runs; the cron path uses the
+    broker client configured in secrets.
+    """
     try:
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        try:
-            n = conn.execute("SELECT COUNT(*) FROM instruments").fetchone()[0]
-        finally:
-            conn.close()
-        return True, f"universe: {n} instruments (sync via Data tab)"
+        from algotrader_api.ingestion import universe as _universe  # noqa: F401
+        from algotrader_api.ingestion.universe_sync import run_universe_sync
+
+        client = client_mod.make_client(sqlite_path=db_path, use_fake=True)
+        rows = asyncio.run(run_universe_sync(db_path, client))
+        return True, f"universe: {rows} instruments synced from broker"
     except Exception as exc:  # noqa: BLE001
         return False, f"universe sync failed: {exc}"
 
 
-class _NoopEventSink:
-    """Minimal no-op EventSink for BackfillRunner — discards events."""
-
-    async def emit(self, event_type: str, payload: dict) -> None:  # noqa: D401
-        return None
-
-
 def _step_daily_backfill(db_path: str) -> tuple[bool, str]:
-    """Append yesterday's bars for every tradeable figi.
+    """Append today's bar for every tradeable figi via BackfillRunner.
 
-    If the broker token is not configured, this step is a no-op success
-    — the chain must not abort just because no broker connectivity is
-    available right now.
+    Pre/post bars_count assertion: if the runner returns without
+    adding bars (rate-limit, dead ticker, broker hiccup), the
+    assertion fails and the chain aborts. This closes the silent-
+    skip hole where the previous no-op returned True while 0 bars
+    were written.
     """
+    pre_count = snapshot_bars_count(db_path)
     try:
-        from datetime import date, timedelta
-        import sqlite3
-
         from algotrader_api.ingestion.backfill import BackfillRunner
 
-        token = ""
-        try:
-            conn = sqlite3.connect(db_path)
-            try:
-                row = conn.execute(
-                    "SELECT value FROM secrets WHERE key='tinkoff_token'"
-                ).fetchone()
-            finally:
-                conn.close()
-            if row:
-                token = row[0]
-        except sqlite3.OperationalError:
-            pass
-
-        if not token:
-            return True, "daily backfill: skipped (no broker token in secrets)"
-
-        from algotrader_api.ingestion import client as client_mod
-
-        if not hasattr(client_mod, "RealTinkoffClient"):
-            return True, "daily backfill: skipped (tinkoff SDK not installed)"
-
-        client = client_mod.RealTinkoffClient(token=token)
-        sink = _NoopEventSink()
-        runner = BackfillRunner(client=client, db_path=db_path, event_sink=sink)
-
-        today = date.today()
-        conn = sqlite3.connect(db_path)
-        try:
-            stale_figis = conn.execute(
-                "SELECT figi FROM bars GROUP BY figi HAVING MAX(ts) < ?",
-                ((today - timedelta(days=4)).isoformat(),),
-            ).fetchall()
-        finally:
-            conn.close()
-
-        asyncio.run(runner.run(history_years=0))  # 0 = only incremental
-        return True, f"daily backfill: {len(stale_figis)} stale figis processed"
+        client = client_mod.make_client(sqlite_path=db_path, use_fake=True)
+        runner = BackfillRunner(client=client, db_path=db_path,
+                                event_sink=_async_noop_sink)
+        asyncio.run(runner.run(
+            history_years=0,  # incremental only
+            incremental_threshold_days=1,  # only figis whose last
+                                           # bar is older than today
+        ))
+        pre, post, delta = assert_bars_increased(
+            db_path, phase="daily_backfill", pre_count=pre_count,
+        )
+        return True, f"daily backfill: pre={pre} post={post} delta=+{delta}"
+    except AssertionError as exc:
+        return False, str(exc)
     except Exception as exc:  # noqa: BLE001
         return False, f"daily backfill failed: {exc}"
 
