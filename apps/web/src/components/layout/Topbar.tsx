@@ -1,7 +1,34 @@
+import { useEffect, useState } from 'react';
 import { useUiStore } from '@stores/uiStore';
+
+function formatMoscowTime(d: Date): string {
+  // Force MSK (UTC+3) regardless of the user's local timezone so the
+  // trading dashboard always shows market-local time.
+  const parts = new Intl.DateTimeFormat('ru-RU', {
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'Europe/Moscow',
+  }).formatToParts(d);
+  const hour = parts.find((p) => p.type === 'hour')?.value ?? '00';
+  const minute = parts.find((p) => p.type === 'minute')?.value ?? '00';
+  return `${hour}:${minute}`;
+}
 
 export function Topbar() {
   const toggleSidebar = useUiStore((s) => s.toggleSidebar);
+  const [now, setNow] = useState(() => new Date());
+
+  useEffect(() => {
+    // Tick once a minute at second :00 so the displayed time matches
+    // the wall clock. setInterval drifts by up to one interval but is
+    // fine for a minute-resolution display.
+    const tick = () => setNow(new Date());
+    const id = window.setInterval(tick, 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const moscowTime = formatMoscowTime(now);
+
   return (
     // Each topbar item is `whitespace-nowrap` + `shrink-0` so the
     // value never wraps or truncates inside its own pill. The flex
@@ -40,9 +67,11 @@ export function Topbar() {
           <span className="text-green mono">3 142.8</span>
           <span className="text-green mono">+0.42%</span>
         </span>
-        <span className="hidden md:flex items-center gap-1.5 whitespace-nowrap shrink-0">
+        <span className="hidden md:flex items-baseline gap-1.5 whitespace-nowrap shrink-0">
           <span>Обновлено</span>
-          <span className="text-text mono">19:34 МСК</span>
+          <span className="text-text mono" data-testid="topbar-clock">
+            {moscowTime} МСК
+          </span>
         </span>
         <span className="hidden sm:inline whitespace-nowrap shrink-0">Sandbox</span>
         <a
