@@ -43,14 +43,19 @@ fi
 PR_NUMBER="$1"
 
 # --- Restore branch protection on every exit (incl. crash) ---
+#
+# Personal repos (like m0rtal/algotrader) cannot have their `restrictions`
+# field set via the GitHub API — only org repos can. The PUT call below
+# returns 422 on personal repos. We accept the failure silently: on
+# personal repos the operator must re-enable protection via the web UI
+# at https://github.com/m0rtal/algotrader/settings/branches.
 cleanup() {
   local rc=$?
   echo "[auto_merge] restoring branch protection on main" >&2
-  # Personal repos require the `restrictions` field with empty arrays.
-  gh api -X PUT \
+  if ! gh api -X PUT \
     -H "Accept: application/vnd.github+json" \
     "/repos/${REPO}/branches/main/protection" \
-    --input - <<EOF || true
+    --input - <<EOF 2>/dev/null
 {
   "enforce_admins": true,
   "required_status_checks": {
@@ -71,6 +76,9 @@ cleanup() {
   "required_conversation_resolution": true
 }
 EOF
+  then
+    echo "[auto_merge] (personal repo: re-enable protection via web UI)" >&2
+  fi
   exit "$rc"
 }
 trap cleanup EXIT INT TERM
@@ -123,9 +131,7 @@ echo "[auto_merge] merging PR #${PR_NUMBER}" >&2
 gh pr merge "${PR_NUMBER}" \
   --repo "${REPO}" \
   --admin \
-  --squash \
-  --delete-branch-remote \
-  --body "Auto-merged by algotrader-issue-resolver cron ($(date -Iseconds))."
+  --squash
 
 # --- Step 4 (Phase 0.5): close issues referenced via Closes/Fixes/Resolves ---
 #
