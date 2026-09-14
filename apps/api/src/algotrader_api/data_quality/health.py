@@ -125,6 +125,39 @@ def _weekdays_minus_holiday_set(start: date, end: date, holidays: set[str]) -> i
     return weekdays - in_range
 
 
+def _load_restricted_dates(con: sqlite3.Connection) -> set[str]:
+    """Return the set of ISO dates (YYYY-MM-DD) marked as restricted
+    in the `restricted_periods` table. Empty set if the table does
+    not yet exist (e.g. fresh deploy before migration 010 has run).
+    """
+    try:
+        return {r[0] for r in con.execute(
+            "SELECT date FROM restricted_periods"
+        ).fetchall()}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def _weekdays_minus_restricted(
+    start: date, end: date, holidays: set[str], restricted: set[str]
+) -> int:
+    """Like ``_weekdays_minus_holiday_set`` but also subtracts dates
+    listed in the `restricted_periods` table (MOEX trading halts).
+    """
+    if end < start:  # pragma: no cover — defensive guard
+        return 0
+    cur = start
+    n = 0
+    while cur <= end:
+        if cur.weekday() < 5 and cur.isoformat() not in holidays:
+            # Restricted periods are excluded — see
+            # restricted_periods table seeded by migration 011.
+            if cur.isoformat() not in restricted:
+                n += 1
+        cur += timedelta(days=1)
+    return n
+
+
 def _detect_gaps(
     con: sqlite3.Connection, figi: str, max_keep: int = _MAX_RECENT_GAPS
 ) -> list[date]:
@@ -222,8 +255,9 @@ def compute_health(
         first_bar, last_bar, actual_bars = _bars_range(con, figi)
         gaps = _detect_gaps(con, figi)
         failures = _recent_failures(con, figi)
+        restricted = _load_restricted_dates(con)
         expected_bars = (
-            _weekdays_excluding_holidays(first_bar, today, con)
+            _weekdays_minus_restricted(first_bar, today, set(), restricted)
             if first_bar
             else 0
         )
@@ -288,6 +322,7 @@ def compute_all(db_path: str, today: date | None = None) -> dict[str, HealthRepo
         failures_map = _recent_failures_bulk(con, figis, today)
         holiday_rows = con.execute("SELECT date FROM moex_holidays").fetchall()
         holidays = {r["date"] for r in holiday_rows}
+        restricted = _load_restricted_dates(con)
     finally:
         con.close()
 
@@ -299,7 +334,7 @@ def compute_all(db_path: str, today: date | None = None) -> dict[str, HealthRepo
         last_bar = date.fromisoformat(r["last_bar"]) if r["last_bar"] else None
         actual = int(r["actual_bars"])
         expected = (
-            _weekdays_minus_holiday_set(first_bar, today, holidays)
+            _weekdays_minus_restricted(first_bar, today, holidays, restricted)
             if first_bar
             else 0
         )
