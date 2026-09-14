@@ -61,8 +61,11 @@ class RealTinkoffClient:
             ) from e
 
         constants = importlib.import_module("t_tech.invest.constants")
-        target_constant = getattr(constants, f"INVEST_GRPC_API_{target.upper()}", None)
-        if target_constant is None:
+        if target == "production":
+            target_constant = constants.INVEST_GRPC_API
+        elif target == "sandbox":
+            target_constant = constants.INVEST_GRPC_API_SANDBOX
+        else:
             raise ValueError(f"unknown target: {target} (use 'sandbox' or 'production')")
         self._target = target_constant
         self._token = token
