@@ -38,6 +38,14 @@ export const handlers = [
     passthrough(`bars/${params.symbol}`, request),
   ),
 
+  // Data quality (per ticker) — passthrough. Issue #2: the per-ticker
+  // HealthReport endpoint was missing an MSW passthrough so dev mode
+  // silently 404'd the Data Quality tab. Backend returns the report
+  // shape defined in routes/data_quality.py:_report_to_dict.
+  http.get('/api/data-quality/:symbol', ({ params, request }) =>
+    passthrough(`data-quality/${params.symbol}`, request),
+  ),
+
   // Backfill controls — passthrough so the UI sees real progress,
   // real pending counts, and the real force-reset endpoint.
   http.post('/api/admin/backfill/start', ({ request }) =>

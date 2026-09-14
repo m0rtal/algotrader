@@ -4,6 +4,7 @@ import { TradesTab } from '@features/trades/TradesTab';
 import { PortfolioTab } from '@features/portfolio/PortfolioTab';
 import { BacktestTab } from '@features/backtest/BacktestTab';
 import { DataTab } from '@features/data/DataTab';
+import { DataQualityTab } from '@features/dataQuality/DataQualityTab';
 import { Topbar } from '@components/layout/Topbar';
 import { KPIStr } from '@components/layout/KPIStr';
 import { Sidebar, SidebarDrawer } from '@components/layout/Sidebar';
@@ -16,11 +17,13 @@ const TABS: { id: TabId; label: string }[] = [
   { id: 'portfolio', label: 'Портфель' },
   { id: 'backtest', label: 'Бэктест' },
   { id: 'data', label: 'Данные' },
+  { id: 'data-quality', label: 'Качество' },
 ];
 
 export function Dashboard() {
   const active = useUiStore((s) => s.activeTab);
   const setTab = useUiStore((s) => s.setActiveTab);
+  const selectedTicker = useUiStore((s) => s.selectedTicker);
 
   return (
     <div className="h-screen flex flex-col bg-bg text-text overflow-hidden">
@@ -56,6 +59,7 @@ export function Dashboard() {
             {active === 'portfolio' && <PortfolioTab />}
             {active === 'backtest' && <BacktestTab />}
             {active === 'data' && <DataTab />}
+            {active === 'data-quality' && <DataQualityTab ticker={selectedTicker ?? 'SBER'} />}
           </div>
         </main>
         {/* Right rail: full-height on mobile (below main); fixed column on desktop */}

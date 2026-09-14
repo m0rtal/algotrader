@@ -156,3 +156,13 @@ describe('uiStore', () => {
     expect(second.result.current.activeTab).toBe('signals');
   });
 });
+
+describe('uiStore (issue #2: data-quality tab)', () => {
+  it("TabId union includes 'data-quality' — fix for the missing UI tab", () => {
+    // This is a structural test that compiles only if the union
+    // value exists. If uiStore.ts drops the data-quality tab, this
+    // file fails to compile and the missing-tab regression is caught.
+    const id: TabId = 'data-quality';
+    expect(id).toBe('data-quality');
+  });
+});
