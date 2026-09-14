@@ -29,6 +29,73 @@ def _is_disabled() -> bool:
     return bool(settings.fetch_disabled) or os.environ.get("ALGOTRADER_FETCH_DISABLED") == "1"
 
 
+@router.get("/data-pipeline/status")
+async def data_pipeline_status() -> dict:
+    """Return the last chain-run summary + per-domain freshness.
+
+    Backed by the ``pipeline_log`` table that the worker writes on
+    every phase of the daily refresh chain. Per-domain freshness
+    comes from the shared ``dividends.freshness.pipeline_freshness_check``
+    helper. Safe to poll; no broker calls.
+    """
+    db_path = _get_sqlite_path()
+    import sqlite3
+
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pipeline_log ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "phase TEXT NOT NULL, "
+            "started_at TEXT NOT NULL, "
+            "finished_at TEXT NOT NULL, "
+            "result TEXT NOT NULL, "
+            "detail TEXT"
+            ")"
+        )
+        rows = conn.execute(
+            "SELECT id, phase, started_at, finished_at, result, detail "
+            "FROM pipeline_log ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        last_run = {"timestamp": None, "rc": None, "phases": []}
+    else:
+        phases: list[dict] = []
+        last_ts: str | None = None
+        for r in rows:
+            phases.insert(
+                0,
+                {
+                    "phase": r[1],
+                    "result": r[4],
+                    "detail": r[5] or "",
+                    "finished_at": r[3],
+                },
+            )
+            last_ts = r[3]
+        any_error = any(p["result"] == "error" for p in phases)
+        last_run = {
+            "timestamp": last_ts,
+            "rc": 1 if any_error else 0,
+            "phases": phases,
+        }
+
+    freshness: dict = {"bars": {}, "dividends": {}, "corporate_actions": {}}
+    try:
+        from ..dividends.freshness import pipeline_freshness_check
+
+        freshness = pipeline_freshness_check(db_path, max_chain_age_hours=24)
+    except AssertionError as exc:
+        freshness = {"stale": True, "reason": str(exc)}
+    except Exception:
+        freshness = {"bars": {}, "dividends": {}, "corporate_actions": {}}
+
+    return {"last_run": last_run, "freshness": freshness}
+
+
 @router.get("/fetch/status")
 async def fetch_status() -> dict:
     """Quick health probe: is the broker token set in DB?
