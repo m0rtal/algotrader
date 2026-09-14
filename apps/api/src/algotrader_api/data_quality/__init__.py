@@ -6,6 +6,7 @@ from .completeness import (
     run_completeness_pass,
 )
 from .health import HealthIssue, HealthReport, compute_all, compute_health
+from .integrity import IntegrityViolation, Rule, validate_bar
 from .recovery import RecoverySummary, recover_stale
 from .service import GuardianSummary, run_daily_guardian
 
@@ -14,7 +15,9 @@ __all__ = [
     "GuardianSummary",
     "HealthIssue",
     "HealthReport",
+    "IntegrityViolation",
     "RecoverySummary",
+    "Rule",
     "backfill_gaps",
     "compute_all",
     "compute_health",
@@ -22,4 +25,5 @@ __all__ = [
     "recover_stale",
     "run_completeness_pass",
     "run_daily_guardian",
+    "validate_bar",
 ]
