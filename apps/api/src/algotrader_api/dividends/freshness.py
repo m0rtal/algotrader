@@ -59,7 +59,10 @@ def _parse_iso(ts: str | None) -> datetime | None:
     if not ts:
         return None
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
     except ValueError:
         return None
 
@@ -90,11 +93,15 @@ def dividends_freshness_check(
         count = int(row[0] or 0)
         last_ts = row[1]
         age_h = _age_hours(last_ts)
-        is_stale = (
-            count == 0
-            or age_h is None
-            or age_h > stale_threshold_days * 24
-        )
+        # Empty table is acceptable (initial state) — only fail when
+        # we have data but it's stale. Missing timestamp on populated
+        # rows is also stale (operator should investigate).
+        if count == 0:
+            is_stale = False
+        elif age_h is None:
+            is_stale = True  # rows exist but no timestamp — broken
+        else:
+            is_stale = age_h > stale_threshold_days * 24
         report = FreshnessReport(
             domain="dividends",
             last_fetch_at=last_ts,
@@ -115,13 +122,18 @@ def dividends_freshness_check(
 def _domain_timestamp(
     conn: sqlite3.Connection, table: str, column: str
 ) -> tuple[int, str | None]:
-    """Return (row_count, max(timestamp)) for a table; (0, None) if missing."""
+    """Return (row_count, max(timestamp)) for a table; (0, None) if missing
+    or the column does not exist yet."""
     if not _table_exists(conn, table):
         return 0, None
-    row = conn.execute(
-        f"SELECT COUNT(*), MAX({column}) FROM {table}"  # noqa: S608 — table/column whitelisted by caller
-    ).fetchone()
-    return int(row[0] or 0), row[1]
+    try:
+        row = conn.execute(
+            f"SELECT COUNT(*), MAX({column}) FROM {table}"  # noqa: S608 — table/column whitelisted by caller
+        ).fetchone()
+        return int(row[0] or 0), row[1]
+    except sqlite3.OperationalError:
+        # Column does not exist on this older schema.
+        return 0, None
 
 
 def pipeline_freshness_check(db_path: str, max_chain_age_hours: int = 24) -> dict:
@@ -156,20 +168,20 @@ def pipeline_freshness_check(db_path: str, max_chain_age_hours: int = 24) -> dic
             "bars": {
                 "last_fetch_at": bars_last,
                 "age_hours": _age_hours(bars_last),
-                "is_stale": bars_count == 0
-                or (_age_hours(bars_last) or 0) > max_chain_age_hours,
+                "is_stale": bars_count > 0
+                and ((_age_hours(bars_last) or 0) > max_chain_age_hours),
             },
             "dividends": {
                 "last_fetch_at": div_last,
                 "age_hours": _age_hours(div_last),
-                "is_stale": div_count == 0
-                or (_age_hours(div_last) or 0) > max_chain_age_hours,
+                "is_stale": div_count > 0
+                and ((_age_hours(div_last) or 0) > max_chain_age_hours),
             },
             "corporate_actions": {
                 "last_fetch_at": ca_last,
                 "age_hours": _age_hours(ca_last),
-                "is_stale": ca_count == 0
-                or (_age_hours(ca_last) or 0) > max_chain_age_hours,
+                "is_stale": ca_count > 0
+                and ((_age_hours(ca_last) or 0) > max_chain_age_hours),
             },
             "last_chain_at": last_chain_ts,
             "last_chain_age_hours": last_chain_age,
