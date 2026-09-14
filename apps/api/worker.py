@@ -396,7 +396,7 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
         gaps = find_gaps(db_path)
         if not gaps:
             return True, "gap recovery: no gaps"
-        result = recover_gaps(db_path, runner, gaps)
+        result = asyncio.run(recover_gaps(db_path, runner, gaps))
         return True, (
             f"gap recovery: {sum(result.values())} bars filled "
             f"across {len(gaps)} gaps"
@@ -421,6 +421,7 @@ def _step_corporate_actions(db_path: str) -> tuple[bool, str]:
         conn = sqlite3.connect(db_path)
         try:
             adjusted = apply_all_pending(conn)
+            conn.commit()
         finally:
             conn.close()
         return True, f"splits derived={written} bars adjusted={adjusted}"

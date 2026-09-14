@@ -125,9 +125,9 @@ def find_gaps(db_path: str) -> list[BarGap]:
     return out
 
 
-def recover_gaps(
+async def recover_gaps(
     db_path: str,
-    runner: object,  # duck-typed: needs .run_one(figi, ticker, from_, to_)
+    runner: object,  # duck-typed: needs ._backfill_one(*, figi, ticker, from_, to_) (async)
     gaps: list[BarGap],
 ) -> dict[str, int]:
     """For each BarGap, call ``runner.run_one(figi, ticker, from_, to_)``.
@@ -156,6 +156,8 @@ def recover_gaps(
         ticker = ticker_by_figi.get(gap.figi)
         if ticker is None:
             continue
-        result = runner.run_one(gap.figi, ticker, gap.from_, gap.to_)
+        result = await runner._backfill_one(
+            figi=gap.figi, ticker=ticker, from_=gap.from_, to=gap.to_,
+        )
         added[gap.figi] = added.get(gap.figi, 0) + int(result or 0)
     return added

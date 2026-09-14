@@ -167,6 +167,12 @@ class InMemoryTinkoffClient:
         with self._lock:
             self._storage.closed = True
 
+    async def __aenter__(self) -> "InMemoryTinkoffClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
+
     # ─── Test assertions ─────────────────────────────────────────────
     def call_count(self, method: str) -> int:
         with self._lock:
