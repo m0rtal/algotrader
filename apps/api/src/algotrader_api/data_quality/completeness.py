@@ -128,6 +128,14 @@ async def backfill_gaps(
             interval="CANDLE_INTERVAL_DAY",
         )
         closed = [c for c in candles if (d := _candle_date(c)) is not None and d < today]
+        # Issue #3: clear the exhausted marker BEFORE replace_bars_for_figi
+        # runs. That helper overwrites ``last_run_status`` to 'ok' in the
+        # same transaction that inserts the bars, so we have to read and
+        # clear the sentinel before it would be clobbered. Only do this
+        # when we have something to write — a broker returning zero
+        # candles must NOT clear the marker (would silently hide a real
+        # upstream outage).
+        prev = reset_exhausted_marker(db, figi) if closed else None
         added = replace_bars_for_figi(db, figi, closed, replace=False)
         total_added += added
         if added:
@@ -135,6 +143,11 @@ async def backfill_gaps(
                 "guardian.completeness.gap_filled",
                 extra={"figi": figi, "start": str(start), "end": str(end), "added": added},
             )
+            if prev is not None:
+                _log.info(
+                    "guardian.completeness.exhausted_marker_cleared",
+                    extra={"figi": figi, "previous_status": prev},
+                )
     return total_added
 
 
@@ -173,6 +186,55 @@ def _mark_completeness_exhausted(db: str, figi: str) -> None:
             (figi,),
         )
         con.commit()
+    finally:
+        con.close()
+
+
+# Issue #3: sentinel values written by the two guardian passes.
+# Centralised so callers don't hard-code the spellings and so a typo
+# in any one location surfaces as a sentinel mismatch on the next write.
+EXHAUSTED_STATUSES = frozenset({"completeness_exhausted", "stale_recovery_exhausted"})
+
+
+def reset_exhausted_marker(db: str, figi: str) -> str | None:
+    """Clear an exhausted marker on ``figi`` and return the previous status.
+
+    Returns the previous status (``completeness_exhausted`` or
+    ``stale_recovery_exhausted``) when a marker was cleared, or
+    ``None`` if the row had no exhausted marker (or no row at all).
+
+    Called automatically by ``backfill_gaps`` and ``BackfillRunner``
+    on a successful write so a previously-exhausted figi resumes
+    normal processing on the next guardian cycle. Also exposed via
+    ``POST /api/admin/data-quality/reset-exhausted/{symbol}`` as the
+    operator escape hatch.
+
+    IMPORTANT sequencing note: ``replace_bars_for_figi`` overwrites
+    ``last_run_status`` to ``'ok'`` in the SAME transaction as the
+    bars insert. This helper MUST therefore run BEFORE that call —
+    if it runs after, the sentinel has already been clobbered and
+    the helper sees a non-exhausted row. Issue #3's root constraint.
+    """
+    placeholders = ",".join("?" for _ in EXHAUSTED_STATUSES)
+    con = sqlite3.connect(db)
+    try:
+        try:
+            prev_row = con.execute(
+                f"SELECT last_run_status FROM instrument_metadata "
+                f"WHERE figi = ? AND last_run_status IN ({placeholders})",
+                (figi, *EXHAUSTED_STATUSES),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # instrument_metadata table doesn't exist yet (pre-migration-004).
+            return None
+        if prev_row is None:
+            return None
+        con.execute(
+            "UPDATE instrument_metadata SET last_run_status = 'ready' WHERE figi = ?",
+            (figi,),
+        )
+        con.commit()
+        return prev_row[0]
     finally:
         con.close()
 
