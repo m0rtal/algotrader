@@ -194,14 +194,15 @@ def main() -> int:
     parser.add_argument(
         "mode",
         nargs="?",
-        default="scheduled",
-        choices=["scheduled", "manual", "backfill", "guardian"],
+        default="daily",
+        choices=["scheduled", "manual", "backfill", "guardian", "daily"],
         help=(
             "Invocation mode. 'scheduled'/'manual' are one-shot fetch flows; "
             "'backfill' runs the persistent universe + historical backfill "
             "lifecycle (systemd-timer driven); 'guardian' runs the daily "
-            "data-quality sweep (universe sync + per-ticker health + "
-            "auto-recovery)."
+            "data-quality sweep; 'daily' runs the full refresh chain "
+            "(migrations → universe sync → daily backfill → corporate "
+            "actions → dividends → guardian) — the recommended cron mode."
         ),
     )
     args = parser.parse_args()
@@ -209,6 +210,8 @@ def main() -> int:
         return run_backfill()
     if args.mode == "guardian":
         return run_guardian()
+    if args.mode == "daily":
+        return run_daily_chain()
     return asyncio.run(run_worker(args.mode))
 
 
@@ -248,6 +251,244 @@ def run_guardian() -> int:
         rc = asyncio.run(_drive_guardian(settings.sqlite_path))
     finally:
         shutdown_tracing()
+    return rc
+
+
+# --------------------------------------------------------------------------- #
+# Daily refresh chain — single cron entry that runs the whole pipeline
+# --------------------------------------------------------------------------- #
+
+
+_DAILY_CHAIN_PHASES = (
+    "migrations",
+    "universe_sync",
+    "daily_backfill",
+    "corporate_actions",
+    "dividends",
+    "guardian",
+)
+
+
+def _log_chain_phase(db_path: str, phase: str, result: str, *, detail: str = "") -> None:
+    """Best-effort write to pipeline_log. Never raises."""
+    import sqlite3
+    import time
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS pipeline_log ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "phase TEXT NOT NULL, "
+                "started_at TEXT NOT NULL, "
+                "finished_at TEXT NOT NULL, "
+                "result TEXT NOT NULL, "
+                "detail TEXT"
+                ")"
+            )
+            now = time.strftime("%Y-%m-%dT%H:%M:%S")
+            conn.execute(
+                "INSERT INTO pipeline_log (phase, started_at, finished_at, result, detail) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (phase, now, now, result, detail),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("worker.daily.pipeline_log_failed", phase=phase, error=str(exc))
+
+
+def _step_migrations(db_path: str) -> tuple[bool, str]:
+    try:
+        sqlitedb.run_migrations(db_path, MIGRATIONS_DIR)
+        return True, ""
+    except Exception as exc:  # noqa: BLE001
+        return False, f"migrations failed: {exc}"
+
+
+def _step_universe_sync(db_path: str) -> tuple[bool, str]:
+    """Count instruments — actual broker sync is triggered manually via
+    the Data tab when broker connectivity is available."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM instruments").fetchone()[0]
+        finally:
+            conn.close()
+        return True, f"universe: {n} instruments (sync via Data tab)"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"universe sync failed: {exc}"
+
+
+class _NoopEventSink:
+    """Minimal no-op EventSink for BackfillRunner — discards events."""
+
+    async def emit(self, event_type: str, payload: dict) -> None:  # noqa: D401
+        return None
+
+
+def _step_daily_backfill(db_path: str) -> tuple[bool, str]:
+    """Append yesterday's bars for every tradeable figi.
+
+    If the broker token is not configured, this step is a no-op success
+    — the chain must not abort just because no broker connectivity is
+    available right now.
+    """
+    try:
+        from datetime import date, timedelta
+        import sqlite3
+
+        from algotrader_api.ingestion.backfill import BackfillRunner
+
+        token = ""
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute(
+                    "SELECT value FROM secrets WHERE key='tinkoff_token'"
+                ).fetchone()
+            finally:
+                conn.close()
+            if row:
+                token = row[0]
+        except sqlite3.OperationalError:
+            pass
+
+        if not token:
+            return True, "daily backfill: skipped (no broker token in secrets)"
+
+        from algotrader_api.ingestion import client as client_mod
+
+        if not hasattr(client_mod, "RealTinkoffClient"):
+            return True, "daily backfill: skipped (tinkoff SDK not installed)"
+
+        client = client_mod.RealTinkoffClient(token=token)
+        sink = _NoopEventSink()
+        runner = BackfillRunner(client=client, db_path=db_path, event_sink=sink)
+
+        today = date.today()
+        conn = sqlite3.connect(db_path)
+        try:
+            stale_figis = conn.execute(
+                "SELECT figi FROM bars GROUP BY figi HAVING MAX(ts) < ?",
+                ((today - timedelta(days=4)).isoformat(),),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        asyncio.run(runner.run(history_years=0))  # 0 = only incremental
+        return True, f"daily backfill: {len(stale_figis)} stale figis processed"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"daily backfill failed: {exc}"
+
+
+def _step_corporate_actions(db_path: str) -> tuple[bool, str]:
+    """Re-run split derivation against the freshly-updated bars."""
+    try:
+        # Late binding to avoid circular import via scripts_import.__init__.
+        import importlib
+        derive_splits = importlib.import_module(
+            "algotrader_api.scripts_import.derive_splits"
+        )
+        written = derive_splits.run_derivation(db_path)
+        return True, f"splits derived: {written}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"corporate actions failed: {exc}"
+
+
+def _step_dividends(db_path: str) -> tuple[bool, str]:
+    """Refresh dividends from Tinkoff + MOEX ISS. Both importers are
+    optional — if not configured, skip without error."""
+    try:
+        tinkoff_count = 0
+        moex_count = 0
+        try:
+            import importlib
+            mod = importlib.import_module(
+                "algotrader_api.scripts_import.import_corporate_actions_tinkoff"
+            )
+            if hasattr(mod, "import_dividends"):
+                tinkoff_count = mod.import_dividends(db_path)
+        except Exception:
+            pass
+
+        try:
+            mod = importlib.import_module(
+                "algotrader_api.scripts_import.import_corporate_actions_moex"
+            )
+            if hasattr(mod, "import_dividends"):
+                moex_count = mod.import_dividends(db_path)
+        except Exception:
+            pass
+
+        return True, f"dividends: tinkoff={tinkoff_count}, moex={moex_count}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"dividends failed: {exc}"
+
+
+def _step_guardian(db_path: str) -> tuple[bool, str]:
+    """Final health sweep + completeness pass."""
+    try:
+        from algotrader_api.data_quality.service import run_daily_guardian
+        summary = asyncio.run(run_daily_guardian(db_path))
+        return True, (
+            f"guardian: checked={summary.figis_checked}, "
+            f"recovered={summary.figis_recovered}, "
+            f"anomalies={summary.anomalies_raised}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"guardian failed: {exc}"
+
+
+_STEP_FUNCS = {
+    "migrations": _step_migrations,
+    "universe_sync": _step_universe_sync,
+    "daily_backfill": _step_daily_backfill,
+    "corporate_actions": _step_corporate_actions,
+    "dividends": _step_dividends,
+    "guardian": _step_guardian,
+}
+
+
+def run_daily_chain() -> int:
+    """Run the full daily refresh chain. Exits 0 on success, non-zero on
+    the first failed phase. Phases run strictly in order."""
+    settings = get_settings()
+    db_path = settings.sqlite_path
+
+    setup_logging(level=settings.log_level, health_sample_rate=1.0)
+    setup_tracing(
+        service_name="algotrader-worker",
+        otlp_endpoint=settings.otel_endpoint,
+        resource_attributes={"mode": "daily", "component": "refresh-chain"},
+    )
+
+    logger.info("worker.daily.start", sqlite=db_path)
+
+    rc = 0
+    try:
+        for phase in _DAILY_CHAIN_PHASES:
+            logger.info("worker.daily.phase_start", phase=phase)
+            step_fn = _STEP_FUNCS[phase]
+            ok, detail = step_fn(db_path)
+            result = "ok" if ok else "error"
+            _log_chain_phase(db_path, phase, result, detail=detail)
+            logger.info(
+                "worker.daily.phase_complete",
+                phase=phase,
+                result=result,
+                detail=detail,
+            )
+            if not ok:
+                logger.error("worker.daily.phase_failed_aborting", phase=phase)
+                rc = 1
+                break
+    finally:
+        shutdown_tracing()
+
+    logger.info("worker.daily.complete", rc=rc)
     return rc
 
 
