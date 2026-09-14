@@ -3,22 +3,14 @@
 Prints type / repr / dir for every value the dividend fetcher will
 read. Committed so the next implementer does not re-probe.
 
-Run from apps/api/src/ as:
-    ../../apps/api/.venv/bin/python -m scripts_import.probe_tinkoff_dividends
+Run from apps/api/ as:
+    PYTHONPATH=src ./.venv/bin/python -m algotrader_api.scripts_import.probe_tinkoff_dividends
 """
 from __future__ import annotations
 
 import asyncio
 import sqlite3
-import sys
-from datetime import date, timedelta
-from pathlib import Path
-
-_SRC = Path(__file__).resolve().parents[1]
-if str(_SRC.parent) not in sys.path:
-    sys.path.insert(0, str(_SRC.parent))
-
-from algotrader_api.ingestion import real_client  # noqa: E402
+from datetime import date
 
 
 def _broker_token() -> str:
@@ -35,10 +27,11 @@ def _broker_token() -> str:
 
 
 async def _probe() -> None:
+    from algotrader_api.ingestion import real_client
+
     token = _broker_token()
     client = real_client.RealTinkoffClient(token=token)
-    async with client:
-        # Pick a known-dividend-paying figi. GAZP pays dividends yearly.
+    try:
         from_ = date(2024, 1, 1)
         to_ = date(2026, 1, 1)
         try:
@@ -48,11 +41,13 @@ async def _probe() -> None:
             return
         print(f"type(resp) = {type(resp)}")
         print(f"dir(resp) = {dir(resp)}")
-        # Iterate likely-candidate fields:
         for attr in ("dividends", "items", "events", "payload", "value"):
             if hasattr(resp, attr):
                 items = getattr(resp, attr)
-                print(f"\nresp.{attr}: type={type(items)}, len={len(items) if hasattr(items, '__len__') else '?'}")
+                print(
+                    f"\nresp.{attr}: type={type(items)}, "
+                    f"len={len(items) if hasattr(items, '__len__') else '?'}"
+                )
                 if hasattr(items, "__iter__") and len(list(items) if hasattr(items, '__len__') else items) > 0:
                     first = next(iter(items))
                     print(f"  first item type={type(first)}")
@@ -67,6 +62,8 @@ async def _probe() -> None:
                             print(f"    {f} = {type(v).__name__}: {v!r}")
                         except Exception as e:
                             print(f"    {f} = ERROR: {e}")
+    finally:
+        await client.aclose()
 
 
 if __name__ == "__main__":
