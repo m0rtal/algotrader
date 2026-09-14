@@ -400,7 +400,11 @@ def test_step_gap_recovery_with_gaps(tmp_path):
     db = str(tmp_path / "x.db")
     fake_gr = MagicMock()
     fake_gr.find_gaps.return_value = ["gap1", "gap2"]
-    fake_gr.recover_gaps.return_value = {"gap1": 3, "gap2": 5}
+
+    # recover_gaps is now async; return_value is awaited via asyncio.run.
+    async def _fake_recover(*args, **kwargs):
+        return {"gap1": 3, "gap2": 5}
+    fake_gr.recover_gaps.side_effect = _fake_recover
     fake_br = MagicMock()
     fake_br.BackfillRunner.return_value = MagicMock()
     with patch.dict(sys.modules, {
@@ -638,14 +642,17 @@ def test_dividends_freshness_check_table_missing(tmp_path):
 
 
 def test_dividends_freshness_check_empty(tmp_path):
+    """Empty dividends table is acceptable initial state — no raise."""
     from algotrader_api.dividends.freshness import dividends_freshness_check
     db = str(tmp_path / "x.db")
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE dividends (figi TEXT, retrieved_at TEXT)")
     conn.commit()
     conn.close()
-    with pytest.raises(AssertionError):
-        dividends_freshness_check(db)
+    # Should NOT raise — empty is OK.
+    report = dividends_freshness_check(db)
+    assert report.is_stale is False
+    assert report.row_count == 0
 
 
 def test_dividends_freshness_check_fresh(tmp_path):

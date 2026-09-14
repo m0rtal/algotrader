@@ -136,7 +136,7 @@ def test_run_daily_chain_logs_each_step_to_pipeline_log(tmp_path: Path):
         "SELECT phase, result FROM pipeline_log ORDER BY id"
     ).fetchall()
     conn.close()
-    assert len(rows) == 6
+    assert len(rows) == 9  # 9-phase chain (migrations, universe_sync, daily_backfill, full_history, gap_recovery, corporate_actions, dividends, freshness_check, guardian)
     assert all(r[1] == "ok" for r in rows)
     assert [r[0] for r in rows] == list(_DAILY_CHAIN_PHASES)
 
