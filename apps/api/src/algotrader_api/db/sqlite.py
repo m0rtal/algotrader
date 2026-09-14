@@ -100,8 +100,17 @@ def run_migrations(path: str, migrations_dir: str) -> None:
                 conn.executescript(stmt)
             except sqlite3.OperationalError as e:
                 msg = str(e).lower()
-                if "duplicate column" in msg or "already exists" in msg:
-                    continue  # idempotent no-op for ADD COLUMN / CREATE
+                # Idempotent no-ops:
+                # - "duplicate column" for ALTER TABLE ADD COLUMN on re-run
+                # - "already exists" for CREATE TABLE/INDEX on re-run
+                # - "use DROP TABLE" / "use DROP VIEW" when DROP statement
+                #   target type (VIEW vs TABLE) is wrong — the subsequent
+                #   DROP statement of the correct type handles it.
+                if ("duplicate column" in msg
+                    or "already exists" in msg
+                    or "use drop table" in msg
+                    or "use drop view" in msg):
+                    continue
                 raise
     conn.commit()
 
