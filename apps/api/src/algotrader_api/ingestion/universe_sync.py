@@ -10,9 +10,9 @@ from typing import Any, Protocol
 
 
 class _ClientProtocol(Protocol):
-    async def get_shares(self) -> list[dict]: ...
-    async def get_etfs(self) -> list[dict]: ...
-    async def get_bonds(self) -> list[dict]: ...
+    async def get_shares(self) -> list[dict]: ...  # pragma: no cover
+    async def get_etfs(self) -> list[dict]: ...  # pragma: no cover
+    async def get_bonds(self) -> list[dict]: ...  # pragma: no cover
 
 
 async def run_universe_sync(
