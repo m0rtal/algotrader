@@ -48,10 +48,14 @@ coverage pragmas — must go through a feature branch and a PR.
    gh pr create --base main --title "feat: <title>" --body "..."
    ```
 
-6. **Wait for review.** Do NOT merge your own PR unless the operator
-   explicitly asks you to.
+6. **Wait for review.** The cron task in `/home/hermes/.hermes/cron/`
+   is configured to merge PRs that carry the `LGTM` label once the
+   QA cron has cleared them — see
+   `/home/hermes/.hermes/cron/algotrader-issue-resolver.md`. Agents
+   should NOT manually invoke `gh pr merge` on their own PRs; that
+   path is owned by the cron.
 
-7. **Operator merges.** Then:
+7. **Operator or cron merges.** Then:
    ```bash
    git checkout main
    git pull
