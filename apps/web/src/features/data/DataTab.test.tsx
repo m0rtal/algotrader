@@ -332,39 +332,38 @@ describe('DataTab', () => {
     expect(screen.getByText(/23:00\s*МСК/)).toBeInTheDocument();
   });
 
-  it('renders the KPI grid compactly: period shows year-only to fit one row', async () => {
+  it('renders the KPI grid compactly: period shows "since YYYY" since Tinkoff limits history to 5y', async () => {
     /**
-     * Layout regression: with sm:grid-cols-5 the Период block has
-     * ~80px of width. Even year-month format "2021-09 → 2026-09"
-     * (15 chars) overflows and visually overlaps the Полнота cell.
+     * Tinkoff investAPI sandbox returns ~5 years of historical bars
+     * regardless of instrument listing date. Even SBER (listed 1996)
+     * only has bars from 2021-08-10 onwards in our DB. Verified by
+     * inspecting the bars table directly.
      *
-     * Compact further to year-only "2021–2026" (7 chars) using an
-     * en-dash, with whitespace-nowrap so it stays on one line within
-     * its grid cell.
+     * Layout contract: the KPI Период block must show "since 2021"
+     * (5 chars) — both compact enough to fit the sm:grid-cols-5 cell
+     * AND unambiguous that this is a Tinkoff API limit, not our data
+     * being shallow.
      */
     render(
       <Wrap>
         <DataTab />
       </Wrap>,
     );
-    // The compact period must be present (year-only, en-dash).
-    // Sample has firstDate=2021-09-01, lastDate=2026-09-13, so the
-    // compact form is "2021–2026". Wait for the tickers query by
-    // asserting at least one node contains the compact pair.
+    // The compact period must be present (year-only "с 2021" prefix).
+    // Sample has firstDate=2021-09-01, so the compact form is "с 2021".
     const matches = await screen.findAllByText(
-      (content) => content.includes('2021') && content.includes('2026') && content.includes('–'),
+      (content) => /^с\s+2021/.test(content.trim()),
       undefined,
       { timeout: 3000 },
     );
     expect(matches.length).toBeGreaterThan(0);
-    expect(matches.some((n) => n.textContent?.trim() === '2021–2026')).toBe(true);
 
     // Belt-and-suspenders: the year-month or day-precision format must
     // NOT be in the KPI period block. There are two "Период" labels in
     // the DOM (KPI block + table column header) — pick the first one.
     const periodLabels = screen.getAllByText(/^Период$/);
     const periodValue = periodLabels[0].parentElement?.querySelector('p:nth-of-type(2)');
-    expect(periodValue?.textContent?.trim()).toBe('2021–2026');
+    expect(periodValue?.textContent?.trim()).toMatch(/^с\s+2021/);
   });
 
   it('renders all 5 KPI blocks with … placeholder while data is loading', async () => {

@@ -39,15 +39,15 @@ export function DataTab() {
   const totalBars = ready ? status!.total_bars : null;
   const tickersCount = ready ? tickers!.length : 0;
   const totalGaps = ready ? tickers!.reduce((s, t) => s + t.gaps, 0) : null;
+  // The earliest "first bar" across all tickers. We display only
+  // the START year because Tinkoff investAPI sandbox returns ~5
+  // years of history regardless of instrument listing date —
+  // showing start–end as a range misleads operators into thinking
+  // we have e.g. 5 years of SBER when actually SBER is listed since
+  // 1996 and we just don't have older bars.
   const firstDate = ready
     ? tickers!.reduce<string | null>(
         (acc, t) => (acc === null || t.firstDate < acc ? t.firstDate : acc),
-        null,
-      )
-    : null;
-  const lastDate = ready
-    ? tickers!.reduce<string | null>(
-        (acc, t) => (acc === null || t.lastDate > acc ? t.lastDate : acc),
         null,
       )
     : null;
@@ -101,9 +101,9 @@ export function DataTab() {
             <p className="text-xs text-[var(--muted-foreground)] uppercase tracking-wide">
               Период
             </p>
-            <p className="font-mono text-base mt-1 whitespace-nowrap">
-              {firstDate && lastDate
-                ? `${firstDate.slice(0, 4)}–${lastDate.slice(0, 4)}`
+            <p className="font-mono text-base mt-1 whitespace-nowrap" title="Tinkoff investAPI возвращает только ~5 лет истории баров вне зависимости от даты листинга инструмента">
+              {firstDate
+                ? `с ${firstDate.slice(0, 4)}`
                 : '…'}
             </p>
           </div>
