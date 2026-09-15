@@ -432,36 +432,70 @@ class BackfillRunner:
             return meta
 
         def fetch_year(market: str, board: str, ticker: str, year: int) -> list[dict]:
+            """Walk MOEX ISS /iss/history/.../securities/{ticker}.json for ``year``.
+
+            MOEX caps a single response at 500 bars; for a year with >500
+            trading days (rare, but possible for ETFs) we would miss data.
+            We use the server-reported ``history.cursor`` (offset, total,
+            page-size) to decide when to stop. Page-size itself comes from
+            the cursor field — pre-2024-Q3 MOEX returned 100 even when we
+            asked for 500; asking for 500 simply lets the server pick its
+            current maximum and tell us via the cursor.
+            """
             import requests
-            url = (
+            base = (
                 f"https://iss.moex.com/iss/history/engines/stock/markets/{market}/boards/{board}"
                 f"/securities/{urllib.parse.quote(ticker)}.json"
             )
-            try:
-                data = requests.get(
-                    url,
-                    params={"from": f"{year}-01-01", "till": f"{year}-12-31"},
-                    timeout=30,
-                ).json()
-            except Exception:
-                return []
-            cols = data.get("history", {}).get("columns", [])
-            if not cols or "TRADEDATE" not in cols:
-                return []
-            rows = data.get("history", {}).get("data", [])
-            out = []
-            for row in rows:
-                d = dict(zip(cols, row))
-                out.append({
-                    "figi": None,  # filled by caller
-                    "ts": d.get("TRADEDATE"),
-                    "open": d.get("OPEN"),
-                    "high": d.get("HIGH"),
-                    "low": d.get("LOW"),
-                    "close": d.get("CLOSE"),
-                    "volume": int(d.get("VOLUME") or 0),
-                    "source": "moex",
-                })
+            out: list[dict] = []
+            start = 0
+            page_size = 500
+            while True:
+                try:
+                    data = requests.get(
+                        base,
+                        params={
+                            "from": f"{year}-01-01",
+                            "till": f"{year}-12-31",
+                            "start": start,
+                        },
+                        timeout=30,
+                    ).json()
+                except Exception:
+                    break
+                cols = data.get("history", {}).get("columns", [])
+                if not cols or "TRADEDATE" not in cols:
+                    break
+                rows = data.get("history", {}).get("data", [])
+                if not rows:
+                    break
+                for row in rows:
+                    d = dict(zip(cols, row))
+                    out.append({
+                        "figi": None,  # filled by caller
+                        "ts": d.get("TRADEDATE"),
+                        "open": d.get("OPEN"),
+                        "high": d.get("HIGH"),
+                        "low": d.get("LOW"),
+                        "close": d.get("CLOSE"),
+                        "volume": int(d.get("VOLUME") or 0),
+                        "source": "moex",
+                    })
+                # history.cursor rows: [offset, total, page_size]. When
+                # offset + len(rows) >= total, we've seen everything.
+                cursor_rows = data.get("history.cursor", {}).get("data") or []
+                if cursor_rows:
+                    try:
+                        offset, total, _srv_page_size = cursor_rows[0][:3]
+                        if offset is not None and total is not None and offset + len(rows) >= total:
+                            break
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    # No cursor at all: fall back to "short page = last".
+                    if len(rows) < page_size:
+                        break
+                start += len(rows)
             return out
 
         async def fetch_tinkoff_fallback(
