@@ -7,11 +7,22 @@ SQLite) map to the underlying query.
 """
 from __future__ import annotations
 
+import time
+from typing import Optional
+
 from fastapi import APIRouter
 
 from ..data_quality.gap_recovery import find_gaps
 from ..db.sqlite import execute as sqlite_exec
 from ..observability.logging import get_logger
+
+# Cache the per-figi gap count to avoid recomputing on every request.
+# find_gaps() scans 3,783 figis and takes ~8s on prod — calling it on
+# every /api/tickers or /api/admin/backfill/pending request blocks the
+# single uvicorn worker for that long. The chain rebuilds the gaps
+# nightly, so 60-second freshness is plenty for UI purposes.
+_GAPS_CACHE_TTL_SEC = 60.0
+_gaps_cache: Optional[tuple[float, dict[str, int]]] = None
 
 logger = get_logger("algotrader_api.data_reads")
 
@@ -22,7 +33,15 @@ _sqlite_path_holder: dict[str, str] = {}
 
 
 def set_sqlite_path(path: str) -> None:
+    """Inject the sqlite path used by these read endpoints.
+
+    Also invalidates the per-figi gap cache so a DB swap doesn't return
+    stale gap counts. Called from the FastAPI lifespan on startup and
+    again by tests on every fixture swap.
+    """
+    global _gaps_cache
     _sqlite_path_holder["path"] = path
+    _gaps_cache = None
 
 
 def _get_sqlite_path() -> str:
@@ -133,6 +152,27 @@ def get_logs(limit: int = 50, since_minutes: int = 60) -> list:
     return out
 
 
+def _gaps_by_figi() -> dict[str, int]:
+    """Per-figi gap count, cached for ``_GAPS_CACHE_TTL_SEC`` seconds.
+
+    find_gaps() walks every figi and runs O(days) date math per row —
+    ~8s on prod for 3,783 figis / 73k gaps. Without this cache the
+    single uvicorn worker stalls on every /api/tickers or
+    /api/admin/backfill/pending request. The chain rebuilds gaps
+    nightly, so a 60-second TTL keeps the UI honest while keeping
+    latency low. Returns counts keyed by figi.
+    """
+    global _gaps_cache
+    now = time.monotonic()
+    if _gaps_cache is not None and (now - _gaps_cache[0]) < _GAPS_CACHE_TTL_SEC:
+        return _gaps_cache[1]
+    counts: dict[str, int] = {}
+    for g in find_gaps(_get_sqlite_path()):
+        counts[g.figi] = counts.get(g.figi, 0) + 1
+    _gaps_cache = (now, counts)
+    return counts
+
+
 @router.get("/tickers")
 def get_tickers() -> list:
     """Per-ticker metadata for the Bars tab.
@@ -163,10 +203,9 @@ def get_tickers() -> list:
     by_ticker = {r["ticker"]: r for r in instrument_rows if r["ticker"]}
 
     # Real gap counts from find_gaps() — keyed by figi so two figis
-    # sharing a ticker (relisted shares) don't collide.
-    gaps_by_figi: dict[str, int] = {}
-    for g in find_gaps(_get_sqlite_path()):
-        gaps_by_figi[g.figi] = gaps_by_figi.get(g.figi, 0) + 1
+    # sharing a ticker (relisted shares) don't collide. find_gaps() is
+    # slow (~8s on prod), so we cache the result for 60 seconds.
+    gaps_by_figi = _gaps_by_figi()
 
     out: list[dict] = []
     for r in overview_rows:

@@ -194,3 +194,46 @@ def test_get_tickers_latency_under_slo(seeded_tickers):
         elapsed = (time.time() - t0) * 1000
     assert r.status_code == 200
     assert elapsed < 100, f"/api/tickers took {elapsed:.0f}ms"
+
+
+def test_get_tickers_caches_find_gaps_across_requests(seeded_tickers):
+    """Regression: find_gaps() takes ~8s on prod (3783 figis). Calling it
+    on every /api/tickers request blocks the single uvicorn worker.
+    The gaps-by-figi dict is cached for 60 seconds so the second
+    request is fast and find_gaps() is called at most once per cache
+    window.
+
+    Asserts the cache by patching the find_gaps symbol that
+    data_reads.py actually calls, then verifying the second
+    /api/tickers call does NOT trigger it again.
+    """
+    from unittest.mock import patch
+
+    from algotrader_api.main import create_app
+    from algotrader_api.routes import data_reads as data_reads_route
+
+    # Reset module cache so the test sees a clean state regardless of
+    # what other tests did to the cache during the session.
+    data_reads_route._gaps_cache = None
+
+    call_count = {"n": 0}
+
+    def _counting_find_gaps(db_path):
+        call_count["n"] += 1
+        return []  # Empty gaps is fine for this test — we only count calls.
+
+    # Patch the symbol as it lives in data_reads's namespace, not in
+    # gap_recovery (data_reads did `from ... import find_gaps`).
+    with patch.object(data_reads_route, "find_gaps",
+                      side_effect=_counting_find_gaps):
+        app = create_app()
+        with TestClient(app) as c:
+            r1 = c.get("/api/tickers")
+            assert r1.status_code == 200
+            r2 = c.get("/api/tickers")
+            assert r2.status_code == 200
+
+    assert call_count["n"] == 1, (
+        f"find_gaps called {call_count['n']} times across 2 requests; "
+        f"expected 1 (cached on second call)"
+    )
