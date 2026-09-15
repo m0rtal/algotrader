@@ -103,7 +103,7 @@ export function DataTab() {
             </p>
             <p className="font-mono text-base mt-1 whitespace-nowrap">
               {firstDate && lastDate
-                ? `${firstDate.slice(0, 7)} → ${lastDate.slice(0, 7)}`
+                ? `${firstDate.slice(0, 4)}–${lastDate.slice(0, 4)}`
                 : '…'}
             </p>
           </div>
