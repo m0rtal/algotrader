@@ -61,22 +61,56 @@ def test_upsert_instruments_inserts_rows(tmp_path):
     assert [r["ticker"] for r in result] == ["GAZP", "SBER"]
 
 
-def test_upsert_instruments_replaces_existing(tmp_path):
+def test_upsert_instruments_refreshes_metadata_for_existing_figi(tmp_path):
+    """When the broker returns the same figi again with updated metadata
+    (different name, lot_size, etc.), upsert_instruments must refresh the
+    existing row. This covers cases like sector reclassification or
+    lot_size changes after corporate actions.
+    """
     db_path = str(tmp_path / "test.db")
     sqlitedb.run_migrations(db_path, MIGRATIONS_DIR)
     universe.upsert_instruments(
         db_path,
-        [{"ticker": "SBER", "figi": "old", "class": "share", "name": "old", "currency": "RUB", "lot_size": 10}],
+        [{"ticker": "SBER", "figi": "F1", "class": "share",
+         "name": "old", "currency": "RUB", "lot_size": 10}],
     )
     universe.upsert_instruments(
         db_path,
-        [{"ticker": "SBER", "figi": "new", "class": "share", "name": "new", "currency": "RUB", "lot_size": 1}],
+        [{"ticker": "SBER", "figi": "F1", "class": "share",
+         "name": "new", "currency": "RUB", "lot_size": 1}],
     )
     result = sqlitedb.execute(db_path, "SELECT figi, name, lot_size FROM instruments WHERE ticker = 'SBER'")
     assert len(result) == 1
-    assert result[0]["figi"] == "new"
+    assert result[0]["figi"] == "F1"
     assert result[0]["name"] == "new"
     assert result[0]["lot_size"] == 1
+
+
+def test_upsert_instruments_keeps_existing_figi_on_duplicate_ticker(tmp_path):
+    """When the broker returns a NEW figi for an existing ticker
+    (relisted instrument), the existing figi wins (PK=ticker, older row
+    wins). The new figi is silently dropped but logged at WARN.
+    """
+    db_path = str(tmp_path / "test.db")
+    sqlitedb.run_migrations(db_path, MIGRATIONS_DIR)
+    universe.upsert_instruments(
+        db_path,
+        [{"ticker": "SBER", "figi": "old", "class": "share",
+         "name": "old", "currency": "RUB", "lot_size": 10}],
+    )
+    inserted = universe.upsert_instruments(
+        db_path,
+        [{"ticker": "SBER", "figi": "new", "class": "share",
+         "name": "new", "currency": "RUB", "lot_size": 1}],
+    )
+    assert inserted == 0, (
+        f"Second figi should be dropped (PK collision), but reported {inserted} inserted"
+    )
+    result = sqlitedb.execute(db_path, "SELECT figi, name, lot_size FROM instruments WHERE ticker = 'SBER'")
+    assert len(result) == 1
+    assert result[0]["figi"] == "old"
+    assert result[0]["name"] == "old"
+    assert result[0]["lot_size"] == 10
 
 
 def test_upsert_instruments_empty_returns_zero(tmp_path):

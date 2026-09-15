@@ -24,8 +24,6 @@ def empty_db(tmp_path):
 
 
 def test_upsert_instruments_drops_non_tradeable(empty_db):
-    """Even if a caller hands `upsert_instruments` a mixed bag, only
-    tradeable classes land in SQLite."""
     from algotrader_api.ingestion.universe import upsert_instruments
 
     rows = [
@@ -66,3 +64,41 @@ def test_upsert_instruments_handles_all_empty(empty_db):
     n = con.execute("SELECT COUNT(*) FROM instruments").fetchone()[0]
     con.close()
     assert n == 0
+
+
+def test_upsert_instruments_preserves_duplicate_ticker_rows(empty_db):
+    """Regression: PRIMARY KEY (ticker) makes the second figi disappear.
+
+    Behavior contract: when broker returns two figis for the same
+    ticker (relisted instruments), the FIRST one in DB stays and the
+    second is silently dropped (PK constraint) but logged at WARN so
+    the operator can see it. The test verifies the older row wins.
+    """
+    from algotrader_api.ingestion.universe import upsert_instruments
+
+    # First insert: one figi for ticker RU000A1057D4
+    rows1 = [
+        {"ticker": "RU000A1057D4", "figi": "TCS00A1057D4", "class": "bond",
+         "name": "Original", "currency": "rub", "lot_size": 1, "isin": None, "sector": None},
+    ]
+    upsert_instruments(empty_db, rows1)
+
+    # Second insert: same ticker, different figi
+    rows2 = [
+        {"ticker": "RU000A1057D4", "figi": "TCS90A1057D4", "class": "bond",
+         "name": "Relisted", "currency": "rub", "lot_size": 1, "isin": None, "sector": None},
+    ]
+    inserted = upsert_instruments(empty_db, rows2)
+    assert inserted == 0, (
+        f"Second figi should be silently dropped (PK collision), "
+        f"but upsert_instruments reported {inserted} inserted"
+    )
+
+    con = sqlite3.connect(empty_db)
+    rows = sorted(con.execute("SELECT figi, ticker FROM instruments").fetchall())
+    con.close()
+
+    # The older figi must win — both rows can't coexist with ticker-as-PK
+    assert rows == [("TCS00A1057D4", "RU000A1057D4")], (
+        f"Expected older figi to win: {rows}"
+    )

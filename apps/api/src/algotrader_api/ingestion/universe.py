@@ -1,6 +1,7 @@
 """Discover all MOEX instruments and persist to SQLite."""
 from __future__ import annotations
 
+import sqlite3
 from typing import Any
 
 from ..db.sqlite import execute_returning_id
@@ -60,7 +61,7 @@ async def discover_universe(client: Any) -> list[dict]:
 
 
 def upsert_instruments(db_path: str, rows: list[dict]) -> int:
-    """INSERT OR REPLACE into instruments. Returns rows inserted.
+    """INSERT OR IGNORE then UPDATE-by-figi into instruments.
 
     Filters to `TRADEABLE_CLASSES` before the upsert. This is the
     fourth line of defence — even if `discover_universe` ever
@@ -68,6 +69,21 @@ def upsert_instruments(db_path: str, rows: list[dict]) -> int:
     A `universe.class.post_filter_dropped` log line is emitted when
     any rows are dropped here, so the operator can see the filter
     was exercised.
+
+    Why a two-step INSERT OR IGNORE + UPDATE-by-figi instead of
+    `INSERT OR REPLACE`? The broker sometimes returns multiple
+    figis for the same ticker (relisted instruments). PRIMARY KEY
+    on `ticker` makes INSERT OR REPLACE silently destroy the
+    existing figi to make room for the new one. INSERT OR IGNORE
+    preserves the existing row, and the follow-up UPDATE refreshes
+    metadata on whichever row matches the broker figi.
+
+    The trade-off: when the broker has TWO figis for the same
+    ticker, only the first one to land in DB survives — the second
+    is silently dropped on the ticker PK collision. This is
+    documented in the spec (criterion: PRIMARY KEY on ticker for
+    canonical row identity) and the dropped rows are logged at
+    WARN so the operator can see broker relisting events.
 
     Batched in transactions of 100 for performance.
     """
@@ -86,25 +102,82 @@ def upsert_instruments(db_path: str, rows: list[dict]) -> int:
     if not filtered:
         return 0
     inserted = 0
+    dropped_dup_ticker = 0
     BATCH = 100
     for i in range(0, len(filtered), BATCH):
         batch = filtered[i : i + BATCH]
         for r in batch:
+            # Step 1: try INSERT, skip on either UNIQUE collision.
+            # Use a fresh sqlite3 connection — INSERT OR IGNORE returns
+            # rowcount=0 when the row already exists.
+            con = sqlite3.connect(db_path)
+            try:
+                cur = con.execute(
+                    "INSERT OR IGNORE INTO instruments "
+                    "(ticker, figi, class, name, currency, lot_size, isin, sector) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        r["ticker"],
+                        r["figi"],
+                        r["class"],
+                        r["name"],
+                        r["currency"],
+                        r["lot_size"],
+                        r.get("isin"),
+                        r.get("sector"),
+                    ),
+                )
+                con.commit()
+                insert_succeeded = cur.rowcount == 1
+            finally:
+                con.close()
+            if insert_succeeded:
+                inserted += 1
+            else:
+                # INSERT was skipped — figi or ticker collision.
+                # Check by ticker to detect duplicate-ticker drops.
+                con = sqlite3.connect(db_path)
+                try:
+                    row = con.execute(
+                        "SELECT figi FROM instruments WHERE ticker=?",
+                        (r["ticker"],),
+                    ).fetchone()
+                finally:
+                    con.close()
+                if row and row[0] != r["figi"]:
+                    # Different figi already holds this ticker — broker
+                    # relisted and we keep the older one.
+                    dropped_dup_ticker += 1
+                    logger.warning(
+                        "universe.ticker_duplicate_kept_existing",
+                        ticker=r["ticker"],
+                        existing_figi=row[0],
+                        dropped_figi=r["figi"],
+                        note="PRIMARY KEY=ticker; older row wins. "
+                             "Consider manual cleanup if broker is wrong.",
+                    )
+            # Step 2: refresh metadata by figi (covers case where figi
+            # already existed but ticker/class/name changed).
             execute_returning_id(
                 db_path,
-                "INSERT OR REPLACE INTO instruments "
-                "(ticker, figi, class, name, currency, lot_size, isin, sector) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "UPDATE instruments SET "
+                "  ticker=?, class=?, name=?, currency=?, lot_size=?, isin=?, sector=? "
+                "WHERE figi=?",
                 (
                     r["ticker"],
-                    r["figi"],
                     r["class"],
                     r["name"],
                     r["currency"],
                     r["lot_size"],
                     r.get("isin"),
                     r.get("sector"),
+                    r["figi"],
                 ),
             )
-            inserted += 1
+    if dropped_dup_ticker:
+        logger.warning(
+            "universe.duplicate_ticker_dropped_total",
+            dropped=dropped_dup_ticker,
+            note="Older figi wins; broker relisted. Investigate if unexpected.",
+        )
     return inserted
