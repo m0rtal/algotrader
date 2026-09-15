@@ -332,24 +332,39 @@ describe('DataTab', () => {
     expect(screen.getByText(/23:00\s*МСК/)).toBeInTheDocument();
   });
 
-  it('renders the KPI grid compactly: period shows year-month to fit one row', async () => {
+  it('renders the KPI grid compactly: period shows year-only to fit one row', async () => {
     /**
-     * Layout regression: with sm:grid-cols-5 the long Период string
-     * "2021-08-10 → 2026-09-14" can wrap and push the Гэпы block to a
-     * second row. Compact the period to year-month format and verify
-     * the long form is gone.
+     * Layout regression: with sm:grid-cols-5 the Период block has
+     * ~80px of width. Even year-month format "2021-09 → 2026-09"
+     * (15 chars) overflows and visually overlaps the Полнота cell.
+     *
+     * Compact further to year-only "2021–2026" (7 chars) using an
+     * en-dash, with whitespace-nowrap so it stays on one line within
+     * its grid cell.
      */
     render(
       <Wrap>
         <DataTab />
       </Wrap>,
     );
-    await screen.findByText(/СОСТОЯНИЕ|^\s*Состояние/i);
-    const allText = document.body.textContent ?? '';
-    // The compact year-month form should be present somewhere
-    expect(allText).toMatch(/2021-09.{1,5}2026-09/);
-    // The long day-precision form must NOT be in the page
-    expect(allText).not.toMatch(/2021-08-10|2026-09-14|2021-09-01|2026-09-13/);
+    // The compact period must be present (year-only, en-dash).
+    // Sample has firstDate=2021-09-01, lastDate=2026-09-13, so the
+    // compact form is "2021–2026". Wait for the tickers query by
+    // asserting at least one node contains the compact pair.
+    const matches = await screen.findAllByText(
+      (content) => content.includes('2021') && content.includes('2026') && content.includes('–'),
+      undefined,
+      { timeout: 3000 },
+    );
+    expect(matches.length).toBeGreaterThan(0);
+    expect(matches.some((n) => n.textContent?.trim() === '2021–2026')).toBe(true);
+
+    // Belt-and-suspenders: the year-month or day-precision format must
+    // NOT be in the KPI period block. There are two "Период" labels in
+    // the DOM (KPI block + table column header) — pick the first one.
+    const periodLabels = screen.getAllByText(/^Период$/);
+    const periodValue = periodLabels[0].parentElement?.querySelector('p:nth-of-type(2)');
+    expect(periodValue?.textContent?.trim()).toBe('2021–2026');
   });
 
   it('renders all 5 KPI blocks with … placeholder while data is loading', async () => {
