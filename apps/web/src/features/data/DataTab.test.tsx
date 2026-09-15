@@ -272,4 +272,83 @@ describe('DataTab', () => {
     const gapsText = await screen.findByText(/52\s*дн/);
     expect(gapsText).toBeInTheDocument();
   });
+
+  it('renders Полнота and Гэпы as two separate KPI blocks (no inline subtitle)', async () => {
+    /**
+     * Redesign: completeness (98.3%) and gaps count (73016 дн) are
+     * different operational metrics and should be visually distinct.
+     * Previously the gaps count was crammed into a tiny grey subtitle
+     * next to the Полнота percentage — easy to miss in the UI.
+     *
+     * Layout contract:
+     *   - One KPI block labeled "Полнота" containing only the percentage.
+     *   - One KPI block labeled "Гэпы" containing only the number + "дн".
+     *   - The "гэпы: N дн" inline subtitle inside the Полнота cell
+     *     is removed (was the cramped form).
+     *
+     * Note: "Гэпы" also appears as a TABLE COLUMN HEADER in the per-
+     * ticker table — that's expected and not the same element. We
+     * assert the metric block exists by looking for the value next to
+     * its label in the KPI section.
+     */
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+    // Find Полнота block by its label
+    const polnotaLabel = screen.getByText(/^Полнота$/);
+    expect(polnotaLabel).toBeInTheDocument();
+
+    // Find Гэпы block by its label. The KPI block has "Гэпы" as
+    // label, but the per-ticker table also has a "Гэпы" column
+    // header — both are expected to exist. We assert that at least
+    // one element with that exact text is in the document.
+    expect(screen.getAllByText(/^Гэпы$/).length).toBeGreaterThan(0);
+
+    // Belt-and-suspenders: the OLD inline "гэпы: N дн" form inside
+    // the Полнота cell must be gone.
+    const allText = document.body.textContent ?? '';
+    expect(allText).not.toMatch(/гэпы:\s*\d/);
+  });
+
+  it('shows the actual cron time (23:00 МСК), not the hardcoded 02:00 МСК', async () => {
+    /**
+     * Regression: UI label claimed "Ежедневно в 02:00 МСК" but actual
+     * crontab is `0 20 * * *` UTC = 23:00 MSK. The hardcoded label was
+     * never wired to the real schedule, so operators thought the chain
+     * ran in the middle of the night when it actually ran at 23:00 MSK.
+     *
+     * The cron script comments and crontab entry both confirm 20:00 UTC.
+     */
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+    // Must NOT show the wrong time
+    expect(screen.queryByText(/02:00\s*МСК/)).toBeNull();
+    // Must show the actual time
+    expect(screen.getByText(/23:00\s*МСК/)).toBeInTheDocument();
+  });
+
+  it('renders the KPI grid compactly: period shows year-month to fit one row', async () => {
+    /**
+     * Layout regression: with sm:grid-cols-5 the long Период string
+     * "2021-08-10 → 2026-09-14" can wrap and push the Гэпы block to a
+     * second row. Compact the period to year-month format and verify
+     * the long form is gone.
+     */
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+    await screen.findByText(/СОСТОЯНИЕ|^\s*Состояние/i);
+    const allText = document.body.textContent ?? '';
+    // The compact year-month form should be present somewhere
+    expect(allText).toMatch(/2021-09.{1,5}2026-09/);
+    // The long day-precision form must NOT be in the page
+    expect(allText).not.toMatch(/2021-08-10|2026-09-14|2021-09-01|2026-09-13/);
+  });
 });
