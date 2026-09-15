@@ -386,10 +386,11 @@ def test_step_gap_recovery_no_gaps(tmp_path):
     fake_gr.find_gaps.return_value = []
     fake_br = MagicMock()
     fake_br.BackfillRunner.return_value = MagicMock()
-    with patch.dict(sys.modules, {
-        "algotrader_api.data_quality.gap_recovery": fake_gr,
-        "algotrader_api.ingestion.backfill": fake_br,
-    }):
+    with patch("algotrader_api.ingestion.client.make_client", return_value=MagicMock()), \
+         patch.dict(sys.modules, {
+            "algotrader_api.data_quality.gap_recovery": fake_gr,
+            "algotrader_api.ingestion.backfill": fake_br,
+         }):
         ok, detail = worker._step_gap_recovery(db)
     assert ok is True
     assert "no gaps" in detail
@@ -407,10 +408,11 @@ def test_step_gap_recovery_with_gaps(tmp_path):
     fake_gr.recover_gaps.side_effect = _fake_recover
     fake_br = MagicMock()
     fake_br.BackfillRunner.return_value = MagicMock()
-    with patch.dict(sys.modules, {
-        "algotrader_api.data_quality.gap_recovery": fake_gr,
-        "algotrader_api.ingestion.backfill": fake_br,
-    }):
+    with patch("algotrader_api.ingestion.client.make_client", return_value=MagicMock()), \
+         patch.dict(sys.modules, {
+            "algotrader_api.data_quality.gap_recovery": fake_gr,
+            "algotrader_api.ingestion.backfill": fake_br,
+         }):
         ok, detail = worker._step_gap_recovery(db)
     assert ok is True
     assert "8 bars filled" in detail

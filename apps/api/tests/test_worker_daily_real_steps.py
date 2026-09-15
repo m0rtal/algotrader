@@ -39,16 +39,20 @@ def db_with_bars(tmp_path: pathlib.Path):
 
 
 def test_step_universe_sync_real_calls_discover(db_with_bars):
-    """Real implementation: invokes discover_universe + upsert."""
+    """Real implementation: invokes run_universe_sync wrapper which
+    calls universe.discover_universe + universe.upsert_instruments."""
     fake_client = MagicMock()
 
-    with patch("algotrader_api.ingestion.universe.discover_universe",
-               new=AsyncMock(return_value=[])) as mock_discover:
-        with patch("algotrader_api.ingestion.universe.upsert_instruments",
-                   return_value=0):
-            ok, detail = worker_module._step_universe_sync(db_with_bars)
-    # Confirm the real path was hit (not a count-only no-op):
-    assert mock_discover.called, "discover_universe must be called in real impl"
+    # Patch make_client via its original module path; run_universe_sync
+    # via its module path. worker_module.client_mod is an alias for
+    # algotrader_api.ingestion.client, but patching the alias string
+    # doesn't reliably work in newer pytest-mock versions.
+    with patch("algotrader_api.ingestion.client.make_client", return_value=fake_client), \
+         patch("algotrader_api.ingestion.universe_sync.run_universe_sync",
+               new=AsyncMock(return_value=0)) as mock_sync:
+        ok, detail = worker_module._step_universe_sync(db_with_bars)
+    # Confirm the wrapper was hit (not a count-only no-op):
+    assert mock_sync.called, "run_universe_sync must be called in real impl"
     assert ok is True
     assert "0 instruments" in detail
 
