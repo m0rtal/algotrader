@@ -136,9 +136,11 @@ def test_find_gaps_skips_restricted_period_dates(db):
         assert g.from_ != restricted
         assert g.to_ != restricted
     # The Tue-w1 gap exists, and the Thu..Fri-w1 gap exists.
+    # (2024-03-08 is International Women's Day, a MOEX holiday, so the
+    # Friday-w1 gap collapses to just Thursday-w1.)
     expected_gaps = {
         BarGap(figi=figi, from_=date(2024, 3, 5), to_=date(2024, 3, 5)),
-        BarGap(figi=figi, from_=date(2024, 3, 7), to_=date(2024, 3, 8)),
+        BarGap(figi=figi, from_=date(2024, 3, 7), to_=date(2024, 3, 7)),
     }
     assert set(gaps) == expected_gaps
 
@@ -205,3 +207,47 @@ def test_recover_gaps_empty_list_returns_empty_dict(db):
     runner = FakeRunner()
     assert asyncio.run(recover_gaps(db, runner, [])) == {}
     assert runner.calls == []
+
+def test_find_gaps_excludes_moex_holidays(tmp_path):
+    """find_gaps must exclude both restricted_periods AND moex_holidays.
+
+    Regression: SBER has bars for 2022-02-24 and 2022-02-25 (real trading
+    days) but 2022-02-23 was a Russian holiday (Defender of the Fatherland Day).
+    find_gaps used to report 2022-02-23 as a gap because it only loaded
+    restricted_periods, not moex_holidays.
+    """
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    p = str(db)
+    from algotrader_api.db.migrations import MIGRATIONS_DIR
+    from algotrader_api.db.sqlite import run_migrations
+    run_migrations(p, str(MIGRATIONS_DIR))
+
+    con = sqlite3.connect(p)
+    # Insert instrument + bars spanning a holiday (2030-06-12 is Russia Day Wed)
+    con.execute(
+        "INSERT INTO instruments(ticker, figi, class, name, currency, lot_size) VALUES (?,?,?,?,?,?)",
+        ("SBER", "BBG001", "share", "Sber", "RUB", 1),
+    )
+    # Bars: 2030-06-11 (Tue), 2030-06-13 (Thu). 2030-06-12 (Wed) is Russia Day.
+    for d in ("2030-06-11", "2030-06-13"):
+        con.execute(
+            "INSERT INTO bars(figi, ts, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?)",
+            ("BBG001", d, 100, 100, 100, 100, 1000),
+        )
+    # Add the MOEX holiday
+    con.execute(
+        "INSERT OR IGNORE INTO moex_holidays(date, name) VALUES (?, ?)",
+        ("2030-06-12", "Russia Day"),
+    )
+    con.commit()
+    con.close()
+
+    from algotrader_api.data_quality.gap_recovery import find_gaps
+    gaps = find_gaps(p)
+
+    figi_gaps = [g for g in gaps if g.figi == "BBG001"]
+    assert len(figi_gaps) == 0, (
+        f"find_gaps reported holidays as gaps: {[(g.from_, g.to_) for g in figi_gaps]}"
+    )
