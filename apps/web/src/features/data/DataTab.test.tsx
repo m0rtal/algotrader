@@ -351,4 +351,57 @@ describe('DataTab', () => {
     // The long day-precision form must NOT be in the page
     expect(allText).not.toMatch(/2021-08-10|2026-09-14|2021-09-01|2026-09-13/);
   });
+
+  it('renders all 5 KPI blocks with … placeholder while data is loading', async () => {
+    /**
+     * Regression: when backend is slow/down the KPI grid showed mixed
+     * placeholders — some `…`, some `0` (status.total_bars default),
+     * some `—` (totalGaps>0 false branch). Operators couldn't tell
+     * whether 0 was "really zero" or "haven't loaded yet".
+     *
+     * Contract: when data is loading, EVERY block renders `…`. Once
+     * data is loaded, real numbers replace the placeholder.
+     *
+     * Test simulates loading by stalling the backfill-status and
+     * tickers endpoints indefinitely. Use a fresh QueryClient so
+     * the shared module-level cache doesn't already have data from
+     * earlier tests.
+     */
+    server.use(
+      http.get('/api/admin/backfill/status', async () => {
+        await new Promise((r) => setTimeout(r, 10_000));
+        return HttpResponse.json(defaultStatus);
+      }),
+      http.get('/api/admin/backfill/pending', async () => {
+        await new Promise((r) => setTimeout(r, 10_000));
+        return HttpResponse.json(defaultPending);
+      }),
+      http.get('/api/tickets', async () => {
+        await new Promise((r) => setTimeout(r, 10_000));
+        return HttpResponse.json(sampleTickers);
+      }),
+    );
+    const freshClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const FreshWrap = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={freshClient}>{children}</QueryClientProvider>
+    );
+    FreshWrap.displayName = 'FreshQueryClientWrapper';
+    render(
+      <FreshWrap>
+        <DataTab />
+      </FreshWrap>,
+    );
+    await screen.findByRole('heading', { name: 'Данные' });
+
+    const allText = document.body.textContent ?? '';
+    const ellipsisMatches = allText.match(/…/g) ?? [];
+    expect(ellipsisMatches.length).toBeGreaterThanOrEqual(5);
+    const barsBlock = screen.getByText(/^Баров на диске$/).parentElement;
+    expect(barsBlock?.textContent).not.toMatch(/^\s*0\s*$/);
+    const gapsLabels = screen.getAllByText(/^Гэпы$/);
+    const gapsBlock = gapsLabels[0].parentElement;
+    expect(gapsBlock?.textContent).not.toMatch(/^\s*—\s*$/);
+  });
 });

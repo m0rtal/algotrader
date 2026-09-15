@@ -11,9 +11,9 @@ import {
 } from '@features/backfill/hooks';
 
 export function DataTab() {
-  const { data: status } = useBackfillStatus();
+  const { data: status, isLoading: statusLoading } = useBackfillStatus();
   const { data: pending } = usePendingCount();
-  const { data: tickers } = useTickers();
+  const { data: tickers, isLoading: tickersLoading } = useTickers();
   const start = useStartBackfill();
   const stop = useStopBackfill();
   const reset = useForceReset();
@@ -31,25 +31,34 @@ export function DataTab() {
       ? Math.round((status.tickers_done / status.tickers_total) * 100)
       : 0;
 
-  const totalBars = status?.total_bars ?? 0;
-  const tickersCount = tickers?.length ?? 0;
-  const totalGaps = tickers?.reduce((s, t) => s + t.gaps, 0) ?? 0;
-  const firstDate = tickers?.reduce<string | null>(
-    (acc, t) => (acc === null || t.firstDate < acc ? t.firstDate : acc),
-    null,
-  );
-  const lastDate = tickers?.reduce<string | null>(
-    (acc, t) => (acc === null || t.lastDate > acc ? t.lastDate : acc),
-    null,
-  );
+  // When data isn't loaded yet, every KPI block must show the same
+  // placeholder (`…`) — operators need a uniform signal to know
+  // they're looking at a loading state, not a real zero count.
+  const ready = !statusLoading && !tickersLoading && status != null && tickers != null;
+
+  const totalBars = ready ? status!.total_bars : null;
+  const tickersCount = ready ? tickers!.length : 0;
+  const totalGaps = ready ? tickers!.reduce((s, t) => s + t.gaps, 0) : null;
+  const firstDate = ready
+    ? tickers!.reduce<string | null>(
+        (acc, t) => (acc === null || t.firstDate < acc ? t.firstDate : acc),
+        null,
+      )
+    : null;
+  const lastDate = ready
+    ? tickers!.reduce<string | null>(
+        (acc, t) => (acc === null || t.lastDate > acc ? t.lastDate : acc),
+        null,
+      )
+    : null;
   const completeness = (() => {
-    if (!tickers || tickersCount === 0) return null;
+    if (!ready || tickersCount === 0) return null;
     // Per-ticker completeness: for each ticker, days_present /
     // ticker_span. Average across tickers. This avoids double-counting
     // gaps across tickers (the previous global-span / sum-gaps formula
     // showed 0% when sum_gaps > global_span, e.g. 73016 gaps in 1861
     // days).
-    const perTicker = tickers.map((t) => {
+    const perTicker = tickers!.map((t) => {
       const startMs = new Date(t.firstDate).getTime();
       const endMs = new Date(t.lastDate).getTime();
       const span = Math.max(1, Math.round((endMs - startMs) / 86_400_000));
@@ -70,7 +79,7 @@ export function DataTab() {
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">Данные</h2>
           <span className="text-xs text-[var(--muted-foreground)]">
-            Ежедневно в 02:00 МСК
+            Ежедневно в 23:00 МСК
           </span>
         </div>
         <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-5">
@@ -85,7 +94,7 @@ export function DataTab() {
               Баров на диске
             </p>
             <p className="font-mono text-base mt-1">
-              {totalBars.toLocaleString('ru')}
+              {totalBars != null ? totalBars.toLocaleString('ru') : '…'}
             </p>
           </div>
           <div>
@@ -109,7 +118,7 @@ export function DataTab() {
               Гэпы
             </p>
             <p className="font-mono text-base mt-1">
-              {totalGaps > 0 ? `${totalGaps.toLocaleString('ru')} дн` : '—'}
+              {totalGaps != null ? `${totalGaps.toLocaleString('ru')} дн` : '…'}
             </p>
           </div>
         </div>
@@ -286,7 +295,7 @@ export function DataTab() {
         title="Сбросить метаданные и перезагрузить всё?"
         body={
           pending
-            ? `Это удалит все строки instrument_metadata, поэтому следующий запланированный запуск (и любой последующий ручной триггер) перезагрузит всю историю для всех ${pending.total} инструментов. Используйте это только после корпоративного события, изменившего серию, или если подозреваете, что бары на диске повреждены. Плановое обслуживание автоматическое — ежедневный запуск в 02:00 МСК ловит новые и устаревшие тикеры без ручного вмешательства.`
+            ? `Это удалит все строки instrument_metadata, поэтому следующий запланированный запуск (и любой последующий ручной триггер) перезагрузит всю историю для всех ${pending.total} инструментов. Используйте это только после корпоративного события, изменившего серию, или если подозреваете, что бары на диске повреждены. Плановое обслуживание автоматическое — ежедневный запуск в 23:00 МСК ловит новые и устаревшие тикеры без ручного вмешательства.`
             : 'Загружаю количество инструментов…'
         }
         confirmLabel="Сбросить метаданные"
