@@ -61,22 +61,63 @@ def test_upsert_instruments_inserts_rows(tmp_path):
     assert [r["ticker"] for r in result] == ["GAZP", "SBER"]
 
 
-def test_upsert_instruments_replaces_existing(tmp_path):
+def test_upsert_instruments_refreshes_metadata_for_existing_figi(tmp_path):
+    """When the broker returns the same figi again with updated metadata
+    (different name, lot_size, etc.), upsert_instruments must refresh the
+    existing row. This covers cases like sector reclassification or
+    lot_size changes after corporate actions.
+    """
     db_path = str(tmp_path / "test.db")
     sqlitedb.run_migrations(db_path, MIGRATIONS_DIR)
     universe.upsert_instruments(
         db_path,
-        [{"ticker": "SBER", "figi": "old", "class": "share", "name": "old", "currency": "RUB", "lot_size": 10}],
+        [{"ticker": "SBER", "figi": "F1", "class": "share",
+         "name": "old", "currency": "RUB", "lot_size": 10}],
     )
     universe.upsert_instruments(
         db_path,
-        [{"ticker": "SBER", "figi": "new", "class": "share", "name": "new", "currency": "RUB", "lot_size": 1}],
+        [{"ticker": "SBER", "figi": "F1", "class": "share",
+         "name": "new", "currency": "RUB", "lot_size": 1}],
     )
     result = sqlitedb.execute(db_path, "SELECT figi, name, lot_size FROM instruments WHERE ticker = 'SBER'")
     assert len(result) == 1
-    assert result[0]["figi"] == "new"
+    assert result[0]["figi"] == "F1"
     assert result[0]["name"] == "new"
     assert result[0]["lot_size"] == 1
+
+
+def test_upsert_instruments_preserves_both_figis_for_duplicate_ticker(tmp_path):
+    """When the broker returns TWO figis for the same ticker (relisted
+    instruments), BOTH figis must coexist — neither replaces the other.
+
+    PR #50's "older figi wins" rule was wrong because relisted figis
+    carry the bars while the older figi has 0 bars (relisted = replaced).
+    Dropping the bar-carrying figi silently destroyed data.
+
+    The fix: drop PRIMARY KEY (ticker) so duplicate tickers can coexist.
+    figi remains UNIQUE so each figi is a distinct row.
+    """
+    db_path = str(tmp_path / "test.db")
+    sqlitedb.run_migrations(db_path, MIGRATIONS_DIR)
+    universe.upsert_instruments(
+        db_path,
+        [{"ticker": "RU000A1057D4", "figi": "TCS00A1057D4", "class": "bond",
+         "name": "Original", "currency": "rub", "lot_size": 1}],
+    )
+    universe.upsert_instruments(
+        db_path,
+        [{"ticker": "RU000A1057D4", "figi": "TCS90A1057D4", "class": "bond",
+         "name": "Relisted", "currency": "rub", "lot_size": 1}],
+    )
+    result = sqlitedb.execute(
+        db_path,
+        "SELECT figi, ticker FROM instruments ORDER BY figi",
+    )
+    figis = [(r["figi"], r["ticker"]) for r in result]
+    assert figis == [
+        ("TCS00A1057D4", "RU000A1057D4"),
+        ("TCS90A1057D4", "RU000A1057D4"),
+    ], f"Duplicate-ticker figis were collapsed: {figis}"
 
 
 def test_upsert_instruments_empty_returns_zero(tmp_path):

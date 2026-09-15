@@ -24,8 +24,6 @@ def empty_db(tmp_path):
 
 
 def test_upsert_instruments_drops_non_tradeable(empty_db):
-    """Even if a caller hands `upsert_instruments` a mixed bag, only
-    tradeable classes land in SQLite."""
     from algotrader_api.ingestion.universe import upsert_instruments
 
     rows = [

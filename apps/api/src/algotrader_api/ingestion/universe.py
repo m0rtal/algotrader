@@ -1,6 +1,7 @@
 """Discover all MOEX instruments and persist to SQLite."""
 from __future__ import annotations
 
+import sqlite3
 from typing import Any
 
 from ..db.sqlite import execute_returning_id
@@ -60,7 +61,7 @@ async def discover_universe(client: Any) -> list[dict]:
 
 
 def upsert_instruments(db_path: str, rows: list[dict]) -> int:
-    """INSERT OR REPLACE into instruments. Returns rows inserted.
+    """INSERT OR REPLACE into instruments keyed by figi.
 
     Filters to `TRADEABLE_CLASSES` before the upsert. This is the
     fourth line of defence — even if `discover_universe` ever
@@ -68,6 +69,14 @@ def upsert_instruments(db_path: str, rows: list[dict]) -> int:
     A `universe.class.post_filter_dropped` log line is emitted when
     any rows are dropped here, so the operator can see the filter
     was exercised.
+
+    Why figi-keyed and not ticker-keyed? Migration 016 dropped the
+    PRIMARY KEY on `ticker` because Tinkoff broker returns multiple
+    figis for the same ticker (relisted instruments). With ticker as
+    PK, the relisted figi was silently dropped — losing 277+ bars of
+    history in some cases. Keying the upsert on `figi` (UNIQUE)
+    preserves both rows. Same ticker is allowed; the backfill layer
+    addresses data by figi so duplicates are harmless.
 
     Batched in transactions of 100 for performance.
     """
