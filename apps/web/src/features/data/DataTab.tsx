@@ -73,7 +73,7 @@ export function DataTab() {
             Ежедневно в 02:00 МСК
           </span>
         </div>
-        <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
+        <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-5">
           <div>
             <p className="text-xs text-[var(--muted-foreground)] uppercase tracking-wide">
               Состояние
@@ -100,13 +100,14 @@ export function DataTab() {
             <p className="text-xs text-[var(--muted-foreground)] uppercase tracking-wide">
               Полнота
             </p>
+            <p className="font-mono text-base mt-1">{completeness ?? '…'}</p>
+          </div>
+          <div>
+            <p className="text-xs text-[var(--muted-foreground)] uppercase tracking-wide">
+              Гэпы
+            </p>
             <p className="font-mono text-base mt-1">
-              {completeness ?? '…'}
-              {completeness && (
-                <span className="ml-1 text-[11px] text-[var(--muted-foreground)]">
-                  гэпы: {totalGaps} дн
-                </span>
-              )}
+              {totalGaps > 0 ? `${totalGaps.toLocaleString('ru')} дн` : '—'}
             </p>
           </div>
         </div>
