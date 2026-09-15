@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
-import asyncio
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -356,6 +356,206 @@ class BackfillRunner:
             },
         )
         return processed
+
+    async def backfill_from_moex(
+        self,
+        *,
+        today: date | None = None,
+        delta_only: bool = True,
+    ) -> int:
+        """Walk every tradeable figi from MOEX listed_from to min(yesterday, listed_till).
+
+        Replaces the Tinkoff-only daily_backfill + full_history walk.
+        Insertion is INSERT OR IGNORE on PRIMARY KEY (figi, ts), so existing
+        Tinkoff bars (2021+) are never overwritten.
+
+        Algorithm:
+          1. List instruments via self._list_instruments().
+          2. For each figi:
+             a. Probe /iss/securities/{ticker}.json (cached in self._moex_meta).
+                - Pick primary board (TQBR/TQTF/SMAL for shares, TQOB/TQCB for bonds).
+                - Extract listed_from, listed_till, market (shares|bonds).
+                - If NO_BOARDS: fall back to self.client.get_candles() with [listed_from, yesterday].
+             b. Compute window = [max(moex_listed_from, figi's earliest existing bar - 30d), min(yesterday, moex_listed_till)].
+             c. If delta_only and window is empty (figi already has bars covering moex_listed_from..today), skip.
+             d. Walk window year-by-year via /iss/history/.../securities/{ticker}.json?from=YYYY-01-01&till=YYYY-12-31.
+                (For bonds: /markets/bonds/.)
+             e. INSERT OR IGNORE each bar via replace_bars_for_figi(..., replace=False).
+             f. Update instrument_metadata (first_bar_ts, last_bar_ts, total_bars).
+
+        Returns total bars written across all figis.
+        """
+        from ..db.bars_sqlite import replace_bars_for_figi
+        from . import retry as retry_mod
+
+        if today is None:
+            today = date.today()
+        yesterday = today - timedelta(days=1)
+        instruments = self._list_instruments()
+        self._moex_meta: dict[str, dict | None] = {}
+        self._moex_meta_lock = threading.Lock()
+
+        def get_meta(ticker: str) -> dict | None:
+            """Probe MOEX for ticker. Return {market, board, listed_from, listed_till} or None."""
+            import requests
+            with self._moex_meta_lock:
+                if ticker in self._moex_meta:
+                    return self._moex_meta[ticker]
+            url = f"https://iss.moex.com/iss/securities/{urllib.parse.quote(ticker)}.json"
+            try:
+                data = requests.get(url, timeout=10).json()
+            except Exception:
+                return None
+            boards = data.get("boards", {}).get("data", [])
+            primary = next(
+                (b for b in boards
+                 if b[8] == 1  # is_traded
+                 and b[1] in ("TQBR", "TQTF", "TQOB", "TQCB", "SMAL", "TQIF", "TQPI")),
+                None,
+            )
+            if not primary:
+                with self._moex_meta_lock:
+                    self._moex_meta[ticker] = None
+                return None
+            boardid = primary[1]
+            market = "bonds" if boardid in ("TQOB", "TQCB") else "shares"
+            listed_from = primary[12]
+            listed_till = primary[13]
+            meta = {
+                "market": market,
+                "board": boardid,
+                "listed_from": listed_from,
+                "listed_till": listed_till or yesterday.isoformat(),
+            }
+            with self._moex_meta_lock:
+                self._moex_meta[ticker] = meta
+            return meta
+
+        def fetch_year(market: str, board: str, ticker: str, year: int) -> list[dict]:
+            import requests
+            url = (
+                f"https://iss.moex.com/iss/history/engines/stock/markets/{market}/boards/{board}"
+                f"/securities/{urllib.parse.quote(ticker)}.json"
+            )
+            try:
+                data = requests.get(
+                    url,
+                    params={"from": f"{year}-01-01", "till": f"{year}-12-31"},
+                    timeout=30,
+                ).json()
+            except Exception:
+                return []
+            cols = data.get("history", {}).get("columns", [])
+            if not cols or "TRADEDATE" not in cols:
+                return []
+            rows = data.get("history", {}).get("data", [])
+            out = []
+            for row in rows:
+                d = dict(zip(cols, row))
+                out.append({
+                    "figi": None,  # filled by caller
+                    "ts": d.get("TRADEDATE"),
+                    "open": d.get("OPEN"),
+                    "high": d.get("HIGH"),
+                    "low": d.get("LOW"),
+                    "close": d.get("CLOSE"),
+                    "volume": int(d.get("VOLUME") or 0),
+                    "source": "moex",
+                })
+            return out
+
+        async def fetch_tinkoff_fallback(
+            figi: str, ticker: str, from_d: date, to_d: date
+        ) -> list[dict]:
+            """Tinkoff fallback for sanctions-delisted tickers where MOEX has no boards.
+            Walks in 7-day chunks via the existing Tinkoff client."""
+            chunk_retry = retry_mod.AdaptiveRetry(
+                max_attempts=2, initial_delay=0.5, backoff_factor=2.0, max_delay=5.0,
+            )
+            out = []
+            cur = from_d
+            while cur <= to_d:
+                chunk_end = min(cur + timedelta(days=6), to_d)
+                try:
+                    chunk = await chunk_retry.run(
+                        lambda cur=cur, chunk_end=chunk_end: self.client.get_candles(
+                            figi=figi, date_from=cur, date_to=chunk_end,
+                            interval="CANDLE_INTERVAL_DAY",
+                        )
+                    )
+                    out.extend(chunk)
+                except Exception:
+                    pass
+                cur = chunk_end + timedelta(days=1)
+            return out
+
+        written_total = 0
+
+        for inst in instruments:
+            if self._stop_flag.is_set():
+                break
+            figi = inst["figi"]
+            ticker = inst.get("ticker")
+            if not ticker:
+                continue
+
+            meta = get_meta(ticker)
+            if meta is None:
+                # Sanctions-delisted / no MOEX data: Tinkoff fallback
+                await self._log("info", figi=figi, message="no MOEX board; falling back to Tinkoff")
+                listed_from_iso = (inst.get("listed_from") or "2014-01-01")[:10]
+                try:
+                    from_d = date.fromisoformat(listed_from_iso)
+                except (TypeError, ValueError):
+                    from_d = date(2014, 1, 1)
+                candles = await fetch_tinkoff_fallback(figi, ticker, from_d, yesterday)
+                if not candles:
+                    await self._log("warn", figi=figi, message="Tinkoff fallback: no data")
+                    continue
+                written = replace_bars_for_figi(self.db_path, figi, candles, replace=False)
+                written_total += written
+                continue
+
+            listed_from_iso = meta["listed_from"]
+            listed_till_iso = meta["listed_till"]
+            try:
+                listed_from_d = date.fromisoformat(listed_from_iso[:10])
+                listed_till_d = date.fromisoformat(listed_till_iso[:10])
+            except (TypeError, ValueError):
+                continue
+
+            if delta_only:
+                con = __import__("sqlite3").connect(self.db_path)
+                try:
+                    row = con.execute(
+                        "SELECT MIN(ts) FROM bars WHERE figi = ?", (figi,)
+                    ).fetchone()
+                    first_ts = row[0] if row and row[0] else None
+                finally:
+                    con.close()
+                if first_ts and date.fromisoformat(first_ts[:10]) <= listed_from_d:
+                    # figi already has bars covering MOEX window — skip
+                    continue
+
+            to_d = min(yesterday, listed_till_d)
+            from_d = listed_from_d
+            if from_d > to_d:
+                continue
+
+            year = from_d.year
+            all_bars: list[dict] = []
+            while year <= to_d.year:
+                year_bars = fetch_year(meta["market"], meta["board"], ticker, year)
+                for b in year_bars:
+                    b["figi"] = figi
+                    all_bars.append(b)
+                year += 1
+            if not all_bars:
+                continue
+            written = replace_bars_for_figi(self.db_path, figi, all_bars, replace=False)
+            written_total += written
+
+        return written_total
 
     # ─── universe discovery ──────────────────────────────────────────
 
