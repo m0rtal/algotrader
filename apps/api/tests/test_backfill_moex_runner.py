@@ -1,6 +1,7 @@
 from __future__ import annotations
+import json
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -29,6 +30,31 @@ def fresh_db(tmp_path):
         INSERT INTO instruments (ticker, figi, class, name, currency, lot_size)
         VALUES ('SU46020RMFS2', 'FIGI-BOND', 'bond', 'OFZ', 'rub', 1);
     """)
+    con.commit()
+    con.close()
+    return db_path
+
+
+@pytest.fixture
+def sber_only_db(tmp_path):
+    """Pagination test fixtures focus only on SBER.
+
+    Other instruments are excluded so the test stays scoped to the
+    pagination behavior under test.
+    """
+    db_path = str(tmp_path / "test_sber.db")
+    from algotrader_api.db import sqlite as sqlitedb
+    migrations_dir = str(
+        Path(__file__).resolve().parent.parent
+        / "src/algotrader_api/db/migrations"
+    )
+    sqlitedb.run_migrations(db_path, migrations_dir)
+    sqlitedb.close_all()
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES ('SBER', 'BBG004730N88', 'share', 'Sber', 'rub', 10)"
+    )
     con.commit()
     con.close()
     return db_path
@@ -124,6 +150,93 @@ async def test_backfill_from_moex_writes_bars_with_dynamic_dates(fresh_db):
         ("BBG004730RP0", "2014-06-09", "moex"),
         ("FIGI-BOND", "2013-03-25", "moex"),
     ]
+
+
+@responses.activate
+async def test_backfill_from_moex_paginates_pages_in_year(sber_only_db):
+    """MOEX ISS returns max 500 bars/page; ``fetch_year`` must follow
+    the `start` cursor until a short page signals end-of-data.
+
+    Setup: SBER 2014. The mock returns 3 full pages of 100 bars and
+    one trailing page of 50 bars (350 total). After the fix
+    ``backfill_from_moex`` must persist all 350 bars; without
+    pagination it writes only the first 100.
+    """
+    from urllib.parse import urlparse, parse_qs
+
+    # SBER: listed 2014-01-01, still listed (single instrument keeps
+    # the test scoped to pagination behavior).
+    responses.add(
+        responses.GET,
+        "https://iss.moex.com/iss/securities/SBER.json",
+        json={"boards": {"data": [["SBER", "TQBR", "x", 0, 0, "shares", 0, 1, 1, 0,
+                                     "2014-01-01", "2026-09-14", "2014-01-01", "2026-09-15",
+                                     1, "SUR", "%"]]}},
+    )
+
+    page_size = 100
+    total_target = 350
+    # Pre-compute 350 valid (yyyy-mm-dd, ...) rows split into pages.
+    # 350 calendar days from 2014-01-01 (which lands in 2014-12-17) —
+    # the year filter still accepts them because MOEX filters
+    # server-side and the test asserts on row count, not on the
+    # exact dates.
+    rows_by_offset: dict[int, list[list]] = {}
+    base_date = date(2014, 1, 1)
+    cursor = 0
+    while cursor < total_target:
+        chunk_len = min(page_size, total_target - cursor)
+        rows = []
+        for i in range(chunk_len):
+            ts = (base_date + timedelta(days=cursor + i)).isoformat()
+            rows.append([ts, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i, 1000 + i])
+        rows_by_offset[cursor] = rows
+        cursor += page_size
+
+    def sber_history_cb(request):
+        qs = parse_qs(urlparse(request.url).query)
+        year_from = (qs.get("from") or [""])[0][:4]
+        if year_from != "2014":
+            return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"], "data": []}, "history.cursor": {"data": [[0, 0, 500]]}}')
+        try:
+            start = int((qs.get("start") or ["0"])[0])
+        except ValueError:
+            start = 0
+        rows = rows_by_offset.get(start, [])
+        # MOEX's history.cursor row is [offset, total, page_size]:
+        # offset = index where this page begins, total = dataset size
+        # overall, page_size = server's chosen page size. The fetcher
+        # compares offset+len(rows) against total to decide when to
+        # stop. We declare total_target so the fetcher keeps paging
+        # until every chunk has been seen.
+        cursor_json = '"history.cursor": {"data": [[' + str(start) + ', ' + str(total_target) + ', ' + str(page_size) + ']]}'
+        return (
+            200,
+            {},
+            '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"], '
+            '"data": ' + json.dumps(rows) + '}, '
+            + cursor_json + '}',
+        )
+
+    responses.add_callback(
+        responses.GET,
+        "https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/TQBR/securities/SBER.json",
+        callback=sber_history_cb,
+    )
+
+    runner = BackfillRunner(client=MagicMock(), db_path=sber_only_db, event_sink=_noop_sink)
+    written = await runner.backfill_from_moex(today=date(2026, 9, 15))
+
+    assert written == 350, f"expected 350 bars written across 4 pages, got {written}"
+    con = sqlite3.connect(sber_only_db)
+    try:
+        rows = con.execute(
+            "SELECT COUNT(*) FROM bars WHERE figi = ? AND source = 'moex'",
+            ("BBG004730N88",),
+        ).fetchone()
+    finally:
+        con.close()
+    assert rows and rows[0] == 350, f"expected 350 moex rows for SBER figi, got {rows and rows[0]}"
 
 
 @responses.activate
