@@ -112,7 +112,19 @@ def find_gaps(db_path: str) -> list[BarGap]:
         con = _open(db_path)
         try:
             restricted = _load_restricted_dates(con, first_ts, last_ts)
+            # Also load MOEX public holidays so gap detection doesn't
+            # report public holidays (Russia Day, Defender of Fatherland
+            # Day, etc.) as missing trading days.
+            holiday_rows = con.execute(
+                "SELECT date FROM moex_holidays WHERE date BETWEEN ? AND ?",
+                (first_ts.isoformat(), last_ts.isoformat()),
+            ).fetchall()
+            holiday_set = {
+                date.fromisoformat(r["date"]) for r in holiday_rows
+            }
             expected = _weekdays_minus_restricted(first_ts, last_ts, restricted)
+            # Remove public holidays from the expected set
+            expected -= holiday_set
             actual_rows = con.execute(
                 "SELECT ts FROM bars WHERE figi = ?", (figi,)
             ).fetchall()
