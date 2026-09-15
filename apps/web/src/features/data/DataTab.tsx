@@ -92,8 +92,10 @@ export function DataTab() {
             <p className="text-xs text-[var(--muted-foreground)] uppercase tracking-wide">
               Период
             </p>
-            <p className="font-mono text-base mt-1">
-              {firstDate && lastDate ? `${firstDate} → ${lastDate}` : '…'}
+            <p className="font-mono text-base mt-1 whitespace-nowrap">
+              {firstDate && lastDate
+                ? `${firstDate.slice(0, 7)} → ${lastDate.slice(0, 7)}`
+                : '…'}
             </p>
           </div>
           <div>

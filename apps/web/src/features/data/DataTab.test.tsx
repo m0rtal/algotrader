@@ -331,4 +331,24 @@ describe('DataTab', () => {
     // Must show the actual time
     expect(screen.getByText(/23:00\s*МСК/)).toBeInTheDocument();
   });
+
+  it('renders the KPI grid compactly: period shows year-month to fit one row', async () => {
+    /**
+     * Layout regression: with sm:grid-cols-5 the long Период string
+     * "2021-08-10 → 2026-09-14" can wrap and push the Гэпы block to a
+     * second row. Compact the period to year-month format and verify
+     * the long form is gone.
+     */
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+    await screen.findByText(/СОСТОЯНИЕ|^\s*Состояние/i);
+    const allText = document.body.textContent ?? '';
+    // The compact year-month form should be present somewhere
+    expect(allText).toMatch(/2021-09.{1,5}2026-09/);
+    // The long day-precision form must NOT be in the page
+    expect(allText).not.toMatch(/2021-08-10|2026-09-14|2021-09-01|2026-09-13/);
+  });
 });
