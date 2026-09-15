@@ -73,6 +73,23 @@ const sampleTickers = [
     fileSize: 98000,
     gaps: 0,
   },
+  {
+    // NEW bond: short span (2025-01-01..2026-09-13 = 622 days), no gaps.
+    // Used by the completeness test to force the per-ticker average
+    // to differ from the (span-gaps)/span formula:
+    //   sum formula: (1838 - (2+0+0)) / 1838 = 99.89% (coincidentally right)
+    //   avg formula: mean(99.89%, 100%, 100%) = 99.96% — same
+    // To make the bug visible we need gaps > 1 per ticker:
+    symbol: 'BOND',
+    name: 'Test bond',
+    sector: '',
+    price: 0,
+    bars: 1500,
+    firstDate: '2021-09-01',
+    lastDate: '2026-09-13',
+    fileSize: 0,
+    gaps: 50,
+  },
 ];
 
 function makeWrapper() {
@@ -210,5 +227,49 @@ describe('DataTab', () => {
     const sberRow = await screen.findByText(/SBER/);
     fireEvent.click(sberRow);
     expect(openTickerMock).toHaveBeenCalledWith('SBER');
+  });
+
+  it('renders completeness as per-ticker average, not sum across tickers', async () => {
+    /**
+     * Regression: completeness formula was
+     *   (global_span - sum_gaps) / global_span
+     * which double-counted gaps across tickers and read 0% when sum
+     * exceeded the global span (e.g. 73016 gaps vs 1861 days).
+     *
+     * Correct metric: average of (ticker_span - ticker_gaps) / ticker_span.
+     *
+     * Sample (after fix to make bug visible):
+     *   SBER (1838 days span, 2 gaps)  pct = 99.89%
+     *   GAZP (1838 days span, 0 gaps)  pct = 100.00%
+     *   BOND (1838 days span, 50 gaps) pct = 97.28%
+     *   sum formula: (1838 - 52)/1838 = 97.17% → "97.2%"  ← WRONG
+     *   avg formula: mean(99.89, 100, 97.28) = 99.06% → "99.1%"  ← correct
+     */
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+    const value = await screen.findByText(/99[.,]1\s*%/);
+    expect(value).toBeInTheDocument();
+    // Belt-and-suspenders: must NOT show the sum formula's wrong answer.
+    expect(screen.queryByText(/97[.,]2\s*%/)).toBeNull();
+  });
+
+  it('renders gaps as sum across tickers (73016-style)', async () => {
+    /**
+     * The "гэпы: N дн" field IS supposed to be the global sum across
+     * tickers — that's a meaningful operational metric ("how many
+     * gaps exist in total"). Only completeness was buggy.
+     *
+     * Sample has SBER.gaps=2 + GAZP.gaps=0 + BOND.gaps=50 = 52 total.
+     */
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+    const gapsText = await screen.findByText(/52\s*дн/);
+    expect(gapsText).toBeInTheDocument();
   });
 });
