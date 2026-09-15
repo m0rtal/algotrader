@@ -86,31 +86,38 @@ def test_upsert_instruments_refreshes_metadata_for_existing_figi(tmp_path):
     assert result[0]["lot_size"] == 1
 
 
-def test_upsert_instruments_keeps_existing_figi_on_duplicate_ticker(tmp_path):
-    """When the broker returns a NEW figi for an existing ticker
-    (relisted instrument), the existing figi wins (PK=ticker, older row
-    wins). The new figi is silently dropped but logged at WARN.
+def test_upsert_instruments_preserves_both_figis_for_duplicate_ticker(tmp_path):
+    """When the broker returns TWO figis for the same ticker (relisted
+    instruments), BOTH figis must coexist — neither replaces the other.
+
+    PR #50's "older figi wins" rule was wrong because relisted figis
+    carry the bars while the older figi has 0 bars (relisted = replaced).
+    Dropping the bar-carrying figi silently destroyed data.
+
+    The fix: drop PRIMARY KEY (ticker) so duplicate tickers can coexist.
+    figi remains UNIQUE so each figi is a distinct row.
     """
     db_path = str(tmp_path / "test.db")
     sqlitedb.run_migrations(db_path, MIGRATIONS_DIR)
     universe.upsert_instruments(
         db_path,
-        [{"ticker": "SBER", "figi": "old", "class": "share",
-         "name": "old", "currency": "RUB", "lot_size": 10}],
+        [{"ticker": "RU000A1057D4", "figi": "TCS00A1057D4", "class": "bond",
+         "name": "Original", "currency": "rub", "lot_size": 1}],
     )
-    inserted = universe.upsert_instruments(
+    universe.upsert_instruments(
         db_path,
-        [{"ticker": "SBER", "figi": "new", "class": "share",
-         "name": "new", "currency": "RUB", "lot_size": 1}],
+        [{"ticker": "RU000A1057D4", "figi": "TCS90A1057D4", "class": "bond",
+         "name": "Relisted", "currency": "rub", "lot_size": 1}],
     )
-    assert inserted == 0, (
-        f"Second figi should be dropped (PK collision), but reported {inserted} inserted"
+    result = sqlitedb.execute(
+        db_path,
+        "SELECT figi, ticker FROM instruments ORDER BY figi",
     )
-    result = sqlitedb.execute(db_path, "SELECT figi, name, lot_size FROM instruments WHERE ticker = 'SBER'")
-    assert len(result) == 1
-    assert result[0]["figi"] == "old"
-    assert result[0]["name"] == "old"
-    assert result[0]["lot_size"] == 10
+    figis = [(r["figi"], r["ticker"]) for r in result]
+    assert figis == [
+        ("TCS00A1057D4", "RU000A1057D4"),
+        ("TCS90A1057D4", "RU000A1057D4"),
+    ], f"Duplicate-ticker figis were collapsed: {figis}"
 
 
 def test_upsert_instruments_empty_returns_zero(tmp_path):
