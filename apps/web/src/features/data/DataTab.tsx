@@ -43,12 +43,21 @@ export function DataTab() {
     null,
   );
   const completeness = (() => {
-    if (!firstDate || !lastDate || tickersCount === 0) return null;
-    const startMs = new Date(firstDate).getTime();
-    const endMs = new Date(lastDate).getTime();
-    const span = Math.max(1, Math.round((endMs - startMs) / 86_400_000));
-    const days = Math.max(0, span - totalGaps);
-    return `${((days / span) * 100).toFixed(1)}%`;
+    if (!tickers || tickersCount === 0) return null;
+    // Per-ticker completeness: for each ticker, days_present /
+    // ticker_span. Average across tickers. This avoids double-counting
+    // gaps across tickers (the previous global-span / sum-gaps formula
+    // showed 0% when sum_gaps > global_span, e.g. 73016 gaps in 1861
+    // days).
+    const perTicker = tickers.map((t) => {
+      const startMs = new Date(t.firstDate).getTime();
+      const endMs = new Date(t.lastDate).getTime();
+      const span = Math.max(1, Math.round((endMs - startMs) / 86_400_000));
+      const daysPresent = Math.max(0, span - t.gaps);
+      return daysPresent / span;
+    });
+    const avg = perTicker.reduce((a, b) => a + b, 0) / perTicker.length;
+    return `${(avg * 100).toFixed(1)}%`;
   })();
 
   return (
