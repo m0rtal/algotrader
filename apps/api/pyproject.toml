@@ -64,6 +64,10 @@ omit = [
     # tools, …). They run once on demand, not in the request path,
     # so coverage gate doesn't apply.
     "src/algotrader_api/maintenance/*",
+    # One-off data-import scripts (CSV/JSON loaders, probes).
+    # Same rationale as maintenance/*: invoked manually by an operator
+    # or via cron, not from the FastAPI request path.
+    "src/algotrader_api/scripts_import/*",
 ]
 
 [tool.coverage.report]
