@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from ..data_quality.gap_recovery import find_gaps
 from ..db.sqlite import execute as sqlite_exec
 from ..observability.logging import get_logger
 
@@ -161,6 +162,12 @@ def get_tickers() -> list:
     by_figi = {r["figi"]: r for r in instrument_rows if r["figi"]}
     by_ticker = {r["ticker"]: r for r in instrument_rows if r["ticker"]}
 
+    # Real gap counts from find_gaps() — keyed by figi so two figis
+    # sharing a ticker (relisted shares) don't collide.
+    gaps_by_figi: dict[str, int] = {}
+    for g in find_gaps(_get_sqlite_path()):
+        gaps_by_figi[g.figi] = gaps_by_figi.get(g.figi, 0) + 1
+
     out: list[dict] = []
     for r in overview_rows:
         meta = by_figi.get(r["figi"]) or by_ticker.get(r["figi"])
@@ -175,7 +182,7 @@ def get_tickers() -> list:
                 "firstDate": str(r["first_ts"]),
                 "lastDate": str(r["last_ts"]),
                 "fileSize": 0,
-                "gaps": 0,
+                "gaps": gaps_by_figi.get(r["figi"], 0),
                 "currency": meta["currency"] if meta and meta["currency"] else "",
                 "lotSize": int(meta["lot_size"]) if meta and meta["lot_size"] else 0,
             }
