@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -92,7 +93,7 @@ def test_run_daily_chain_aborts_on_phase_failure(tmp_path: Path):
     fake_steps = {
         "migrations": make_step("migrations"),
         "universe_sync": make_step("universe_sync"),
-        "daily_backfill": make_step("daily_backfill", fail=True),
+        "backfill_moex": make_step("backfill_moex", fail=True),
         "corporate_actions": make_step("corporate_actions"),
         "dividends": make_step("dividends"),
         "guardian": make_step("guardian"),
@@ -107,7 +108,7 @@ def test_run_daily_chain_aborts_on_phase_failure(tmp_path: Path):
             rc = run_daily_chain()
 
     assert rc == 1
-    assert "daily_backfill" in calls
+    assert "backfill_moex" in calls
     assert "corporate_actions" not in calls
     assert "dividends" not in calls
     assert "guardian" not in calls
@@ -118,12 +119,21 @@ def test_run_daily_chain_logs_each_step_to_pipeline_log(tmp_path: Path):
     db_path = tmp_path / "test.db"
     _init_pipeline_log(db_path)
 
+    # Re-import worker so we get the same module instance the chain test
+    # suite uses (otherwise its `get_settings` patch misses us).
+    sys.modules.pop("worker", None)
+    importlib.import_module("worker")
+    worker_mod = sys.modules["worker"]
+    run_daily_chain = worker_mod.run_daily_chain
+    step_funcs = worker_mod._STEP_FUNCS
+    phases = worker_mod._DAILY_CHAIN_PHASES
+
     def ok_step(db_path: str):
         return True, "test"
 
-    fake_steps = {phase: ok_step for phase in _DAILY_CHAIN_PHASES}
+    fake_steps = {phase: ok_step for phase in phases}
 
-    with patch.dict(_STEP_FUNCS, fake_steps, clear=True):
+    with patch.dict(step_funcs, fake_steps, clear=True):
         with patch("worker.get_settings") as gs, \
              patch("worker.setup_logging"), \
              patch("worker.setup_tracing"), \
@@ -136,9 +146,9 @@ def test_run_daily_chain_logs_each_step_to_pipeline_log(tmp_path: Path):
         "SELECT phase, result FROM pipeline_log ORDER BY id"
     ).fetchall()
     conn.close()
-    assert len(rows) == 9  # 9-phase chain (migrations, universe_sync, daily_backfill, full_history, gap_recovery, corporate_actions, dividends, freshness_check, guardian)
+    assert len(rows) == 8  # 8-phase chain (migrations, universe_sync, backfill_moex, gap_recovery, corporate_actions, dividends, freshness_check, guardian)
     assert all(r[1] == "ok" for r in rows)
-    assert [r[0] for r in rows] == list(_DAILY_CHAIN_PHASES)
+    assert [r[0] for r in rows] == list(phases)
 
 
 def test_daily_is_default_mode():

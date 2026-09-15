@@ -272,8 +272,7 @@ def run_guardian() -> int:
 _DAILY_CHAIN_PHASES = (
     "migrations",
     "universe_sync",
-    "daily_backfill",
-    "full_history",
+    "backfill_moex",      # replaces daily_backfill + full_history (MOEX ISS, dynamic listed_from→yesterday)
     "gap_recovery",
     "corporate_actions",
     "dividends",
@@ -337,48 +336,38 @@ def _step_universe_sync(db_path: str) -> tuple[bool, str]:
         return False, f"universe sync failed: {exc}"
 
 
-def _step_daily_backfill(db_path: str) -> tuple[bool, str]:
-    """Append today's bar for every tradeable figi via BackfillRunner.
+def _step_backfill_moex(db_path: str) -> tuple[bool, str]:
+    """Walk every tradeable figi from MOEX listed_from to min(yesterday, listed_till).
 
-    Pre/post bars_count assertion: if the runner returns without
-    adding bars (rate-limit, dead ticker, broker hiccup), the
-    assertion fails and the chain aborts.
+    Replaces Tinkoff daily_backfill + full_history. MOEX ISS gives
+    us ~13 years of history per ticker vs. Tinkoff's ~5. Insertion
+    is INSERT OR IGNORE so existing Tinkoff bars (2021+) are preserved.
+    Sanctions-delisted tickers where MOEX has no boards fall back to
+    Tinkoff sandbox.
+
+    Delta-fetch is the default: only figis whose earliest bar is later
+    than MOEX's listed_from get processed. New figis (added by
+    universe_sync) get a full walk.
     """
     pre_count = snapshot_bars_count(db_path)
     try:
         from algotrader_api.ingestion.backfill import BackfillRunner
 
-        client = client_mod.make_client(sqlite_path=db_path, )
-        runner = BackfillRunner(client=client, db_path=db_path,
-                                event_sink=_async_noop_sink)
-        asyncio.run(runner.run(history_years=0,
-                               incremental_threshold_days=1))
-        pre, post, delta = assert_bars_increased(
-            db_path, phase="daily_backfill", pre_count=pre_count,
+        client = client_mod.make_client(sqlite_path=db_path)
+        runner = BackfillRunner(
+            client=client,
+            db_path=db_path,
+            event_sink=_async_noop_sink,
         )
-        return True, f"daily backfill: pre={pre} post={post} delta=+{delta}"
+        written = asyncio.run(runner.backfill_from_moex())
+        pre, post, delta = assert_bars_increased(
+            db_path, phase="backfill_moex", pre_count=pre_count,
+        )
+        return True, f"backfill_moex: pre={pre} post={post} delta=+{delta}"
     except AssertionError as exc:
         return False, str(exc)
     except Exception as exc:
-        return False, f"daily backfill failed: {exc}"
-
-
-def _step_full_history(db_path: str) -> tuple[bool, str]:
-    """Walk every figi from first_bar_ts-30d to yesterday.
-
-    Idempotent. The existing recover_stale logic in the guardian
-    handles what this can't (tickers with no bars at all).
-    """
-    try:
-        from algotrader_api.ingestion.backfill import BackfillRunner
-
-        client = client_mod.make_client(sqlite_path=db_path, )
-        runner = BackfillRunner(client=client, db_path=db_path,
-                                event_sink=_async_noop_sink)
-        count = asyncio.run(runner.run_full_history())
-        return True, f"full history: {count} figis processed"
-    except Exception as exc:
-        return False, f"full history failed: {exc}"
+        return False, f"backfill_moex failed: {exc}"
 
 
 def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
@@ -490,8 +479,7 @@ def _step_guardian(db_path: str) -> tuple[bool, str]:
 _STEP_FUNCS = {
     "migrations": _step_migrations,
     "universe_sync": _step_universe_sync,
-    "daily_backfill": _step_daily_backfill,
-    "full_history": _step_full_history,
+    "backfill_moex": _step_backfill_moex,
     "gap_recovery": _step_gap_recovery,
     "corporate_actions": _step_corporate_actions,
     "dividends": _step_dividends,
