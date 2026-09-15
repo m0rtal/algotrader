@@ -290,3 +290,63 @@ async def test_run_processes_figis_in_parallel(tmp_path):
         f"backfill took {elapsed:.1f}s for 10 figis × 0.5s each — "
         f"appears sequential. Expected <4s with concurrency."
     )
+
+@pytest.mark.asyncio
+async def test_backfill_one_empty_response_marks_metadata_as_up_to_date(tmp_path):
+    """When broker returns 0 candles (e.g., delisted figi), _backfill_one
+    must mark metadata.last_bar_ts to today so decide_strategy skips
+    the figi on the next run instead of looping forever.
+    """
+    db = tmp_path / "state.db"
+    _seed_migrations(db, _migrations_dir())
+    _seed_instruments(db)
+
+    from datetime import date
+
+    class _EmptyClient:
+        async def get_candles(self, **kw):
+            return []
+        async def aclose(self):
+            pass
+
+    async def _sink(ev):
+        pass
+
+    runner = BackfillRunner(client=_EmptyClient(), db_path=str(db), event_sink=_sink)
+    today = date.today()
+    await runner._backfill_one(
+        figi="BBG001", ticker="SBER", from_=today, to=today,
+    )
+
+    # metadata should have last_bar_ts=today (so next run skips via decide_strategy)
+    con = sqlite3.connect(str(db))
+    row = con.execute(
+        "SELECT last_bar_ts, last_run_status FROM instrument_metadata WHERE figi='BBG001'"
+    ).fetchone()
+    con.close()
+    assert row is not None, "metadata should be created"
+    assert row[1] == "skipped", f"status should be 'skipped', got {row[1]!r}"
+    # last_bar_ts must be set to today (or close to it) so next run sees
+    # days_since < incremental_threshold_days and skips
+    assert row[0] is not None, (
+        "last_bar_ts should NOT be None — that would cause decide_strategy "
+        "to return 'full' and trigger an infinite retry loop"
+    )
+    last_ts = date.fromisoformat(row[0])
+    assert last_ts == today, f"expected {today}, got {last_ts}"
+
+
+@pytest.mark.asyncio
+async def test_decide_strategy_skips_figi_with_fresh_last_bar_ts():
+    """If last_bar_ts = today, decide_strategy should return 'skip'."""
+    from algotrader_api.ingestion.backfill import decide_strategy
+    from datetime import date
+
+    today = date.today()
+    row = {"last_bar_ts": today.isoformat()}
+    strategy, from_, to = decide_strategy(
+        metadata_row=row, today=today, history_years=5, incremental_threshold_days=1,
+    )
+    assert strategy == "skip"
+    assert from_ is None
+    assert to is None

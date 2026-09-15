@@ -524,10 +524,28 @@ class BackfillRunner:
             return 0
         raw_candles = all_candles
         if not raw_candles:
+            # Empty response: broker has no data for this range. Mark
+            # last_bar_ts=today so decide_strategy skips on next run
+            # (otherwise it returns 'full' and we'd retry forever).
+            self._upsert_metadata(
+                figi=figi,
+                last_bar_ts=to,
+                total_bars=0,
+                status="skipped",
+                error_msg=None,
+            )
             await self._log(
                 "warn",
                 figi=figi,
                 message=f"no candles in {from_}..{to}",
+            )
+            await self._emit(
+                "ticker_progress",
+                {
+                    "figi": figi,
+                    "status": "empty",
+                    "bars_written": 0,
+                },
             )
             return 0
 
