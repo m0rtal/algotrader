@@ -272,4 +272,24 @@ describe('DataTab', () => {
     const gapsText = await screen.findByText(/52\s*дн/);
     expect(gapsText).toBeInTheDocument();
   });
+
+  it('shows the actual cron time (23:00 МСК), not the hardcoded 02:00 МСК', async () => {
+    /**
+     * Regression: UI label claimed "Ежедневно в 02:00 МСК" but actual
+     * crontab is `0 20 * * *` UTC = 23:00 MSK. The hardcoded label was
+     * never wired to the real schedule, so operators thought the chain
+     * ran in the middle of the night when it actually ran at 23:00 MSK.
+     *
+     * The cron script comments and crontab entry both confirm 20:00 UTC.
+     */
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+    // Must NOT show the wrong time
+    expect(screen.queryByText(/02:00\s*МСК/)).toBeNull();
+    // Must show the actual time
+    expect(screen.getByText(/23:00\s*МСК/)).toBeInTheDocument();
+  });
 });
