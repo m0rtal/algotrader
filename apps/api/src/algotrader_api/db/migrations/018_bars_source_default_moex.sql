@@ -1,0 +1,21 @@
+-- Migration 018: flip bars.source default to 'moex' (the new primary
+-- source for historical bars) and back-fill existing post-2021 rows as
+-- 'tinkoff'. Pre-2021 rows keep the column default 'moex' (added by
+-- ADD COLUMN).
+--
+-- The cutoff 2021-08-01 is safe: Tinkoff sandbox has no data before
+-- 2021-08-10, so any pre-cutoff row in bars must have come from MOEX
+-- ISS (whether from the previous-plan delta-fetch or this-plan full
+-- backfill).
+--
+-- Implementation note: this migration is the foundation that adds the
+-- `source` column to bars. If a prior migration (e.g. 017) had already
+-- added it with default 'tinkoff', the ADD COLUMN here is a no-op
+-- ("duplicate column" error is silenced by the migration runner). The
+-- UPDATE below then rewrites post-2021 rows to 'tinkoff' (idempotent
+-- if they already were). The default of an existing column is not
+-- flipped by this migration; if a future operator needs to flip the
+-- default on a pre-existing column, run a one-shot ALTER TABLE
+-- recreation.
+ALTER TABLE bars ADD COLUMN source TEXT NOT NULL DEFAULT 'moex';
+UPDATE bars SET source = 'tinkoff' WHERE ts >= '2021-08-01';
