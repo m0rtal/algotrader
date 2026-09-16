@@ -119,6 +119,12 @@ def replace_bars_for_figi(
     rows = []
     for c in candles:
         ts_str, o, h, l, cl, v = _row(c)
+        # Skip rows with any None OHLC value — MOEX occasionally returns
+        # trading sessions with no price data (illiquid instruments,
+        # sanctions-delisted tickers, half-days). float(None) raises
+        # TypeError and would abort the whole chain. Drop the row instead.
+        if o is None or h is None or l is None or cl is None:
+            continue
         rows.append((figi, ts_str, float(o), float(h), float(l), float(cl), int(v)))
 
     if not rows:

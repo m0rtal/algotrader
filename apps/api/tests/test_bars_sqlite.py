@@ -87,6 +87,30 @@ def test_replace_bars_for_figi_empty_list_noop(bars_db):
     con.close()
 
 
+def test_replace_bars_for_figi_skips_rows_with_none_ohlc(bars_db):
+    """Rows with None open/high/low/close are skipped (MOEX occasionally returns
+    trading sessions with no price data for illiquid instruments). The chain must
+    not abort — drop the bad row and continue with the rest.
+    """
+    candles = [
+        # valid row
+        {"ts": "2026-09-01", "open": 100, "high": 110, "low": 95, "close": 105, "volume": 1000},
+        # row with None close — must be skipped
+        {"ts": "2026-09-02", "open": 100, "high": 110, "low": 95, "close": None, "volume": 0},
+        # valid row
+        {"ts": "2026-09-03", "open": 101, "high": 112, "low": 96, "close": 106, "volume": 800},
+    ]
+    written = replace_bars_for_figi(bars_db, "FIGI-1", candles, replace=False)
+    assert written == 2, f"expected 2 rows inserted, got {written}"
+
+    con = sqlite3.connect(bars_db)
+    rows = con.execute(
+        "SELECT ts FROM bars WHERE figi = ? ORDER BY ts", ("FIGI-1",)
+    ).fetchall()
+    con.close()
+    assert [r[0] for r in rows] == ["2026-09-01", "2026-09-03"]
+
+
 # ─── read path ────────────────────────────────────────────────────────
 
 
