@@ -259,11 +259,27 @@ async def test_backfill_from_moex_handles_delisted_ticker_via_fallback(fresh_db)
 
 
 async def test_fetch_tinkoff_fallback_logs_progress_per_chunk(fresh_db):
-    """When Tinkoff fallback walks 7-day chunks, each chunk must emit a structured
-    log via structlog so operators can see why a figi takes 20+ min and identify stuck
-    ranges. Without this, a single slow chunk hides all progress.
-    """
+    """Each chunk must emit a structured log; isolate from test ordering."""
+    import structlog
     import structlog.testing as slog_test
+
+    # Pin structlog to JSON output, then capture for this call only.
+    # cache_logger_on_first_use=False forces re-resolution of any cached
+    # BoundLoggerLazyProxy in production modules so capture_logs sees them.
+    structlog.configure(
+        processors=[structlog.processors.JSONRenderer()],
+        wrapper_class=structlog.make_filtering_bound_logger(min_level=0),
+        cache_logger_on_first_use=False,
+    )
+    # If a prior test bound backfill.logger, its `bind` method was replaced
+    # with a finalized version pinning the old processor chain. Restore the
+    # unbound class method so the proxy re-resolves against the new config.
+    from algotrader_api.ingestion import backfill as _backfill_mod
+    _proxy = _backfill_mod.logger
+    if hasattr(_proxy, "_logger"):  # BoundLoggerLazyProxy
+        # Re-bind the original class method to this instance.
+        import types as _types
+        _proxy.bind = _types.MethodType(type(_proxy).bind, _proxy)
 
     chunks_observed: list[tuple] = []
 
@@ -275,7 +291,6 @@ async def test_fetch_tinkoff_fallback_logs_progress_per_chunk(fresh_db):
     client.get_candles = fake_get_candles
 
     runner = BackfillRunner(client=client, db_path=fresh_db, event_sink=_noop_sink)
-    # 1-year window from 2014-01-01 to 2014-12-31 → ~53 chunks
     from datetime import date
     with slog_test.capture_logs() as captured:
         # fetch_tinkoff_fallback is an inner closure; reach it via the runner's
@@ -305,3 +320,5 @@ async def test_fetch_tinkoff_fallback_logs_progress_per_chunk(fresh_db):
     # And progress events should have been logged
     progress_events = [e for e in captured if e.get("event") == "backfill.tinkoff.chunk"]
     assert len(progress_events) >= 50, f"expected ~53 progress events, got {len(progress_events)}"
+    # Reset structlog config so this test doesn't leak state to the next one
+    structlog.reset_defaults()
