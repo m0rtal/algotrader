@@ -25,8 +25,10 @@ def db(tmp_path):
             ("BAD", "FIGI-BAD", "Bad"),
         ],
     )
-    today = date(2026, 9, 12)
-    # FIGI-SBER healthy, FIGI-OFZ healthy (also), FIGI-GOOD healthy, FIGI-BAD stale.
+    today = date.today()
+    # FIGI-SBER/OFZ/GOOD healthy: 60 days of history through today so MISSING_RECENT
+    # (last_bar < today - 3 days) never fires regardless of when the test runs.
+    # Hardcoded end-dates drift past date.today() and break the healthy assertion.
     healthy = [(today - timedelta(days=i)).isoformat() for i in range(60, -1, -1)]
     for figi in ("FIGI-SBER", "FIGI-OFZ", "FIGI-GOOD"):
         con.executemany(
@@ -34,7 +36,8 @@ def db(tmp_path):
             "VALUES (?, ?, 1, 1, 1, 1, 1)",
             [(figi, d) for d in healthy],
         )
-    # BAD: last bar 10 days ago.
+    # BAD: last bar 10 days ago (relative to today so MISSING_RECENT keeps firing
+    # regardless of when the suite runs).
     stale = [(today - timedelta(days=i)).isoformat() for i in range(60, 10, -1)]
     con.executemany(
         "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
