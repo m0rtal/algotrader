@@ -610,7 +610,9 @@ class BackfillRunner:
                 year += 1
             if not all_bars:
                 continue
-            written = replace_bars_for_figi(self.db_path, figi, all_bars, replace=False)
+            written = replace_bars_for_figi(
+                self.db_path, figi, all_bars, replace=False, source="moex"
+            )
             written_total += written
 
         return written_total
