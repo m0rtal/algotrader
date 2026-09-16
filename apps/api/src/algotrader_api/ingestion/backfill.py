@@ -503,7 +503,13 @@ class BackfillRunner:
             figi: str, ticker: str, from_d: date, to_d: date
         ) -> list[dict]:
             """Tinkoff fallback for sanctions-delisted tickers where MOEX has no boards.
-            Walks in 7-day chunks via the existing Tinkoff client."""
+            Walks in 7-day chunks via the existing Tinkoff client.
+
+            Each chunk emits a ``tinkoff.chunk`` structured log via structlog so
+            operators can identify stuck ranges (a single 20-min hang used to
+            hide all progress; now each chunk is independently visible).
+            """
+            import time as _time
             chunk_retry = retry_mod.AdaptiveRetry(
                 max_attempts=2, initial_delay=0.5, backoff_factor=2.0, max_delay=5.0,
             )
@@ -511,6 +517,7 @@ class BackfillRunner:
             cur = from_d
             while cur <= to_d:
                 chunk_end = min(cur + timedelta(days=6), to_d)
+                chunk_start_t = _time.time()
                 try:
                     chunk = await chunk_retry.run(
                         lambda cur=cur, chunk_end=chunk_end: self.client.get_candles(
@@ -519,8 +526,23 @@ class BackfillRunner:
                         )
                     )
                     out.extend(chunk)
-                except Exception:
-                    pass
+                    logger.debug(
+                        "backfill.tinkoff.chunk",
+                        figi=figi, ticker=ticker,
+                        date_from=cur.isoformat(),
+                        date_to=chunk_end.isoformat(),
+                        elapsed_s=round(_time.time() - chunk_start_t, 3),
+                        rows=len(chunk),
+                    )
+                except Exception as e:
+                    logger.warn(
+                        "backfill.tinkoff.chunk.failed",
+                        figi=figi, ticker=ticker,
+                        date_from=cur.isoformat(),
+                        date_to=chunk_end.isoformat(),
+                        elapsed_s=round(_time.time() - chunk_start_t, 3),
+                        error=str(e)[:200],
+                    )
                 cur = chunk_end + timedelta(days=1)
             return out
 

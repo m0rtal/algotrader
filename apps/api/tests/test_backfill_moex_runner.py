@@ -256,3 +256,52 @@ async def test_backfill_from_moex_handles_delisted_ticker_via_fallback(fresh_db)
     written = await runner.backfill_from_moex(today=date(2026, 9, 15))
 
     assert written == 0, f"expected 0 bars written (Tinkoff returns empty), got {written}"
+
+
+async def test_fetch_tinkoff_fallback_logs_progress_per_chunk(fresh_db):
+    """When Tinkoff fallback walks 7-day chunks, each chunk must emit a structured
+    log via structlog so operators can see why a figi takes 20+ min and identify stuck
+    ranges. Without this, a single slow chunk hides all progress.
+    """
+    import structlog.testing as slog_test
+
+    chunks_observed: list[tuple] = []
+
+    async def fake_get_candles(figi, date_from, date_to, interval):
+        chunks_observed.append((date_from.isoformat(), date_to.isoformat()))
+        return []
+
+    client = MagicMock()
+    client.get_candles = fake_get_candles
+
+    runner = BackfillRunner(client=client, db_path=fresh_db, event_sink=_noop_sink)
+    # 1-year window from 2014-01-01 to 2014-12-31 → ~53 chunks
+    from datetime import date
+    with slog_test.capture_logs() as captured:
+        # fetch_tinkoff_fallback is an inner closure; reach it via the runner's
+        # local closure via the broader backfill_from_moex path. To keep the
+        # test independent, we just verify the chunked walk happens by counting
+        # how many times get_candles was called when we route a delisted ticker
+        # through backfill_from_moex.
+        # Sanctions-delisted: MOEX returns empty boards list
+        responses.add(
+            responses.GET,
+            "https://iss.moex.com/iss/securities/CHUNKLOG.json",
+            json={"boards": {"data": []}},
+        )
+        # Seed an instrument so backfill_from_moex picks it up
+        import sqlite3 as _sq
+        _con = _sq.connect(fresh_db)
+        _con.execute(
+            "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin, sector) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("CHUNKLOG", "BBG-CHUNKLOG", "share", "Chunklog test", "rub", 1, "TEST", "test"),
+        )
+        _con.commit()
+        _con.close()
+        await runner.backfill_from_moex(today=date(2015, 1, 1))
+    # Should have ~53 chunks observed (2014-01-01 to 2014-12-31 in 7-day steps)
+    assert len(chunks_observed) >= 50, f"expected ~53 chunks, got {len(chunks_observed)}"
+    # And progress events should have been logged
+    progress_events = [e for e in captured if e.get("event") == "backfill.tinkoff.chunk"]
+    assert len(progress_events) >= 50, f"expected ~53 progress events, got {len(progress_events)}"
