@@ -97,6 +97,188 @@ def decide_strategy(
 # ─── runner ──────────────────────────────────────────────────────────
 
 
+# ─── module-level backfill helpers (testable, patchable) ───────────
+#
+# These were extracted from inner closures of BackfillRunner.backfill_from_moex
+# so tests can patch them at the class level (BackfillRunner._fetch_year_moex,
+# etc.) instead of digging through closures. The bodies are identical to the
+# original closures; only the call surface changed.
+#
+# Why not @staticmethod on the class directly: staticmethods can't be
+# patched with ``unittest.mock.patch.object`` on the class attribute — they
+# must be module-level functions that the class binds via ``name = ...``.
+# This is the standard pattern (see Flask, requests).
+
+
+def _get_meta_moex(
+    ticker: str,
+    yesterday: date,
+    *,
+    meta_cache: dict[str, dict | None],
+    meta_lock: threading.Lock,
+) -> dict | None:
+    """Probe MOEX for ticker. Return {market, board, listed_from, listed_till} or None.
+
+    Extracted from inner closure so tests can patch it.
+    Caches results in ``meta_cache`` (guarded by ``meta_lock``) — same
+    caching the inline closure used so concurrent access behaves identically.
+    """
+    import requests
+    with meta_lock:
+        if ticker in meta_cache:
+            return meta_cache[ticker]
+    url = f"https://iss.moex.com/iss/securities/{urllib.parse.quote(ticker)}.json"
+    try:
+        data = requests.get(url, timeout=10).json()
+    except Exception:
+        return None
+    boards = data.get("boards", {}).get("data", [])
+    primary = next(
+        (b for b in boards
+         if len(b) > 8 and b[8] == 1  # is_traded
+         and b[1] in ("TQBR", "TQTF", "TQOB", "TQCB", "SMAL", "TQIF", "TQPI")),
+        None,
+    )
+    if not primary:
+        with meta_lock:
+            meta_cache[ticker] = None
+        return None
+    boardid = primary[1]
+    market = "bonds" if boardid in ("TQOB", "TQCB") else "shares"
+    listed_from = primary[12]
+    listed_till = primary[13]
+    meta = {
+        "market": market,
+        "board": boardid,
+        "listed_from": listed_from,
+        "listed_till": listed_till or yesterday.isoformat(),
+    }
+    with meta_lock:
+        meta_cache[ticker] = meta
+    return meta
+
+
+def _fetch_year_moex(market: str, board: str, ticker: str, year: int) -> list[dict]:
+    """Walk MOEX ISS /iss/history/.../securities/{ticker}.json for ``year``.
+
+    MOEX caps a single response at 500 bars; for a year with >500
+    trading days (rare, but possible for ETFs) we would miss data.
+    We use the server-reported ``history.cursor`` (offset, total,
+    page-size) to decide when to stop. Page-size itself comes from
+    the cursor field — pre-2024-Q3 MOEX returned 100 even when we
+    asked for 500; asking for 500 simply lets the server pick its
+    current maximum and tell us via the cursor.
+    """
+    import requests
+    base = (
+        f"https://iss.moex.com/iss/history/engines/stock/markets/{market}/boards/{board}"
+        f"/securities/{urllib.parse.quote(ticker)}.json"
+    )
+    out: list[dict] = []
+    start = 0
+    page_size = 500
+    while True:
+        try:
+            data = requests.get(
+                base,
+                params={
+                    "from": f"{year}-01-01",
+                    "till": f"{year}-12-31",
+                    "start": start,
+                },
+                timeout=30,
+            ).json()
+        except Exception:
+            break
+        cols = data.get("history", {}).get("columns", [])
+        if not cols or "TRADEDATE" not in cols:
+            break
+        rows = data.get("history", {}).get("data", [])
+        if not rows:
+            break
+        for row in rows:
+            d = dict(zip(cols, row))
+            out.append({
+                "figi": None,  # filled by caller
+                "ts": d.get("TRADEDATE"),
+                "open": d.get("OPEN"),
+                "high": d.get("HIGH"),
+                "low": d.get("LOW"),
+                "close": d.get("CLOSE"),
+                "volume": int(d.get("VOLUME") or 0),
+                "source": "moex",
+            })
+        # history.cursor rows: [offset, total, page_size]. When
+        # offset + len(rows) >= total, we've seen everything.
+        cursor_rows = data.get("history.cursor", {}).get("data") or []
+        if cursor_rows:
+            try:
+                offset, total, _srv_page_size = cursor_rows[0][:3]
+                if offset is not None and total is not None and offset + len(rows) >= total:
+                    break
+            except (TypeError, ValueError):
+                pass
+        else:
+            # No cursor at all: fall back to "short page = last".
+            if len(rows) < page_size:
+                break
+        start += len(rows)
+    return out
+
+
+async def _fetch_tinkoff_fallback_impl(
+    client: Any,
+    retry_mod: Any,
+    figi: str,
+    ticker: str,
+    from_d: date,
+    to_d: date,
+) -> list[dict]:
+    """Tinkoff fallback for sanctions-delisted tickers where MOEX has no boards.
+    Walks in 7-day chunks via the existing Tinkoff client.
+
+    Each chunk emits a ``tinkoff.chunk`` structured log via structlog so
+    operators can identify stuck ranges (a single 20-min hang used to
+    hide all progress; now each chunk is independently visible).
+    """
+    import time as _time
+    chunk_retry = retry_mod.AdaptiveRetry(
+        max_attempts=2, initial_delay=0.5, backoff_factor=2.0, max_delay=5.0,
+    )
+    out = []
+    cur = from_d
+    while cur <= to_d:
+        chunk_end = min(cur + timedelta(days=6), to_d)
+        chunk_start_t = _time.time()
+        try:
+            chunk = await chunk_retry.run(
+                lambda cur=cur, chunk_end=chunk_end: client.get_candles(
+                    figi=figi, date_from=cur, date_to=chunk_end,
+                    interval="CANDLE_INTERVAL_DAY",
+                )
+            )
+            out.extend(chunk)
+            logger.debug(
+                "backfill.tinkoff.chunk",
+                figi=figi, ticker=ticker,
+                date_from=cur.isoformat(),
+                date_to=chunk_end.isoformat(),
+                elapsed_s=round(_time.time() - chunk_start_t, 3),
+                rows=len(chunk),
+            )
+        except Exception as e:
+            logger.warn(
+                "backfill.tinkoff.chunk.failed",
+                figi=figi, ticker=ticker,
+                date_from=cur.isoformat(),
+                date_to=chunk_end.isoformat(),
+                elapsed_s=round(_time.time() - chunk_start_t, 3),
+                error=str(e)[:200],
+            )
+        cur = chunk_end + timedelta(days=1)
+    return out
+
+
 @dataclass
 class BackfillRunner:
     """Orchestrates one full backfill run end to end.
@@ -126,6 +308,14 @@ class BackfillRunner:
     tickers_done: int = 0
     tickers_total: int = 0
     total_bars: int = 0
+
+    # Expose module-level backfill helpers as class attributes so tests
+    # can patch them with ``patch.object(BackfillRunner, '_fetch_year_moex')``.
+    # These bindings mirror the inner closures that used to live inside
+    # backfill_from_moex — same logic, but reachable from outside.
+    _fetch_year_moex = staticmethod(_fetch_year_moex)
+    _get_meta_moex = staticmethod(_get_meta_moex)
+    _fetch_tinkoff_fallback = staticmethod(_fetch_tinkoff_fallback_impl)
 
     # ─── public API ──────────────────────────────────────────────────
 
@@ -396,155 +586,15 @@ class BackfillRunner:
         self._moex_meta: dict[str, dict | None] = {}
         self._moex_meta_lock = threading.Lock()
 
-        def get_meta(ticker: str) -> dict | None:
-            """Probe MOEX for ticker. Return {market, board, listed_from, listed_till} or None."""
-            import requests
-            with self._moex_meta_lock:
-                if ticker in self._moex_meta:
-                    return self._moex_meta[ticker]
-            url = f"https://iss.moex.com/iss/securities/{urllib.parse.quote(ticker)}.json"
-            try:
-                data = requests.get(url, timeout=10).json()
-            except Exception:
-                return None
-            boards = data.get("boards", {}).get("data", [])
-            primary = next(
-                (b for b in boards
-                 if b[8] == 1  # is_traded
-                 and b[1] in ("TQBR", "TQTF", "TQOB", "TQCB", "SMAL", "TQIF", "TQPI")),
-                None,
+        def _get_meta(ticker: str) -> dict | None:
+            """Inline thin wrapper around the module-level helper, kept so
+            other code in the method reads naturally. Real work happens in
+            BackfillRunner._get_meta_moex so tests can patch it."""
+            return self._get_meta_moex(
+                ticker, yesterday,
+                meta_cache=self._moex_meta,
+                meta_lock=self._moex_meta_lock,
             )
-            if not primary:
-                with self._moex_meta_lock:
-                    self._moex_meta[ticker] = None
-                return None
-            boardid = primary[1]
-            market = "bonds" if boardid in ("TQOB", "TQCB") else "shares"
-            listed_from = primary[12]
-            listed_till = primary[13]
-            meta = {
-                "market": market,
-                "board": boardid,
-                "listed_from": listed_from,
-                "listed_till": listed_till or yesterday.isoformat(),
-            }
-            with self._moex_meta_lock:
-                self._moex_meta[ticker] = meta
-            return meta
-
-        def fetch_year(market: str, board: str, ticker: str, year: int) -> list[dict]:
-            """Walk MOEX ISS /iss/history/.../securities/{ticker}.json for ``year``.
-
-            MOEX caps a single response at 500 bars; for a year with >500
-            trading days (rare, but possible for ETFs) we would miss data.
-            We use the server-reported ``history.cursor`` (offset, total,
-            page-size) to decide when to stop. Page-size itself comes from
-            the cursor field — pre-2024-Q3 MOEX returned 100 even when we
-            asked for 500; asking for 500 simply lets the server pick its
-            current maximum and tell us via the cursor.
-            """
-            import requests
-            base = (
-                f"https://iss.moex.com/iss/history/engines/stock/markets/{market}/boards/{board}"
-                f"/securities/{urllib.parse.quote(ticker)}.json"
-            )
-            out: list[dict] = []
-            start = 0
-            page_size = 500
-            while True:
-                try:
-                    data = requests.get(
-                        base,
-                        params={
-                            "from": f"{year}-01-01",
-                            "till": f"{year}-12-31",
-                            "start": start,
-                        },
-                        timeout=30,
-                    ).json()
-                except Exception:
-                    break
-                cols = data.get("history", {}).get("columns", [])
-                if not cols or "TRADEDATE" not in cols:
-                    break
-                rows = data.get("history", {}).get("data", [])
-                if not rows:
-                    break
-                for row in rows:
-                    d = dict(zip(cols, row))
-                    out.append({
-                        "figi": None,  # filled by caller
-                        "ts": d.get("TRADEDATE"),
-                        "open": d.get("OPEN"),
-                        "high": d.get("HIGH"),
-                        "low": d.get("LOW"),
-                        "close": d.get("CLOSE"),
-                        "volume": int(d.get("VOLUME") or 0),
-                        "source": "moex",
-                    })
-                # history.cursor rows: [offset, total, page_size]. When
-                # offset + len(rows) >= total, we've seen everything.
-                cursor_rows = data.get("history.cursor", {}).get("data") or []
-                if cursor_rows:
-                    try:
-                        offset, total, _srv_page_size = cursor_rows[0][:3]
-                        if offset is not None and total is not None and offset + len(rows) >= total:
-                            break
-                    except (TypeError, ValueError):
-                        pass
-                else:
-                    # No cursor at all: fall back to "short page = last".
-                    if len(rows) < page_size:
-                        break
-                start += len(rows)
-            return out
-
-        async def fetch_tinkoff_fallback(
-            figi: str, ticker: str, from_d: date, to_d: date
-        ) -> list[dict]:
-            """Tinkoff fallback for sanctions-delisted tickers where MOEX has no boards.
-            Walks in 7-day chunks via the existing Tinkoff client.
-
-            Each chunk emits a ``tinkoff.chunk`` structured log via structlog so
-            operators can identify stuck ranges (a single 20-min hang used to
-            hide all progress; now each chunk is independently visible).
-            """
-            import time as _time
-            chunk_retry = retry_mod.AdaptiveRetry(
-                max_attempts=2, initial_delay=0.5, backoff_factor=2.0, max_delay=5.0,
-            )
-            out = []
-            cur = from_d
-            while cur <= to_d:
-                chunk_end = min(cur + timedelta(days=6), to_d)
-                chunk_start_t = _time.time()
-                try:
-                    chunk = await chunk_retry.run(
-                        lambda cur=cur, chunk_end=chunk_end: self.client.get_candles(
-                            figi=figi, date_from=cur, date_to=chunk_end,
-                            interval="CANDLE_INTERVAL_DAY",
-                        )
-                    )
-                    out.extend(chunk)
-                    logger.debug(
-                        "backfill.tinkoff.chunk",
-                        figi=figi, ticker=ticker,
-                        date_from=cur.isoformat(),
-                        date_to=chunk_end.isoformat(),
-                        elapsed_s=round(_time.time() - chunk_start_t, 3),
-                        rows=len(chunk),
-                    )
-                except Exception as e:
-                    logger.warn(
-                        "backfill.tinkoff.chunk.failed",
-                        figi=figi, ticker=ticker,
-                        date_from=cur.isoformat(),
-                        date_to=chunk_end.isoformat(),
-                        elapsed_s=round(_time.time() - chunk_start_t, 3),
-                        error=str(e)[:200],
-                    )
-                cur = chunk_end + timedelta(days=1)
-            return out
 
         written_total = 0
         s_http = __import__("requests").Session()
@@ -557,7 +607,7 @@ class BackfillRunner:
             if not ticker:
                 continue
 
-            meta = get_meta(ticker)
+            meta = _get_meta(ticker)
             if meta is None:
                 # Sanctions-delisted / no MOEX data: Tinkoff fallback
                 await self._log("info", figi=figi, message="no MOEX board; falling back to Tinkoff")
@@ -566,7 +616,9 @@ class BackfillRunner:
                     from_d = date.fromisoformat(listed_from_iso)
                 except (TypeError, ValueError):
                     from_d = date(2014, 1, 1)
-                candles = await fetch_tinkoff_fallback(figi, ticker, from_d, yesterday)
+                candles = await self._fetch_tinkoff_fallback(
+                    self.client, retry_mod, figi, ticker, from_d, yesterday,
+                )
                 if not candles:
                     await self._log("warn", figi=figi, message="Tinkoff fallback: no data")
                     continue
@@ -591,19 +643,28 @@ class BackfillRunner:
                     first_ts = row[0] if row and row[0] else None
                 finally:
                     con.close()
-                if first_ts and date.fromisoformat(first_ts[:10]) <= listed_from_d:
-                    # figi already has bars covering MOEX window — skip
-                    continue
+                if first_ts:
+                    earliest = date.fromisoformat(first_ts[:10])
+                    if earliest <= listed_from_d:
+                        # figi already has bars covering MOEX window — skip
+                        continue
+                    # 30-day buffer before earliest existing bar so we
+                    # catch any late-listed data MOEX holds before the
+                    # Tinkoff range without re-walking the full history.
+                    from_d = max(listed_from_d, earliest - timedelta(days=30))
+                else:
+                    from_d = listed_from_d
 
             to_d = min(yesterday, listed_till_d)
-            from_d = listed_from_d
+            if not delta_only:
+                from_d = listed_from_d
             if from_d > to_d:
                 continue
 
             year = from_d.year
             all_bars: list[dict] = []
             while year <= to_d.year:
-                year_bars = fetch_year(meta["market"], meta["board"], ticker, year)
+                year_bars = self._fetch_year_moex(meta["market"], meta["board"], ticker, year)
                 for b in year_bars:
                     b["figi"] = figi
                     all_bars.append(b)
