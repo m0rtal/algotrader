@@ -1,6 +1,6 @@
 """Tests for the daily refresh chain (apps/api/worker.py).
 
-The chain is a 9-phase ordered list of step functions. These tests
+The chain is an 8-phase ordered list of step functions. These tests
 patch every step to its FakeClient-shaped stub so we can exercise the
 chain's plumbing without hitting the broker or the data-quality
 service.
@@ -84,11 +84,11 @@ def _patch_all_steps(monkeypatch, *, results: dict | None = None):
 
 
 # --------------------------------------------------------------------------- #
-# 1. All 9 phases run in order
+# 1. All 8 phases run in order
 # --------------------------------------------------------------------------- #
 
 
-def test_chain_runs_all_9_phases_in_order(monkeypatch):
+def test_chain_runs_all_8_phases_in_order(monkeypatch):
     worker, calls = _patch_all_steps(monkeypatch)
 
     rc = worker.run_daily_chain()
@@ -97,29 +97,28 @@ def test_chain_runs_all_9_phases_in_order(monkeypatch):
     expected = [
         "migrations",
         "universe_sync",
-        "daily_backfill",
-        "full_history",
+        "backfill_moex",
         "gap_recovery",
         "corporate_actions",
         "dividends",
         "freshness_check",
         "guardian",
     ]
-    assert len(worker._DAILY_CHAIN_PHASES) == 9
+    assert len(worker._DAILY_CHAIN_PHASES) == 8
     assert [c[0] for c in calls] == expected
 
 
 # --------------------------------------------------------------------------- #
-# 2. Chain aborts when daily_backfill doesn't add bars
+# 2. Chain aborts when backfill_moex doesn't add bars
 # --------------------------------------------------------------------------- #
 
 
-def test_chain_aborts_when_daily_backfill_shrinks_bars(monkeypatch):
+def test_chain_aborts_when_backfill_moex_shrinks_bars(monkeypatch):
     worker, calls = _patch_all_steps(
         monkeypatch,
         results={
-            "daily_backfill": "pre=10 post=8 delta=-2",
-            "daily_backfill._ok": False,
+            "backfill_moex": "pre=10 post=8 delta=-2",
+            "backfill_moex._ok": False,
         },
     )
 
@@ -127,9 +126,9 @@ def test_chain_aborts_when_daily_backfill_shrinks_bars(monkeypatch):
 
     assert rc == 1
     actual = [c[0] for c in calls]
-    assert actual[:3] == ["migrations", "universe_sync", "daily_backfill"]
-    # Steps after daily_backfill did NOT run
-    for skipped in ("full_history", "gap_recovery", "dividends", "guardian"):
+    assert actual[:3] == ["migrations", "universe_sync", "backfill_moex"]
+    # Steps after backfill_moex did NOT run
+    for skipped in ("gap_recovery", "dividends", "guardian"):
         assert skipped not in actual
 
 
@@ -154,8 +153,9 @@ def test_chain_aborts_when_dividends_stale(monkeypatch):
     assert "dividends" in actual
     assert "freshness_check" not in actual
     assert "guardian" not in actual
-    # 0-indexed: 7th of 9 phases
-    assert actual.index("dividends") == 6
+    # 0-indexed: 5th of 8 phases (migrations, universe_sync, backfill_moex,
+    # gap_recovery, corporate_actions, dividends)
+    assert actual.index("dividends") == 5
 
 
 # --------------------------------------------------------------------------- #
@@ -257,7 +257,7 @@ def test_step_universe_sync_exception(tmp_path):
     assert "universe sync failed" in detail
 
 
-def test_step_daily_backfill_ok(tmp_path):
+def test_step_backfill_moex_ok(tmp_path):
     worker = _import_worker()
     db = str(tmp_path / "x.db")
     conn = sqlite3.connect(db)
@@ -268,13 +268,13 @@ def test_step_daily_backfill_ok(tmp_path):
 
     fake_runner = MagicMock()
 
-    async def _run(**kw):
+    async def _backfill_from_moex():
         conn = sqlite3.connect(db)
         conn.execute("INSERT INTO bars VALUES ('x', '2099-01-01')")
         conn.commit()
         conn.close()
 
-    fake_runner.run.side_effect = _run
+    fake_runner.backfill_from_moex.side_effect = _backfill_from_moex
     fake_pkg = MagicMock()
     fake_pkg.BackfillRunner.return_value = fake_runner
     fake_client_mod = MagicMock()
@@ -282,13 +282,13 @@ def test_step_daily_backfill_ok(tmp_path):
 
     with patch.dict(sys.modules, {"algotrader_api.ingestion.backfill": fake_pkg}):
         with patch.object(worker, "client_mod", fake_client_mod):
-            ok, detail = worker._step_daily_backfill(db)
+            ok, detail = worker._step_backfill_moex(db)
     assert ok is True
     assert "delta=" in detail
 
 
-def test_step_daily_backfill_sshers_on_db_via_runner(tmp_path):
-    """When runner.run() deletes bars, the assertion fires.
+def test_step_backfill_moex_shrinks_on_db_via_runner(tmp_path):
+    """When runner.backfill_from_moex() deletes bars, the assertion fires.
 
     Covers the no-progress regression in the brief by verifying the
     assertion path is reachable when post < pre.
@@ -304,14 +304,14 @@ def test_step_daily_backfill_sshers_on_db_via_runner(tmp_path):
 
     fake_runner = MagicMock()
 
-    async def _run(**kw):
+    async def _backfill_from_moex():
         # Simulate the runner deleting a row.
         conn = sqlite3.connect(db)
         conn.execute("DELETE FROM bars WHERE figi='y'")
         conn.commit()
         conn.close()
 
-    fake_runner.run.side_effect = _run
+    fake_runner.backfill_from_moex.side_effect = _backfill_from_moex
     fake_pkg = MagicMock()
     fake_pkg.BackfillRunner.return_value = fake_runner
     fake_client_mod = MagicMock()
@@ -319,12 +319,12 @@ def test_step_daily_backfill_sshers_on_db_via_runner(tmp_path):
 
     with patch.dict(sys.modules, {"algotrader_api.ingestion.backfill": fake_pkg}):
         with patch.object(worker, "client_mod", fake_client_mod):
-            ok, detail = worker._step_daily_backfill(db)
+            ok, detail = worker._step_backfill_moex(db)
     assert ok is False
     assert "shrunk" in detail or "delta=" in detail
 
 
-def test_step_daily_backfill_exception(tmp_path):
+def test_step_backfill_moex_exception(tmp_path):
     worker = _import_worker()
     db = str(tmp_path / "x.db")
     # Create bars table so snapshot_bars_count() doesn't blow up first.
@@ -334,49 +334,14 @@ def test_step_daily_backfill_exception(tmp_path):
     conn.close()
 
     fake_pkg = MagicMock()
-    fake_pkg.BackfillRunner.return_value.run.side_effect = RuntimeError("boom")
+    fake_pkg.BackfillRunner.return_value.backfill_from_moex.side_effect = RuntimeError("boom")
     fake_client_mod = MagicMock()
     fake_client_mod.make_client.return_value = MagicMock()
     with patch.dict(sys.modules, {"algotrader_api.ingestion.backfill": fake_pkg}):
         with patch.object(worker, "client_mod", fake_client_mod):
-            ok, detail = worker._step_daily_backfill(db)
+            ok, detail = worker._step_backfill_moex(db)
     assert ok is False
-    assert "daily backfill failed" in detail
-
-
-def test_step_full_history_ok(tmp_path):
-    worker = _import_worker()
-    db = str(tmp_path / "x.db")
-    fake_runner = MagicMock()
-
-    async def _fh():
-        return 7
-    fake_runner.run_full_history.side_effect = _fh
-    fake_pkg = MagicMock()
-    fake_pkg.BackfillRunner.return_value = fake_runner
-    fake_client_mod = MagicMock()
-    fake_client_mod.make_client.return_value = MagicMock()
-    with patch.dict(sys.modules, {"algotrader_api.ingestion.backfill": fake_pkg}):
-        with patch.object(worker, "client_mod", fake_client_mod):
-            ok, detail = worker._step_full_history(db)
-    assert ok is True
-    assert "7 figis processed" in detail
-
-
-def test_step_full_history_exception(tmp_path):
-    worker = _import_worker()
-    db = str(tmp_path / "x.db")
-    fake_pkg = MagicMock()
-    fake_pkg.BackfillRunner.return_value.run_full_history.side_effect = (
-        RuntimeError("boom")
-    )
-    fake_client_mod = MagicMock()
-    fake_client_mod.make_client.return_value = MagicMock()
-    with patch.dict(sys.modules, {"algotrader_api.ingestion.backfill": fake_pkg}):
-        with patch.object(worker, "client_mod", fake_client_mod):
-            ok, detail = worker._step_full_history(db)
-    assert ok is False
-    assert "full history failed" in detail
+    assert "backfill_moex failed" in detail
 
 
 def test_step_gap_recovery_no_gaps(tmp_path):

@@ -1,4 +1,5 @@
-"""Tests for worker.py real _step_universe_sync and _step_daily_backfill."""
+"""Tests for worker.py real _step_universe_sync and _step_backfill_moex."""
+import importlib
 import sqlite3
 import pathlib
 import sys
@@ -12,7 +13,13 @@ import pytest
 _APPS_API = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_APPS_API))
 
-import worker as worker_module  # noqa: E402
+
+def _fresh_worker():
+    """Re-import worker so we share its module instance with sibling
+    tests that pop and reimport the module (otherwise they patch a
+    stale module instance)."""
+    sys.modules.pop("worker", None)
+    return importlib.import_module("worker")
 
 
 @pytest.fixture
@@ -41,6 +48,7 @@ def db_with_bars(tmp_path: pathlib.Path):
 def test_step_universe_sync_real_calls_discover(db_with_bars):
     """Real implementation: invokes run_universe_sync wrapper which
     calls universe.discover_universe + universe.upsert_instruments."""
+    worker_module = _fresh_worker()
     fake_client = MagicMock()
 
     # Patch make_client via its original module path; run_universe_sync
@@ -57,19 +65,24 @@ def test_step_universe_sync_real_calls_discover(db_with_bars):
     assert "0 instruments" in detail
 
 
-def test_step_daily_backfill_aborts_when_bars_shrink(db_with_bars):
+def test_step_backfill_moex_aborts_when_bars_shrink(db_with_bars):
     """If BackfillRunner ends up writing 0 bars (rate-limit, dead
     ticker), the assertion fires and the chain aborts."""
+    worker_module = _fresh_worker()
     fake_client = MagicMock()
     fake_runner = MagicMock()
 
-    with patch.object(worker_module, "BackfillRunner", return_value=fake_runner):
+    # `_step_backfill_moex` imports `BackfillRunner` from
+    # `algotrader_api.ingestion.backfill` inside the function, so patch
+    # the source module rather than `worker_module.BackfillRunner`.
+    with patch("algotrader_api.ingestion.client.make_client", return_value=fake_client), \
+         patch("algotrader_api.ingestion.backfill.BackfillRunner", return_value=fake_runner):
         # BackfillRunner returns 0 (no bars added):
-        fake_runner.run = AsyncMock()
+        fake_runner.backfill_from_moex = AsyncMock()
         # `worker.py` imports `assert_bars_increased` at module level so
         # `worker.assert_bars_increased` is the correct attribute path.
         with patch("worker.assert_bars_increased",
                    side_effect=AssertionError("bars_count shrunk")):
-            ok, detail = worker_module._step_daily_backfill(db_with_bars)
+            ok, detail = worker_module._step_backfill_moex(db_with_bars)
     assert ok is False
     assert "shrunk" in detail
