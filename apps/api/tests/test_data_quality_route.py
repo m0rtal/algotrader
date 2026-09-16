@@ -25,7 +25,7 @@ def db(tmp_path):
             ("BAD", "FIGI-BAD", "Bad"),
         ],
     )
-    today = date(2026, 9, 12)
+    today = date.today()
     # FIGI-SBER healthy, FIGI-OFZ healthy (also), FIGI-GOOD healthy, FIGI-BAD stale.
     healthy = [(today - timedelta(days=i)).isoformat() for i in range(60, -1, -1)]
     for figi in ("FIGI-SBER", "FIGI-OFZ", "FIGI-GOOD"):
