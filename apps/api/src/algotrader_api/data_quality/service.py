@@ -170,8 +170,8 @@ async def run_daily_guardian(
         # 4. Anomalies (also logged inside recover_stale).
         for figi in recovery.skipped_exhausted:
             _LOG.warning(
-                "guardian.anomaly.stale_recovery_exhausted",
-                extra={"figi": figi, "message": "figi has been failing 3+ cycles; operator investigation needed"},
+                "guardian.anomaly.stale_recovery_exhausted figi=%s",
+                figi,
             )
 
         # 5. Completeness backfill pass — chain after recovery, before
