@@ -251,6 +251,24 @@ def test_replace_bars_for_figi_accepts_nested_time_dict(bars_db):
     assert row == (100.0, 110.0, 95.0, 105.0)
 
 
+def test_replace_bars_for_figi_writes_source_column(bars_db):
+    """Explicit source override — must be written into bars.source.
+
+    The function used to rely on the column default for `source`,
+    which made attribution fragile. Callers must be able to pass an
+    explicit source string and have it persisted.
+    """
+    candles = [
+        {"ts": "2026-09-01", "open": 100, "high": 110, "low": 95, "close": 105, "volume": 1000},
+    ]
+    replace_bars_for_figi(bars_db, "FIGI-1", candles, replace=False, source="custom")
+
+    con = sqlite3.connect(bars_db)
+    row = con.execute("SELECT source FROM bars WHERE figi=?", ("FIGI-1",)).fetchone()
+    con.close()
+    assert row[0] == "custom"
+
+
 def test_replace_bars_for_figi_raises_on_unparseable_ts(bars_db):
     """A candle with neither `ts` nor `time.year/month/day` raises so the
     runner can fall back to a warn-log and skip the figi."""

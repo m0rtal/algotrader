@@ -98,6 +98,7 @@ def replace_bars_for_figi(
     candles: Iterable[dict],
     *,
     replace: bool = True,
+    source: str = "tinkoff",
 ) -> int:
     """Insert or replace all candles for `figi`.
 
@@ -112,6 +113,11 @@ def replace_bars_for_figi(
     incremental writes where new candles arrive across multiple
     backfill chunks and you want to accumulate.
 
+    The `source` argument explicitly names the data origin (e.g.
+    "tinkoff", "moex", "synth"). It is written into the `source`
+    column of every inserted row — no longer relying on the column
+    default, so attribution survives future schema migrations.
+
     The function runs everything in a single transaction so a
     concurrent reader via SQLite WAL sees either the pre-call or
     post-call snapshot, never a half-written state.
@@ -125,7 +131,7 @@ def replace_bars_for_figi(
         # TypeError and would abort the whole chain. Drop the row instead.
         if o is None or h is None or l is None or cl is None:
             continue
-        rows.append((figi, ts_str, float(o), float(h), float(l), float(cl), int(v)))
+        rows.append((figi, ts_str, float(o), float(h), float(l), float(cl), int(v), source))
 
     if not rows:
         return 0
@@ -136,13 +142,13 @@ def replace_bars_for_figi(
         if replace:
             conn.execute("DELETE FROM bars WHERE figi = ?", (figi,))
             insert_sql = (
-                "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO bars (figi, ts, open, high, low, close, volume, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             )
         else:
             insert_sql = (
-                "INSERT OR IGNORE INTO bars (figi, ts, open, high, low, close, volume) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)"
+                "INSERT OR IGNORE INTO bars (figi, ts, open, high, low, close, volume, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             )
         conn.executemany(insert_sql, rows)
         conn.execute(
