@@ -305,3 +305,123 @@ async def test_fetch_tinkoff_fallback_logs_progress_per_chunk(fresh_db):
     # And progress events should have been logged
     progress_events = [e for e in captured if e.get("event") == "backfill.tinkoff.chunk"]
     assert len(progress_events) >= 50, f"expected ~53 progress events, got {len(progress_events)}"
+
+
+# ─── Targeted coverage tests for ingestion/backfill.py (issue #64) ──────────
+# Each test below targets a SPECIFIC missed-line range reported by
+# ``pytest --cov-report=term-missing``.
+
+
+@responses.activate
+async def test_backfill_from_moex_skips_figi_with_no_ticker(fresh_db):
+    """Lines 557-558: when an instrument row has no ticker (empty
+    string), the loop continues to the next instrument without
+    crashing."""
+    # Add an empty-ticker instrument to the seeded DB. The schema
+    # requires NOT NULL, but an empty string is allowed and `if not
+    # ticker:` evaluates truthy-false.
+    con = sqlite3.connect(fresh_db)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+        "VALUES ('', 'BBG-NO-TICKER', 'share', 'No ticker', 'rub', 1)"
+    )
+    con.commit()
+    con.close()
+
+    # All seeded tickers get a normal MOEX response (already covered by
+    # other tests); the no-ticker row must simply be skipped.
+    responses.add(
+        responses.GET,
+        "https://iss.moex.com/iss/securities/SBER.json",
+        json={"boards": {"data": []}},
+    )
+    responses.add(
+        responses.GET,
+        "https://iss.moex.com/iss/securities/GAZP.json",
+        json={"boards": {"data": []}},
+    )
+    responses.add(
+        responses.GET,
+        "https://iss.moex.com/iss/securities/SU46020RMFS2.json",
+        json={"boards": {"data": []}},
+    )
+
+    client = MagicMock()
+    client.get_candles = AsyncMock(return_value=[])
+
+    runner = BackfillRunner(client=client, db_path=fresh_db, event_sink=_noop_sink)
+    # Should not raise on the no-ticker row.
+    written = await runner.backfill_from_moex(today=date(2026, 9, 15))
+    # The two share instruments and one bond go through Tinkoff fallback
+    # (no MOEX boards), which returns []. No bars written.
+    assert written == 0
+
+
+@responses.activate
+async def test_backfill_from_moex_skips_figi_with_no_listed_from_after_fallback(
+    fresh_db,
+):
+    """Lines 567-568: when an instrument row has no ``listed_from``,
+    the Tinkoff fallback defaults to ``2014-01-01``. The schema
+    doesn't expose ``listed_from``, so we exercise the
+    ``inst.get('listed_from') or '2014-01-01'`` default in line 564
+    and confirm the loop completes via Tinkoff fallback."""
+    # Sanctions-delisted: MOEX returns empty boards, triggering fallback.
+    responses.add(
+        responses.GET,
+        "https://iss.moex.com/iss/securities/SBER.json",
+        json={"boards": {"data": []}},
+    )
+
+    client = MagicMock()
+    client.get_candles = AsyncMock(return_value=[])
+
+    runner = BackfillRunner(client=client, db_path=fresh_db, event_sink=_noop_sink)
+    # Should NOT raise; the fallback handles missing listed_from.
+    written = await runner.backfill_from_moex(today=date(2026, 9, 15))
+    assert written == 0
+
+
+@responses.activate
+async def test_backfill_from_moex_handles_invalid_date_format_in_meta(
+    fresh_db,
+):
+    """Lines 582-583: when MOEX returns listed_from/listed_till as
+    non-ISO strings, the loop continues to the next instrument."""
+    # MOEX returns boards with garbage listed_from / listed_till strings.
+    responses.add(
+        responses.GET,
+        "https://iss.moex.com/iss/securities/SBER.json",
+        json={
+            "boards": {
+                "data": [
+                    [
+                        "SBER", "TQBR", "x", 0, 0, "shares", 0, 1, 1, 0,
+                        "garbage-listed-from", "garbage-listed-till",
+                        "garbage-listed-from", "garbage-listed-till",
+                        1, "SUR", "%",
+                    ]
+                ]
+            }
+        },
+    )
+    responses.add(
+        responses.GET,
+        "https://iss.moex.com/iss/securities/GAZP.json",
+        json={"boards": {"data": []}},
+    )
+    responses.add(
+        responses.GET,
+        "https://iss.moex.com/iss/securities/SU46020RMFS2.json",
+        json={"boards": {"data": []}},
+    )
+
+    client = MagicMock()
+    client.get_candles = AsyncMock(return_value=[])
+
+    runner = BackfillRunner(client=client, db_path=fresh_db, event_sink=_noop_sink)
+    # Should NOT raise; the SBER branch hits the except at line 582-583
+    # and continues. The other two fall through to Tinkoff fallback
+    # (returns []) → 0 bars written.
+    written = await runner.backfill_from_moex(today=date(2026, 9, 15))
+    assert written == 0
