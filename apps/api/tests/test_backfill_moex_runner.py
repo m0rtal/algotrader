@@ -485,3 +485,57 @@ async def test_backfill_from_moex_skips_tinkoff_fallback_after_timeout(fresh_db)
 
     assert written == 0, f"no bars should be written for timed-out figi, got {written}"
     assert elapsed < 5, f"chain should not block on slow Tinkoff fallback, took {elapsed:.1f}s"
+
+
+@responses.activate
+async def test_backfill_from_moex_skips_remaining_chunks_on_tinkoff_rate_limit(fresh_db):
+    """When Tinkoff sandbox returns RESOURCE_EXHAUSTED on one chunk,
+    the chain must abort the figi's fallback loop (not retry the
+    remaining ~50 chunks one by one and burn the rate-limit window).
+    """
+    from algotrader_api.ingestion.backfill import BackfillRunner
+
+    # Sanctions-delisted: MOEX returns empty boards list
+    responses.add(
+        responses.GET,
+        "https://iss.moex.com/iss/securities/RATE_LIM.json",
+        json={"boards": {"data": []}},
+    )
+
+    # Tinkoff fallback: first chunk rate-limited, subsequent chunks
+    # should NOT be called (test verifies call count is bounded).
+    call_count = {"n": 0}
+
+    async def rate_limited(*_args, **_kwargs):
+        call_count["n"] += 1
+        from grpc import StatusCode
+        from grpc.aio import AioRpcError  # type: ignore
+        # Simulate RESOURCE_EXHAUSTED error string format
+        raise Exception(
+            "RESOURCE_EXHAUSTED: rate limit 600/60s exceeded"
+        )
+
+    # Seed figi
+    import sqlite3 as _sq
+    _con = _sq.connect(fresh_db)
+    _con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin, sector) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("RATE_LIM", "BBG-RATE-LIM", "share", "Rate limit test", "rub", 1, "T", "test"),
+    )
+    _con.commit()
+    _con.close()
+
+    client = MagicMock()
+    client.get_candles = rate_limited
+
+    runner = BackfillRunner(client=client, db_path=fresh_db, event_sink=_noop_sink)
+    # 13-year window → would normally need ~13*52/7 = 97 chunks
+    written = await runner.backfill_from_moex(today=date(2027, 1, 1))
+
+    assert written == 0
+    # Should bail out after first chunk, not loop through all 97 chunks
+    assert call_count["n"] <= 2, (
+        f"expected ≤2 calls (one + one retry), got {call_count['n']} "
+        f"— chain didn't bail out on RESOURCE_EXHAUSTED"
+    )
