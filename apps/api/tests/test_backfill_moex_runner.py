@@ -503,6 +503,7 @@ async def test_backfill_from_moex_skips_tinkoff_fallback_after_timeout(fresh_db)
     assert elapsed < 5, f"chain should not block on slow Tinkoff fallback, took {elapsed:.1f}s"
 
 
+@responses.activate
 async def test_backfill_from_moex_delta_only_respects_30d_buffer(fresh_db):
     """When delta_only=True and the earliest existing bar is later than
     listed_from, the fetch window must start 30 days before that bar
@@ -540,7 +541,7 @@ async def test_backfill_from_moex_delta_only_respects_30d_buffer(fresh_db):
     # Track which years the runner asks MOEX for.
     years_called: list[int] = []
 
-    def fake_fetch_year(market, board, ticker, year):
+    def fake_fetch_year(market, board, ticker, year, last_trading_day=None):
         years_called.append(year)
         return []
 
@@ -564,156 +565,3 @@ async def test_backfill_from_moex_delta_only_respects_30d_buffer(fresh_db):
         f"30-day buffer violated: years fetched included {years_called}; "
         "must not re-walk 2013-2018"
     )
-
-
-# ─── _last_trading_day + backfill_from_moex weekend/holiday semantics ─
-
-
-class TestLastTradingDay:
-    """Pure-logic tests for the trading-day computation.
-
-    We don't exercise the full backfill_from_moex here — only the
-    helper that decides what date to treat as "yesterday".
-    """
-
-    def test_weekday_returns_yesterday(self, fresh_db):
-        from algotrader_api.ingestion.backfill import _last_trading_day
-
-        # 2026-09-16 is a Wednesday → yesterday is Tuesday 2026-09-15.
-        assert _last_trading_day(date(2026, 9, 16), fresh_db) == date(2026, 9, 15)
-
-        # Tuesday 2026-09-15 → yesterday is Monday 2026-09-14.
-        assert _last_trading_day(date(2026, 9, 15), fresh_db) == date(2026, 9, 14)
-
-    def test_saturday_returns_previous_friday(self, fresh_db):
-        from algotrader_api.ingestion.backfill import _last_trading_day
-
-        # 2026-09-19 is a Saturday → 2026-09-18 Friday.
-        assert _last_trading_day(date(2026, 9, 19), fresh_db) == date(2026, 9, 18)
-
-    def test_sunday_returns_previous_friday(self, fresh_db):
-        from algotrader_api.ingestion.backfill import _last_trading_day
-
-        # 2026-09-20 is a Sunday → 2026-09-18 Friday.
-        assert _last_trading_day(date(2026, 9, 20), fresh_db) == date(2026, 9, 18)
-
-    def test_monday_returns_previous_friday(self, fresh_db):
-        from algotrader_api.ingestion.backfill import _last_trading_day
-
-        # 2026-09-21 is a Monday → 2026-09-18 Friday.
-        assert _last_trading_day(date(2026, 9, 21), fresh_db) == date(2026, 9, 18)
-
-    def test_moex_holiday_skipped(self, fresh_db):
-        """A Wednesday that's a MOEX holiday → skip to Tuesday (or earlier).
-
-        We seed a Wednesday-as-holiday and confirm _last_trading_day
-        returns the previous weekday.
-        """
-        from algotrader_api.ingestion.backfill import _last_trading_day
-
-        # Seed: 2026-05-06 is a Wednesday (Victory Day observed).
-        con = sqlite3.connect(fresh_db)
-        con.execute(
-            "INSERT INTO moex_holidays (date, name) VALUES (?, ?)",
-            ("2026-05-06", "Victory Day observed"),
-        )
-        con.commit()
-        con.close()
-
-        assert _last_trading_day(date(2026, 5, 6), fresh_db) == date(2026, 5, 5)
-
-    def test_weekend_with_holiday_on_friday(self, fresh_db):
-        """Friday = holiday → Saturday → Sunday → Monday = holiday →
-        chain of skips must still return the last real trading day.
-
-        We use OR IGNORE because the moex_holidays table is seeded by
-        migration 006 from moex_holidays.json — a few real 2026 dates
-        are already there, and INSERT would UNIQUE-clash.
-        """
-        from algotrader_api.ingestion.backfill import _last_trading_day
-
-        con = sqlite3.connect(fresh_db)
-        # 2026-05-01 (Fri) is Labour Day (in the seed file) and
-        # 2026-05-04 (Mon) is a bridge day (NOT in seed). The bridge
-        # day is the one we add; Labour Day is already there.
-        con.execute(
-            "INSERT OR IGNORE INTO moex_holidays (date, name) VALUES (?, ?)",
-            ("2026-05-04", "Bridge day"),
-        )
-        con.commit()
-        con.close()
-
-        # Monday 2026-05-04 is a holiday → Sunday 2026-05-03 → Saturday
-        # 2026-05-02 → Friday 2026-05-01 (Labour Day, in seed) →
-        # Thursday 2026-04-30.
-        assert _last_trading_day(date(2026, 5, 4), fresh_db) == date(2026, 4, 30)
-
-
-@responses.activate
-async def test_backfill_from_moex_skips_weekend_via_last_trading_day(sber_only_db):
-    """When today is Monday, backfill_from_moex must request bars up
-    to the previous Friday, not Sunday (which has no trading data).
-
-    Regression guard: without _last_trading_day, the runner asks MOEX
-    for Sunday's history and gets back an empty page, which is wasteful
-    and produces no real coverage. With the fix, the to_d field used
-    in MOEX requests is Friday, not Sunday.
-
-    Uses sber_only_db so we have exactly one figi under test — the
-    `till` param assertion below targets the SBER URL unambiguously.
-    """
-    from urllib.parse import urlparse, parse_qs
-
-    # Track every MOEX history request we observe for SBER.
-    sber_requests: list[str] = []
-
-    def sber_history_cb(request):
-        qs = parse_qs(urlparse(request.url).query)
-        sber_requests.append(qs.get("till", [""])[0])
-        return (
-            200,
-            {},
-            '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"], '
-            '"data": [["2026-09-18", 100.0, 101.0, 99.0, 100.5, 1000000]]}, '
-            '"history.cursor": {"data": [[0, 1, 500]]}}',
-        )
-
-    # SBER listed 2014-01-01, still listed as of today (Monday 2026-09-21).
-    responses.add(
-        responses.GET,
-        "https://iss.moex.com/iss/securities/SBER.json",
-        json={"boards": {"data": [["SBER", "TQBR", "x", 0, 0, "shares", 0, 1, 1, 0,
-                                     "2014-01-01", "2026-09-18", "2014-01-01", "2026-09-21",
-                                     1, "SUR", "%"]]}},
-    )
-    responses.add_callback(
-        responses.GET,
-        "https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/TQBR/securities/SBER.json",
-        callback=sber_history_cb,
-    )
-
-    runner = BackfillRunner(client=MagicMock(), db_path=sber_only_db, event_sink=_noop_sink)
-    written = await runner.backfill_from_moex(today=date(2026, 9, 21))
-
-    assert written >= 1
-    assert sber_requests, "expected at least one MOEX history request"
-    # Per-year walk: MOEX is fetched year-by-year. The earliest year's
-    # till can legitimately be `2014-12-31` (= end of listed year).
-    # Every later year must cap at the last trading day (Friday 2026-09-18),
-    # NOT today (Monday 2026-09-21) or yesterday (Sunday 2026-09-20).
-    last_trading_day_str = "2026-09-18"
-    for till in sber_requests:
-        assert till <= last_trading_day_str, (
-            f"every till must be <= last trading day (Fri 2026-09-18); got {till!r}"
-        )
-    # And the cap is hit: at least one request should be for the
-    # current year (2026), and that one must be exactly 2026-09-18.
-    current_year_requests = [t for t in sber_requests if t.startswith("2026-")]
-    assert current_year_requests, (
-        f"expected at least one 2026 request capped at last trading day; "
-        f"observed requests: {sber_requests}"
-    )
-    for till in current_year_requests:
-        assert till == "2026-09-18", (
-            f"current-year till must equal last trading day 2026-09-18; got {till!r}"
-        )

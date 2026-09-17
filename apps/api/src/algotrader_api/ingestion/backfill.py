@@ -219,7 +219,6 @@ def _fetch_year_moex(
     board: str,
     ticker: str,
     year: int,
-    *,
     last_trading_day: date | None = None,
 ) -> list[dict]:
     """Walk MOEX ISS /iss/history/.../securities/{ticker}.json for ``year``.
@@ -237,6 +236,12 @@ def _fetch_year_moex(
     ``last_trading_day`` (not Dec 31), so we never ask MOEX for bars
     dated after the last published trading day. Earlier years are
     unaffected.
+
+    The parameter is positional-or-keyword (no ``*`` separator) so
+    existing tests that mock via ``side_effect=callable`` with the
+    4-arg signature keep working unchanged — they just get
+    ``last_trading_day=None`` and the function falls back to
+    ``year-12-31``.
     """
     import requests
     base = (
