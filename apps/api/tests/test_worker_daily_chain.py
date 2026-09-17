@@ -137,7 +137,14 @@ def test_chain_aborts_when_backfill_moex_shrinks_bars(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_chain_aborts_when_dividends_stale(monkeypatch):
+def test_chain_continues_past_dividends_failure(monkeypatch):
+    """Best-effort phases must not abort the chain: a dividends failure
+    should still let freshness_check and guardian run so the operator
+    gets the full picture in the morning.
+
+    The chain still exits 1 (systemd flags it as degraded) but doesn't
+    short-circuit.
+    """
     worker, calls = _patch_all_steps(
         monkeypatch,
         results={
@@ -148,14 +155,38 @@ def test_chain_aborts_when_dividends_stale(monkeypatch):
 
     rc = worker.run_daily_chain()
 
-    assert rc == 1
+    assert rc == 1  # degraded, but chain completed
     actual = [c[0] for c in calls]
     assert "dividends" in actual
+    # Best-effort failure: subsequent phases still run.
+    assert "freshness_check" in actual
+    assert "guardian" in actual
+
+
+def test_chain_aborts_when_backfill_moex_fails(monkeypatch):
+    """Critical phases still abort: backfill_moex is in _CRITICAL_PHASES,
+    so a failure short-circuits the chain.
+
+    Regression guard for the critical/best-effort split: we cannot
+    silently downgrade backfill_moex to best-effort without breaking
+    the operator's mental model that "if backfill ran, we have data".
+    """
+    worker, calls = _patch_all_steps(
+        monkeypatch,
+        results={
+            "backfill_moex": "backfill_moex: AssertionError",
+            "backfill_moex._ok": False,
+        },
+    )
+
+    rc = worker.run_daily_chain()
+
+    assert rc == 1
+    actual = [c[0] for c in calls]
+    assert "backfill_moex" in actual
+    assert "dividends" not in actual
     assert "freshness_check" not in actual
     assert "guardian" not in actual
-    # 0-indexed: 5th of 8 phases (migrations, universe_sync, backfill_moex,
-    # gap_recovery, corporate_actions, dividends)
-    assert actual.index("dividends") == 5
 
 
 # --------------------------------------------------------------------------- #

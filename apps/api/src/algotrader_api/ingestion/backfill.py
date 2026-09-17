@@ -66,6 +66,62 @@ EventSink = Callable[[BackfillEvent], Awaitable[None]]
 # ─── strategy decision ──────────────────────────────────────────────
 
 
+def _last_trading_day(
+    today: date,
+    db_path: str,
+    *,
+    max_lookback_days: int = 14,
+) -> date:
+    """Return the most recent COMPLETED trading day at or before ``today``.
+
+    The semantics are "the last day we have bars for". Bars are published
+    at end-of-day, so even on a trading day (e.g. Wednesday) we cannot
+    fetch the day's bars yet — they don't exist. Therefore we always
+    start from ``today - 1 day`` and walk backwards skipping weekends
+    and MOEX holidays.
+
+    Walking up to ``max_lookback_days`` calendar days is a safety net:
+    if we run out (e.g. empty holidays table during a fresh install
+    mid-holiday-streak), we fall back to the most recent weekday in
+    that window — better to fetch one extra empty trading day than to
+    silently skip real bars.
+
+    The moex_holidays table is populated by migration 006 from
+    ``scripts_import/data/moex_holidays.json`` at the universe-sync
+    step, so the typical case hits it after the daily chain's first
+    universe_sync phase.
+    """
+    import sqlite3
+
+    # Build a set of holiday strings in [today - 1 - max_lookback, today - 1].
+    # Use a single SQL query rather than per-day roundtrips.
+    start = today - timedelta(days=1)
+    lookback_start = start - timedelta(days=max_lookback_days)
+    holiday_strings: set[str] = set()
+    try:
+        con = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            rows = con.execute(
+                "SELECT date FROM moex_holidays "
+                "WHERE date >= ? AND date <= ?",
+                (lookback_start.isoformat(), start.isoformat()),
+            ).fetchall()
+            holiday_strings = {r[0] for r in rows}
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001 — defensive: DB may not be migrated yet
+        pass
+
+    cur = start
+    for _ in range(max_lookback_days + 1):
+        # Monday=0..Sunday=6 — weekday() returns 5 for Sat, 6 for Sun
+        if cur.weekday() < 5 and cur.isoformat() not in holiday_strings:
+            return cur
+        cur = cur - timedelta(days=1)
+    # Fallback: most recent weekday in window.
+    return lookback_start
+
+
 def decide_strategy(
     metadata_row: dict | None,
     today: date,
@@ -158,7 +214,14 @@ def _get_meta_moex(
     return meta
 
 
-def _fetch_year_moex(market: str, board: str, ticker: str, year: int) -> list[dict]:
+def _fetch_year_moex(
+    market: str,
+    board: str,
+    ticker: str,
+    year: int,
+    *,
+    last_trading_day: date | None = None,
+) -> list[dict]:
     """Walk MOEX ISS /iss/history/.../securities/{ticker}.json for ``year``.
 
     MOEX caps a single response at 500 bars; for a year with >500
@@ -168,12 +231,22 @@ def _fetch_year_moex(market: str, board: str, ticker: str, year: int) -> list[di
     the cursor field — pre-2024-Q3 MOEX returned 100 even when we
     asked for 500; asking for 500 simply lets the server pick its
     current maximum and tell us via the cursor.
+
+    ``last_trading_day`` caps the ``till`` for the CURRENT calendar
+    year: if ``year == last_trading_day.year``, the request stops at
+    ``last_trading_day`` (not Dec 31), so we never ask MOEX for bars
+    dated after the last published trading day. Earlier years are
+    unaffected.
     """
     import requests
     base = (
         f"https://iss.moex.com/iss/history/engines/stock/markets/{market}/boards/{board}"
         f"/securities/{urllib.parse.quote(ticker)}.json"
     )
+    if last_trading_day is not None and year == last_trading_day.year:
+        till = last_trading_day.isoformat()
+    else:
+        till = f"{year}-12-31"
     out: list[dict] = []
     start = 0
     page_size = 500
@@ -183,7 +256,7 @@ def _fetch_year_moex(market: str, board: str, ticker: str, year: int) -> list[di
                 base,
                 params={
                     "from": f"{year}-01-01",
-                    "till": f"{year}-12-31",
+                    "till": till,
                     "start": start,
                 },
                 timeout=30,
@@ -581,7 +654,7 @@ class BackfillRunner:
 
         if today is None:
             today = date.today()
-        yesterday = today - timedelta(days=1)
+        yesterday = _last_trading_day(today, self.db_path)
         instruments = self._list_instruments()
         self._moex_meta: dict[str, dict | None] = {}
         self._moex_meta_lock = threading.Lock()
@@ -609,7 +682,10 @@ class BackfillRunner:
         _figi_timeout_s = 90
 
         async def _process_moex_year(inst: dict, meta: dict, year: int) -> list[dict]:
-            year_bars = self._fetch_year_moex(meta["market"], meta["board"], inst["ticker"], year)
+            year_bars = self._fetch_year_moex(
+                meta["market"], meta["board"], inst["ticker"], year,
+                last_trading_day=yesterday,
+            )
             for b in year_bars:
                 b["figi"] = inst["figi"]
             return year_bars
