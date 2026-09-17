@@ -947,8 +947,24 @@ class BackfillRunner:
                 )
                 all_candles.extend(chunk)
             except Exception as e:  # noqa: BLE001
+                # RESOURCE_EXHAUSTED (gRPC 8 / HTTP 429): Tinkoff sandbox
+                # is rate-limited at 600 req/min. If we hit it once, all
+                # subsequent chunks in this run will also fail and just
+                # burn the rate-limit window. Bail out immediately so
+                # the chain can move to other figis and pick this one up
+                # on the next cron tick when the bucket has refilled.
+                err_str = str(e)
+                if "RESOURCE_EXHAUSTED" in err_str or "rate" in err_str.lower():
+                    chunks_failed += 1
+                    last_chunk_error = err_str
+                    await self._log(
+                        "warn",
+                        figi=figi,
+                        message=f"Tinkoff rate-limited on chunk {cur}..{chunk_end}; aborting fallback (will retry next cron)",
+                    )
+                    break  # skip remaining chunks
                 chunks_failed += 1
-                last_chunk_error = str(e)
+                last_chunk_error = err_str
                 await self._log(
                     "warn",
                     figi=figi,
