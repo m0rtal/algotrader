@@ -501,3 +501,67 @@ async def test_backfill_from_moex_skips_tinkoff_fallback_after_timeout(fresh_db)
 
     assert written == 0, f"no bars should be written for timed-out figi, got {written}"
     assert elapsed < 5, f"chain should not block on slow Tinkoff fallback, took {elapsed:.1f}s"
+
+
+@responses.activate
+async def test_backfill_from_moex_delta_only_respects_30d_buffer(fresh_db):
+    """When delta_only=True and the earliest existing bar is later than
+    listed_from, the fetch window must start 30 days before that bar
+    (not at listed_from) so we don't re-walk 13 years of MOEX history
+    on every chain run for figis with partial data.
+    """
+    from unittest.mock import patch
+
+    # Seed an instrument whose MOEX listed_from is 2013-03-25 but whose
+    # earliest existing bar is 2020-01-15 (typical case after a Tinkoff-
+    # only daily backfill that only kept 2021+).
+    con = sqlite3.connect(fresh_db)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin, sector) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("BUFFER", "BBG-BUFFER", "share", "Buffer test", "rub", 1, "TEST", "test"),
+    )
+    con.execute(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume, source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("BBG-BUFFER", "2020-01-15", 100, 110, 95, 105, 1000, "tinkoff"),
+    )
+    con.commit()
+    con.close()
+
+    # MOEX metadata: listed_from 2013-03-25, still listed.
+    responses.add(
+        responses.GET,
+        "https://iss.moex.com/iss/securities/BUFFER.json",
+        json={"boards": {"data": [["BUFFER", "TQBR", "x", 0, 0, "shares", 0, 1, 1, 0,
+                                     "2013-03-25", "2026-09-14", "2013-03-25", "2026-09-15",
+                                     1, "SUR", "%"]]}},
+    )
+
+    # Track which years the runner asks MOEX for.
+    years_called: list[int] = []
+
+    def fake_fetch_year(market, board, ticker, year):
+        years_called.append(year)
+        return []
+
+    # today=2021-01-01 → yesterday=2020-12-31.
+    # Earliest bar = 2020-01-15 → buffer window = 2019-12-16.
+    # 30-day buffer: from_d = max(2013-03-25, 2019-12-16) = 2019-12-16.
+    # to_d = min(2020-12-31, 2026-09-14) = 2020-12-31.
+    # Expected years fetched: 2019, 2020 (NOT 2013..2020).
+    runner = BackfillRunner(
+        client=MagicMock(), db_path=fresh_db, event_sink=_noop_sink
+    )
+    with patch.object(BackfillRunner, "_fetch_year_moex", side_effect=fake_fetch_year):
+        await runner.backfill_from_moex(today=date(2021, 1, 1))
+
+    assert years_called, "expected fetch_year to be invoked at least once"
+    assert all(y >= 2019 for y in years_called), (
+        f"30-day buffer violated: years fetched = {years_called}; "
+        "must be >= 2019 (30d before earliest bar 2020-01-15), not 2013+"
+    )
+    assert not any(y < 2019 for y in years_called), (
+        f"30-day buffer violated: years fetched included {years_called}; "
+        "must not re-walk 2013-2018"
+    )
