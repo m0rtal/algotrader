@@ -65,6 +65,62 @@ async def _noop_sink(_ev):
     return None
 
 
+@pytest.fixture
+def _isolate_backfill_structlog():
+    """Pin structlog + rebind ``backfill.logger`` for the duration of one test.
+
+    Backfill tests in this file that call ``runner.backfill_from_moex(...)``
+    with MOEX returning empty boards invoke the Tinkoff fallback path
+    (``_fetch_tinkoff_fallback_impl``), which emits ``backfill.tinkoff.chunk``
+    progress events and ``backfill.tinkoff.chunk.failed`` warnings via the
+    module-level ``backfill.logger`` (``BoundLoggerLazyProxy``). Once a
+    logger method is invoked on a ``BoundLoggerLazyProxy`` while structlog
+    has ``cache_logger_on_first_use=True`` (the production setting from
+    ``observability.logging.setup_logging``), the proxy finalizes: future
+    ``.bind()`` calls return a ``BoundLogger`` pinned to the OLD processor
+    chain, and ``structlog.testing.capture_logs()`` in
+    ``test_fetch_tinkoff_fallback_logs_progress_per_chunk`` sees zero
+    ``backfill.tinkoff.chunk`` events.
+
+    Without this fixture, the chunk-log test only passes in isolation: any
+    earlier test in the suite that triggers ``logger.warn/debug/info`` on
+    ``backfill.logger`` (e.g. via a real or fake client) finalizes the
+    proxy and breaks the next consumer.
+
+    This fixture mirrors the inline block from PR #69 (commit 277ef2d)
+    and PR #77 (commit 0b539f2) that was originally applied to
+    ``test_fetch_tinkoff_fallback_logs_progress_per_chunk``. It must be
+    listed as a parameter in:
+      * the consumer test (``test_fetch_tinkoff_fallback_logs_progress_per_chunk``)
+        so ``capture_logs()`` sees the progress events for that test.
+      * every producer test that calls ``runner.backfill_from_moex(...)`` and
+        triggers the Tinkoff fallback path, so the proxy is left in a
+        re-bindable state when the test exits.
+
+    Apply this to any new test in this file that calls BackfillRunner
+    methods which emit via ``backfill.logger`` (warn, warning, debug, info,
+    error) — otherwise the chunk-log consumer will start failing again
+    whenever pytest reorders test execution.
+    """
+    structlog.configure(
+        processors=[structlog.processors.JSONRenderer()],
+        wrapper_class=structlog.make_filtering_bound_logger(min_level=0),
+        cache_logger_on_first_use=False,
+    )
+    # If a prior test in this run finalized backfill.logger (cache_logger_on_first_use
+    # swap or direct method-call on the proxy), its `bind` method has been
+    # replaced with `finalized_bind` which pins the OLD processor chain.
+    # Restore the unbound class method so the proxy re-resolves against the
+    # current structlog config on every bind().
+    from algotrader_api.ingestion import backfill as _backfill_mod
+    _proxy = _backfill_mod.logger
+    if hasattr(_proxy, "_logger"):  # BoundLoggerLazyProxy
+        import types as _types
+        _proxy.bind = _types.MethodType(type(_proxy).bind, _proxy)
+    yield
+    structlog.reset_defaults()
+
+
 @responses.activate
 async def test_backfill_from_moex_writes_bars_with_dynamic_dates(fresh_db):
     """For each figi, BackfillRunner fetches from MOEX listed_from to
@@ -241,8 +297,17 @@ async def test_backfill_from_moex_paginates_pages_in_year(sber_only_db):
 
 
 @responses.activate
-async def test_backfill_from_moex_handles_delisted_ticker_via_fallback(fresh_db):
-    """When MOEX returns NO_BOARDS (sanctions-delisted), fall back to Tinkoff."""
+async def test_backfill_from_moex_handles_delisted_ticker_via_fallback(
+    fresh_db, _isolate_backfill_structlog
+):
+    """When MOEX returns NO_BOARDS (sanctions-delisted), fall back to Tinkoff.
+
+    Producer for ``backfill.logger`` (Tinkoff fallback path emits
+    ``backfill.tinkoff.chunk`` debug events via the module-level
+    ``BoundLoggerLazyProxy``); the ``_isolate_backfill_structlog`` fixture
+    rebinds the proxy after this test so the chunk-log consumer can still
+    capture its events.
+    """
     # Sanctions-delisted: MOEX returns empty boards list
     responses.add(
         responses.GET,
@@ -259,10 +324,17 @@ async def test_backfill_from_moex_handles_delisted_ticker_via_fallback(fresh_db)
     assert written == 0, f"expected 0 bars written (Tinkoff returns empty), got {written}"
 
 
-async def test_fetch_tinkoff_fallback_logs_progress_per_chunk(fresh_db):
-    """When Tinkoff fallback walks 7-day chunks, each chunk must emit a structured
-    log via structlog so operators can see why a figi takes 20+ min and identify stuck
-    ranges. Without this, a single slow chunk hides all progress.
+async def test_fetch_tinkoff_fallback_logs_progress_per_chunk(fresh_db, _isolate_backfill_structlog):
+    """Each chunk must emit a structured log; isolate from test ordering.
+
+    The Tinkoff fallback walks 7-day chunks via ``_fetch_tinkoff_fallback_impl``;
+    each chunk emits a ``backfill.tinkoff.chunk`` event via structlog so operators
+    can identify stuck ranges (a single 20-min hang used to hide all progress;
+    now each chunk is independently visible).
+
+    Relies on the ``_isolate_backfill_structlog`` fixture to pin structlog
+    so ``slog_test.capture_logs()`` can see the events despite prior tests
+    in the suite finalizing the ``backfill.logger`` proxy.
     """
     import structlog.testing as slog_test
 
@@ -306,8 +378,7 @@ async def test_fetch_tinkoff_fallback_logs_progress_per_chunk(fresh_db):
     # And progress events should have been logged
     progress_events = [e for e in captured if e.get("event") == "backfill.tinkoff.chunk"]
     assert len(progress_events) >= 50, f"expected ~53 progress events, got {len(progress_events)}"
-    # Reset structlog config so this test doesn't leak state to the next one
-    structlog.reset_defaults()
+    # structlog config is reset by the _isolate_backfill_structlog fixture teardown.
 
 
 # ─── Targeted coverage tests for ingestion/backfill.py (issue #64) ──────────
@@ -316,10 +387,19 @@ async def test_fetch_tinkoff_fallback_logs_progress_per_chunk(fresh_db):
 
 
 @responses.activate
-async def test_backfill_from_moex_skips_figi_with_no_ticker(fresh_db):
+async def test_backfill_from_moex_skips_figi_with_no_ticker(
+    fresh_db, _isolate_backfill_structlog
+):
     """Lines 557-558: when an instrument row has no ticker (empty
     string), the loop continues to the next instrument without
-    crashing."""
+    crashing.
+
+    Producer for ``backfill.logger`` (Tinkoff fallback path emits
+    ``backfill.tinkoff.chunk`` debug events via the module-level
+    ``BoundLoggerLazyProxy``); the ``_isolate_backfill_structlog`` fixture
+    rebinds the proxy after this test so the chunk-log consumer can still
+    capture its events.
+    """
     # Add an empty-ticker instrument to the seeded DB. The schema
     # requires NOT NULL, but an empty string is allowed and `if not
     # ticker:` evaluates truthy-false.
@@ -363,12 +443,20 @@ async def test_backfill_from_moex_skips_figi_with_no_ticker(fresh_db):
 @responses.activate
 async def test_backfill_from_moex_skips_figi_with_no_listed_from_after_fallback(
     fresh_db,
+    _isolate_backfill_structlog,
 ):
     """Lines 567-568: when an instrument row has no ``listed_from``,
     the Tinkoff fallback defaults to ``2014-01-01``. The schema
     doesn't expose ``listed_from``, so we exercise the
     ``inst.get('listed_from') or '2014-01-01'`` default in line 564
-    and confirm the loop completes via Tinkoff fallback."""
+    and confirm the loop completes via Tinkoff fallback.
+
+    Producer for ``backfill.logger`` (Tinkoff fallback path emits
+    ``backfill.tinkoff.chunk`` debug events via the module-level
+    ``BoundLoggerLazyProxy``); the ``_isolate_backfill_structlog`` fixture
+    rebinds the proxy after this test so the chunk-log consumer can still
+    capture its events.
+    """
     # Sanctions-delisted: MOEX returns empty boards, triggering fallback.
     responses.add(
         responses.GET,
@@ -388,9 +476,17 @@ async def test_backfill_from_moex_skips_figi_with_no_listed_from_after_fallback(
 @responses.activate
 async def test_backfill_from_moex_handles_invalid_date_format_in_meta(
     fresh_db,
+    _isolate_backfill_structlog,
 ):
     """Lines 582-583: when MOEX returns listed_from/listed_till as
-    non-ISO strings, the loop continues to the next instrument."""
+    non-ISO strings, the loop continues to the next instrument.
+
+    Producer for ``backfill.logger`` (Tinkoff fallback path emits
+    ``backfill.tinkoff.chunk`` debug events via the module-level
+    ``BoundLoggerLazyProxy``); the ``_isolate_backfill_structlog`` fixture
+    rebinds the proxy after this test so the chunk-log consumer can still
+    capture its events.
+    """
     # MOEX returns boards with garbage listed_from / listed_till strings.
     responses.add(
         responses.GET,
@@ -433,10 +529,21 @@ async def test_backfill_from_moex_handles_invalid_date_format_in_meta(
 
 
 @responses.activate
-async def test_backfill_from_moex_skips_tinkoff_fallback_after_timeout(fresh_db):
+async def test_backfill_from_moex_skips_tinkoff_fallback_after_timeout(
+    fresh_db, _isolate_backfill_structlog
+):
     """Tinkoff fallback that hangs longer than 90s must be skipped, not
     stall the whole chain. Verifies the asyncio.wait_for(timeout=90)
     guard added in hotfix/backfill-concurrency-timeout.
+
+    Producer for ``backfill.logger`` (the asyncio.TimeoutError path
+    inside ``_process_tinkoff`` finalizes the module-level
+    ``BoundLoggerLazyProxy`` via ``self._log`` + the subsequent
+    re-entry into the chunk loop). The ``_isolate_backfill_structlog``
+    fixture rebinds the proxy after this test so the chunk-log consumer
+    can still capture its events.
+
+    Added in PR #74 (commit 9c2cc0b).
     """
     # Sanctions-delisted: MOEX returns empty boards list
     responses.add(
@@ -488,10 +595,23 @@ async def test_backfill_from_moex_skips_tinkoff_fallback_after_timeout(fresh_db)
 
 
 @responses.activate
-async def test_backfill_from_moex_skips_remaining_chunks_on_tinkoff_rate_limit(fresh_db):
+async def test_backfill_from_moex_skips_remaining_chunks_on_tinkoff_rate_limit(
+    fresh_db, _isolate_backfill_structlog
+):
     """When Tinkoff sandbox returns RESOURCE_EXHAUSTED on one chunk,
     the chain must abort the figi's fallback loop (not retry the
     remaining ~50 chunks one by one and burn the rate-limit window).
+
+    Producer for ``backfill.logger``: the rate-limited client raises an
+    Exception inside ``_fetch_tinkoff_fallback_impl``, which the
+    surrounding ``except`` catches and emits two ``logger.warn`` events
+    (``backfill.tinkoff.chunk.failed`` and
+    ``backfill.tinkoff.rate_limited``). Both calls finalize the
+    module-level ``BoundLoggerLazyProxy``. The ``_isolate_backfill_structlog``
+    fixture rebinds the proxy after this test so the chunk-log consumer
+    can still capture its events.
+
+    Added in PR #80 (commit 16454dc).
     """
     from algotrader_api.ingestion.backfill import BackfillRunner
 
