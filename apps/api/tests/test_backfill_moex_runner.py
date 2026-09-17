@@ -428,3 +428,60 @@ async def test_backfill_from_moex_handles_invalid_date_format_in_meta(
     # (returns []) → 0 bars written.
     written = await runner.backfill_from_moex(today=date(2026, 9, 15))
     assert written == 0
+
+
+
+
+@responses.activate
+async def test_backfill_from_moex_skips_tinkoff_fallback_after_timeout(fresh_db):
+    """Tinkoff fallback that hangs longer than 90s must be skipped, not
+    stall the whole chain. Verifies the asyncio.wait_for(timeout=90)
+    guard added in hotfix/backfill-concurrency-timeout.
+    """
+    # Sanctions-delisted: MOEX returns empty boards list
+    responses.add(
+        responses.GET,
+        "https://iss.moex.com/iss/securities/TRY_TIMEOUT.json",
+        json={"boards": {"data": []}},
+    )
+
+    # Tinkoff fallback hangs forever
+    async def hang(*_args, **_kwargs):
+        import asyncio
+        await asyncio.sleep(120)
+        return []
+
+    # Seed a Tinkoff-side figi so backfill tries the Tinkoff fallback
+    import sqlite3 as _sq
+    _con = _sq.connect(fresh_db)
+    _con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin, sector) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("TRY_TIMEOUT", "BBG-TIMEOUT", "share", "Timeout test", "rub", 1, "T", "test"),
+    )
+    _con.commit()
+    _con.close()
+
+    client = MagicMock()
+    client.get_candles = hang
+
+    runner = BackfillRunner(client=client, db_path=fresh_db, event_sink=_noop_sink)
+    # Patch _process_one's timeout to 0.5s for fast test (defaults to 90s in prod)
+    # We monkey-patch asyncio.wait_for by replacing the global constant
+    import algotrader_api.ingestion.backfill as bf_mod
+    original_wait_for = bf_mod.asyncio.wait_for
+    bf_mod.asyncio.wait_for = lambda coro, timeout: original_wait_for(coro, timeout=0.5)
+    try:
+        import asyncio
+        # Patch asyncio.wait_for too (used inside backfill_from_moex)
+        # asyncio.wait_for is referenced via the module's asyncio import
+        # but it's a closure capture — we patch the backfill module's asyncio.wait_for
+        # ... actually asyncio.wait_for inside _process_one resolves to bf_mod.asyncio.wait_for
+        start = asyncio.get_event_loop().time()
+        written = await runner.backfill_from_moex(today=date(2024, 6, 15))
+        elapsed = asyncio.get_event_loop().time() - start
+    finally:
+        bf_mod.asyncio.wait_for = original_wait_for
+
+    assert written == 0, f"no bars should be written for timed-out figi, got {written}"
+    assert elapsed < 5, f"chain should not block on slow Tinkoff fallback, took {elapsed:.1f}s"
