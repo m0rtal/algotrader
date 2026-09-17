@@ -805,27 +805,11 @@ class BackfillRunner:
                 self.db_path, figi, all_bars, replace=False, source="moex"
             )
 
-        # Outer parallelism:
-        # - 5 figis in parallel for MOEX path (cheap, no Tinkoff rate limit).
-        # - 1 figi at a time for Tinkoff fallback (sandbox/prod 600 req/min
-        #   rate limit makes parallelism worse: 5 figis all hit RESOURCE_EXHAUSTED
-        #   at once and waste the whole 60-second reset window).
-        # The split prevents rate-limited Tinkoff figis from starving MOEX
-        # figis of the shared semaphore.
-        _moex_sem = asyncio.Semaphore(5)
-        _tinkoff_sem = asyncio.Semaphore(1)
-
+        # Outer parallelism: 5 figis in parallel. Each figi internally
+        # parallelizes its MOEX year-fetches.
+        _sem = asyncio.Semaphore(5)
         async def _process_one_bounded(inst: dict) -> int:
-            # Decide which semaphore to acquire based on whether the
-            # figi has MOEX boards. We probe MOEX once up front to
-            # avoid holding both semaphores at once.
-            ticker = inst.get("ticker") or ""
-            meta = _get_meta(ticker) if ticker else None
-            if meta is not None:
-                sem = _moex_sem
-            else:
-                sem = _tinkoff_sem
-            async with sem:
+            async with _sem:
                 return await _process_one(inst)
 
         results = await asyncio.gather(
