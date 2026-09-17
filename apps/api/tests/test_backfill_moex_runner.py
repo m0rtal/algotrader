@@ -495,7 +495,31 @@ async def test_backfill_from_moex_skips_remaining_chunks_on_tinkoff_rate_limit(f
     """
     from algotrader_api.ingestion.backfill import BackfillRunner
 
-    # Sanctions-delisted: MOEX returns empty boards list
+    # All seeded figis (SBER/GAZP/SU46020RMFS2 from fresh_db + our new
+    # RATE_LIM) need MOEX responses — otherwise they all fall through to
+    # the Tinkoff mock below and inflate `call_count` to ~4× the
+    # expected single-figi baseline. MOEX returns empty boards for
+    # everything → all figis end up at the Tinkoff fallback path. Only
+    # RATE_LIM is the one we care about; the others get a different
+    # Tinkoff mock so they don't inflate the rate-limited counter.
+    for ticker in ("SBER", "GAZP", "SU46020RMFS2"):
+        responses.add(
+            responses.GET,
+            f"https://iss.moex.com/iss/securities/{ticker}.json",
+            json={"boards": {"data": [["x", "TQBR", "x", 0, 0, "shares", 0, 1, 1, 0,
+                                        "2014-01-01", "2026-09-14", "2014-01-01", "2026-09-15",
+                                        1, "SUR", "%"]]}},
+        )
+        responses.add_callback(
+            responses.GET,
+            f"https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json",
+            callback=lambda req: (200, {}, '{"history": {"data": []}, "history.cursor": {"data": [[0, 0, 500]]}}'),
+        )
+    responses.add_callback(
+        responses.GET,
+        "https://iss.moex.com/iss/history/engines/stock/markets/bonds/boards/TQOB/securities/SU46020RMFS2.json",
+        callback=lambda req: (200, {}, '{"history": {"data": []}, "history.cursor": {"data": [[0, 0, 500]]}}'),
+    )
     responses.add(
         responses.GET,
         "https://iss.moex.com/iss/securities/RATE_LIM.json",
@@ -508,8 +532,6 @@ async def test_backfill_from_moex_skips_remaining_chunks_on_tinkoff_rate_limit(f
 
     async def rate_limited(*_args, **_kwargs):
         call_count["n"] += 1
-        from grpc import StatusCode
-        from grpc.aio import AioRpcError  # type: ignore
         # Simulate RESOURCE_EXHAUSTED error string format
         raise Exception(
             "RESOURCE_EXHAUSTED: rate limit 600/60s exceeded"

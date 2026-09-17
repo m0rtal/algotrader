@@ -353,6 +353,22 @@ async def _fetch_tinkoff_fallback_impl(
                 elapsed_s=round(_time.time() - chunk_start_t, 3),
                 error=str(e)[:200],
             )
+            # RESOURCE_EXHAUSTED (gRPC 8 / HTTP 429): Tinkoff sandbox is
+            # rate-limited at 600 req/min. If we hit it once, all
+            # subsequent chunks will also fail and burn the rate-limit
+            # window. Bail out immediately — no retry, no second chunk.
+            # The figi will be retried on the next cron tick when the
+            # bucket has refilled. (Mirrors the bail-out in
+            # `_backfill_one`; both Tinkoff-fallback code paths must
+            # behave consistently.)
+            err_str = str(e)
+            if "RESOURCE_EXHAUSTED" in err_str or "rate" in err_str.lower():
+                logger.warn(
+                    "backfill.tinkoff.rate_limited",
+                    figi=figi, ticker=ticker,
+                    message="Tinkoff rate-limited; aborting fallback (will retry next cron)",
+                )
+                return out  # bail out immediately; don't even start the next chunk
         cur = chunk_end + timedelta(days=1)
     return out
 
