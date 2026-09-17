@@ -541,7 +541,7 @@ async def test_backfill_from_moex_delta_only_respects_30d_buffer(fresh_db):
     # Track which years the runner asks MOEX for.
     years_called: list[int] = []
 
-    def fake_fetch_year(market, board, ticker, year):
+    def fake_fetch_year(market, board, ticker, year, last_trading_day=None):
         years_called.append(year)
         return []
 

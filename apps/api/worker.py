@@ -280,6 +280,14 @@ _DAILY_CHAIN_PHASES = (
     "guardian",
 )
 
+# Phases whose failure aborts the rest of the chain. universe_sync and
+# backfill_moex are the data-acquisition core — without them there is
+# nothing to operate on, so subsequent phases would silently produce
+# empty/incorrect results. The rest are best-effort: a failure in
+# gap_recovery or dividends should still let the freshness_check and
+# guardian run so the operator sees the real picture in the morning.
+_CRITICAL_PHASES = frozenset({"migrations", "universe_sync", "backfill_moex"})
+
 
 def _log_chain_phase(db_path: str, phase: str, result: str, *, detail: str = "") -> None:
     """Best-effort write to pipeline_log. Never raises."""
@@ -504,6 +512,7 @@ def run_daily_chain() -> int:
     logger.info("worker.daily.start", sqlite=db_path)
 
     rc = 0
+    failed_phases: list[str] = []
     try:
         for phase in _DAILY_CHAIN_PHASES:
             logger.info("worker.daily.phase_start", phase=phase)
@@ -518,13 +527,35 @@ def run_daily_chain() -> int:
                 detail=detail,
             )
             if not ok:
-                logger.error("worker.daily.phase_failed_aborting", phase=phase)
-                rc = 1
-                break
+                failed_phases.append(phase)
+                if phase in _CRITICAL_PHASES:
+                    logger.error(
+                        "worker.daily.critical_phase_failed_aborting",
+                        phase=phase,
+                        detail=detail,
+                    )
+                    rc = 1
+                    break
+                # Best-effort phase: log + continue so the operator
+                # still gets freshness_check + guardian verdicts.
+                logger.warning(
+                    "worker.daily.best_effort_phase_failed_continuing",
+                    phase=phase,
+                    detail=detail,
+                )
     finally:
         shutdown_tracing()
 
-    logger.info("worker.daily.complete", rc=rc)
+    # Non-zero if any best-effort phase failed even though we continued.
+    # Systemd uses this to flag the chain as degraded.
+    if rc == 0 and failed_phases:
+        rc = 1
+
+    logger.info(
+        "worker.daily.complete",
+        rc=rc,
+        failed_phases=failed_phases,
+    )
     return rc
 
 
