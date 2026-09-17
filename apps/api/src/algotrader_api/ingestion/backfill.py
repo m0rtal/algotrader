@@ -599,32 +599,59 @@ class BackfillRunner:
         written_total = 0
         s_http = __import__("requests").Session()
 
-        for inst in instruments:
+        # Concurrency: up to 5 figis in parallel for MOEX paths (MOEX ISS
+        # rate limit is ~100 req/min per endpoint — plenty of headroom
+        # for 5 figis walking 13 years each in parallel). Tinkoff fallback
+        # is intentionally sequential because Tinkoff sandbox is rate-
+        # limited at 600/min and adaptive-retry backoff compounds when
+        # concurrent slots retry together. Per-figi timeout 90s on
+        # Tinkoff fallback so a single hung ticker can't stall the chain.
+        _figi_timeout_s = 90
+
+        async def _process_moex_year(inst: dict, meta: dict, year: int) -> list[dict]:
+            year_bars = self._fetch_year_moex(meta["market"], meta["board"], inst["ticker"], year)
+            for b in year_bars:
+                b["figi"] = inst["figi"]
+            return year_bars
+
+        async def _process_tinkoff(inst: dict) -> int:
+            figi = inst["figi"]
+            ticker = inst["ticker"]
+            try:
+                listed_from_iso = (inst.get("listed_from") or "2014-01-01")[:10]
+                from_d = date.fromisoformat(listed_from_iso)
+            except (TypeError, ValueError):
+                from_d = date(2014, 1, 1)
+            try:
+                candles = await asyncio.wait_for(
+                    self._fetch_tinkoff_fallback(
+                        self.client, retry_mod, figi, ticker, from_d, yesterday,
+                    ),
+                    timeout=_figi_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                await self._log(
+                    "warn", figi=figi,
+                    message=f"Tinkoff fallback timeout after {_figi_timeout_s}s for {ticker}; skipping",
+                )
+                return 0
+            if not candles:
+                await self._log("warn", figi=figi, message="Tinkoff fallback: no data")
+                return 0
+            return replace_bars_for_figi(self.db_path, figi, candles, replace=False)
+
+        async def _process_one(inst: dict) -> int:
             if self._stop_flag.is_set():
-                break
+                return 0
             figi = inst["figi"]
             ticker = inst.get("ticker")
             if not ticker:
-                continue
+                return 0
 
             meta = _get_meta(ticker)
             if meta is None:
-                # Sanctions-delisted / no MOEX data: Tinkoff fallback
                 await self._log("info", figi=figi, message="no MOEX board; falling back to Tinkoff")
-                listed_from_iso = (inst.get("listed_from") or "2014-01-01")[:10]
-                try:
-                    from_d = date.fromisoformat(listed_from_iso)
-                except (TypeError, ValueError):
-                    from_d = date(2014, 1, 1)
-                candles = await self._fetch_tinkoff_fallback(
-                    self.client, retry_mod, figi, ticker, from_d, yesterday,
-                )
-                if not candles:
-                    await self._log("warn", figi=figi, message="Tinkoff fallback: no data")
-                    continue
-                written = replace_bars_for_figi(self.db_path, figi, candles, replace=False)
-                written_total += written
-                continue
+                return await _process_tinkoff(inst)
 
             listed_from_iso = meta["listed_from"]
             listed_till_iso = meta["listed_till"]
@@ -632,7 +659,7 @@ class BackfillRunner:
                 listed_from_d = date.fromisoformat(listed_from_iso[:10])
                 listed_till_d = date.fromisoformat(listed_till_iso[:10])
             except (TypeError, ValueError):
-                continue
+                return 0
 
             if delta_only:
                 con = __import__("sqlite3").connect(self.db_path)
@@ -646,35 +673,63 @@ class BackfillRunner:
                 if first_ts:
                     earliest = date.fromisoformat(first_ts[:10])
                     if earliest <= listed_from_d:
-                        # figi already has bars covering MOEX window — skip
-                        continue
-                    # 30-day buffer before earliest existing bar so we
-                    # catch any late-listed data MOEX holds before the
-                    # Tinkoff range without re-walking the full history.
+                        return 0
                     from_d = max(listed_from_d, earliest - timedelta(days=30))
                 else:
                     from_d = listed_from_d
+            else:
+                from_d = listed_from_d
 
             to_d = min(yesterday, listed_till_d)
-            if not delta_only:
-                from_d = listed_from_d
             if from_d > to_d:
-                continue
+                return 0
 
-            year = from_d.year
+            # Fetch all years for this figi in parallel (MOEX is fast
+            # and 13 years × 1 figi per slot is fine — that's 13 reqs
+            # distributed across the Semaphore).
+            years = list(range(from_d.year, to_d.year + 1))
+            year_batches = await asyncio.gather(
+                *[_process_moex_year(inst, meta, y) for y in years],
+                return_exceptions=True,
+            )
             all_bars: list[dict] = []
-            while year <= to_d.year:
-                year_bars = self._fetch_year_moex(meta["market"], meta["board"], ticker, year)
-                for b in year_bars:
-                    b["figi"] = figi
-                    all_bars.append(b)
-                year += 1
+            for i, batch in enumerate(year_batches):
+                if isinstance(batch, Exception):
+                    await self._log(
+                        "warn", figi=figi,
+                        message=f"fetch_year_moex failed for year {years[i]} ({ticker}): {batch!r}",
+                    )
+                    continue
+                if isinstance(batch, list):
+                    all_bars.extend(batch)
             if not all_bars:
-                continue
-            written = replace_bars_for_figi(
+                return 0
+            return replace_bars_for_figi(
                 self.db_path, figi, all_bars, replace=False, source="moex"
             )
-            written_total += written
+
+        # Outer parallelism: 5 figis in parallel. Each figi internally
+        # parallelizes its MOEX year-fetches.
+        _sem = asyncio.Semaphore(5)
+        async def _process_one_bounded(inst: dict) -> int:
+            async with _sem:
+                return await _process_one(inst)
+
+        results = await asyncio.gather(
+            *[_process_one_bounded(inst) for inst in instruments],
+            return_exceptions=True,
+        )
+        for i, res in enumerate(results):
+            if isinstance(res, Exception):
+                figi = instruments[i].get("figi", "?")
+                ticker = instruments[i].get("ticker", "?")
+                await self._log(
+                    "warn", figi=figi,
+                    message=f"backfill_from_moex figi failed for {ticker}: {res!r}",
+                )
+                continue
+            if isinstance(res, int):
+                written_total += res
 
         return written_total
 
