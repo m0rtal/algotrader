@@ -120,3 +120,81 @@ count, not a stale metadata field.
   re-fetch
 - AND a subsequent backfill overwrites the stale row with fresh
   counts once the figi is processed again
+
+### Requirement: Priority Queue Construction
+
+The system SHALL compute a priority queue of tradable figis ordered
+by gap size (descending) before each daily backfill run. The queue
+SHALL exclude figis whose bars already cover every trading day in
+`[listed_from, min(yesterday, listed_till)]`.
+
+#### Scenario: Empty universe returns empty queue
+
+Given no tradable figis in the universe
+When `compute_priority_queue()` is called
+Then it returns an empty list
+
+#### Scenario: Fully covered figis excluded
+
+Given figi F1 has bars covering `[2014-01-01, 2026-09-17]` with no gaps
+And figi F2 has 500 missing dates
+When `compute_priority_queue()` is called
+Then the returned queue contains only F2
+
+#### Scenario: Mixed coverage sorted by gap descending
+
+Given F1 has 1693 missing dates
+And F2 has 500 missing dates
+And F3 has 100 missing dates
+When `compute_priority_queue()` is called
+Then the queue is `[F1, F2, F3]` in that exact order
+
+#### Scenario: Small-gap figis included by default
+
+Given a figi has 5 missing dates
+And `gap_threshold_for_moex` defaults to 100
+When `compute_priority_queue()` is called
+Then the figi appears in the queue
+
+#### Scenario: gap_threshold_for_moex filter
+
+Given F1 has 50 missing dates
+And F2 has 200 missing dates
+And `gap_threshold_for_moex=100` is configured
+When `compute_priority_queue()` is called
+Then the queue contains only F2
+
+#### Scenario: Idempotency
+
+Given a fixed universe and DB state
+When `compute_priority_queue()` is called twice with the same args
+Then both calls return the same queue (same order, same sizes)
+
+### Requirement: Priority-Aware Fetch Scheduling
+
+The system SHALL process figis in priority order during
+`BackfillRunner.backfill_from_moex()` when `priority=True` (default).
+
+#### Scenario: SBER processed first
+
+Given SBER has the largest gap (1693 missing dates) in the universe
+When `worker.py daily --priority` runs
+Then SBER is processed within the first 10 figis
+
+#### Scenario: Backward compatibility
+
+Given `priority=False` is passed to `backfill_from_moex()`
+When the chain runs
+Then figis are processed in alphabetical ticker order (legacy behavior)
+
+### Requirement: Concurrency Budget
+
+The system SHALL limit concurrent MOEX figi fetches to 5 in flight at
+any time via `asyncio.Semaphore(5)`.
+
+#### Scenario: 6th figi waits
+
+Given 5 figis are currently being fetched
+When a 6th figi is scheduled
+Then it waits until one of the in-flight figis completes before starting
+
