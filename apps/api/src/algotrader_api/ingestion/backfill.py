@@ -216,6 +216,57 @@ def _get_meta_moex(
     return meta
 
 
+def compute_missing_dates(
+    figi: str,
+    listed_from: date,
+    yesterday: date,
+    db_path: str,
+) -> set[date]:
+    """Return the set of expected trading dates the figi is missing.
+
+    "Expected trading dates" = calendar dates in
+    [listed_from, yesterday] excluding weekends and entries in the
+    `moex_holidays` table. The result is the symmetric difference
+    between that expected set and the dates already present in `bars`
+    for this figi (regardless of `source` column).
+
+    Pure function: reads `bars` and `moex_holidays` from the given
+    SQLite path; never writes.
+
+    Used by `backfill_from_moex()` to drive the per-figi fetch
+    decision. A figi with empty missing dates is already complete
+    and skipped.
+    """
+    if listed_from > yesterday:
+        return set()
+    # 1. Load holidays once (set of date).
+    # Note: moex_holidays schema uses `date` column (per migration 004).
+    con = sqlite3.connect(db_path)
+    try:
+        holiday_rows = con.execute(
+            "SELECT date FROM moex_holidays WHERE date BETWEEN ? AND ?",
+            (listed_from.isoformat(), yesterday.isoformat()),
+        ).fetchall()
+        holidays = {date.fromisoformat(r[0]) for r in holiday_rows}
+        # 2. Load existing bar dates (any source).
+        existing_rows = con.execute(
+            "SELECT ts FROM bars WHERE figi = ? AND ts BETWEEN ? AND ?",
+            (figi, listed_from.isoformat(), yesterday.isoformat()),
+        ).fetchall()
+        existing = {date.fromisoformat(r[0]) for r in existing_rows}
+    finally:
+        con.close()
+    # 3. Compute expected set: weekday + not holiday + in window.
+    expected: set[date] = set()
+    cur = listed_from
+    while cur <= yesterday:
+        if cur.weekday() < 5 and cur not in holidays:
+            expected.add(cur)
+        cur += timedelta(days=1)
+    # 4. Missing = expected ∖ existing.
+    return expected - existing
+
+
 def _fetch_year_moex(
     market: str,
     board: str,
@@ -762,20 +813,20 @@ class BackfillRunner:
                 return 0
 
             if delta_only:
-                con = __import__("sqlite3").connect(self.db_path)
-                try:
-                    row = con.execute(
-                        "SELECT MIN(ts) FROM bars WHERE figi = ?", (figi,)
-                    ).fetchone()
-                    first_ts = row[0] if row and row[0] else None
-                finally:
-                    con.close()
-                if first_ts:
-                    earliest = date.fromisoformat(first_ts[:10])
-                    if earliest <= listed_from_d:
-                        return 0
-                    from_d = max(listed_from_d, earliest - timedelta(days=30))
-                else:
+                # Coverage-aware gap detection: skip if all trading
+                # days in [listed_from_d, yesterday] are already in
+                # `bars` (any source); otherwise fetch only the
+                # missing dates via the from_d/to_d window.
+                missing = compute_missing_dates(
+                    figi=figi,
+                    listed_from=listed_from_d,
+                    yesterday=yesterday,
+                    db_path=self.db_path,
+                )
+                if not missing:
+                    return 0
+                from_d = min(missing)
+                if from_d <= listed_from_d:
                     from_d = listed_from_d
             else:
                 from_d = listed_from_d
