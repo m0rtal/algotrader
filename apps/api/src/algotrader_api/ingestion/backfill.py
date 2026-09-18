@@ -185,7 +185,9 @@ def _get_meta_moex(
             return meta_cache[ticker]
     url = f"https://iss.moex.com/iss/securities/{urllib.parse.quote(ticker)}.json"
     try:
-        data = requests.get(url, timeout=10).json()
+        # (connect_timeout, read_timeout) — prevents indefinite hangs
+        # when MOEX ISS accepts the TCP connection but stalls mid-response.
+        data = requests.get(url, timeout=(5, 30)).json()
     except Exception:
         return None
     boards = data.get("boards", {}).get("data", [])
@@ -697,10 +699,11 @@ class BackfillRunner:
         # rate limit is ~100 req/min per endpoint — plenty of headroom
         # for 5 figis walking 13 years each in parallel). Tinkoff fallback
         # is intentionally sequential because Tinkoff sandbox is rate-
-        # limited at 600/min and adaptive-retry backoff compounds when
-        # concurrent slots retry together. Per-figi timeout 90s on
-        # Tinkoff fallback so a single hung ticker can't stall the chain.
-        _figi_timeout_s = 90
+        # Tinkoff fallback is intentionally sequential because Tinkoff sandbox is
+        # rate-limited at 600/min and adaptive-retry backoff compounds when
+        # concurrent slots retry together. Per-figi timeout on Tinkoff
+        # fallback so a single hung ticker can't stall the chain.
+        _figi_timeout_s = 45
 
         async def _process_moex_year(inst: dict, meta: dict, year: int) -> list[dict]:
             year_bars = self._fetch_year_moex(
@@ -812,7 +815,16 @@ class BackfillRunner:
         async def _prefetch_meta(inst: dict) -> None:
             ticker = inst.get("ticker") or ""
             if ticker:
-                await asyncio.to_thread(_get_meta, ticker)
+                # 30s per-ticker timeout — if MOEX ISS hangs on one ticker,
+                # we don't want to block the whole prefetch.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(_get_meta, ticker),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    pass  # Cache will be empty for this ticker; _process_one
+                    # will fall back to Tinkoff as before.
 
         await asyncio.gather(*[_prefetch_meta(inst) for inst in instruments])
 
