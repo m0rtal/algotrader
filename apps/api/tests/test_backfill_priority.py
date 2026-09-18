@@ -43,13 +43,13 @@ def _make_test_db(tmp_path: Path) -> str:
     return db_path
 
 
-def _seed_bars(db_path: str, figi: str, dates: list[str]):
+def _seed_bars(db_path: str, figi: str, dates: list[str], source: str = "moex"):
     con = get_connection(db_path)
     for d in dates:
         con.execute(
-            "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (figi, d, 100.0, 101.0, 99.0, 100.5, 1000),
+            "INSERT INTO bars (figi, ts, open, high, low, close, volume, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (figi, d, 100.0, 101.0, 99.0, 100.5, 1000, source),
         )
     con.commit()
 
@@ -225,3 +225,65 @@ def test_idempotent_same_args_same_queue(tmp_path):
     queue1 = compute_priority_queue(**args)
     queue2 = compute_priority_queue(**args)
     assert queue1 == queue2
+
+
+# Scenario 7: MOEX-yielding figis ranked ahead regardless of gap size
+def test_moex_yielding_figis_ranked_first(tmp_path):
+    """Tier-1 figis (with ≥1 moex bar) come before tier-2 (no moex bars)."""
+    db_path = _make_test_db(tmp_path)
+    # F1: 0 moex bars (only tinkoff) → tier 2, but with large gap
+    _seed_bars(db_path, "BBG_F1",
+               ["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08",
+                "2026-01-09", "2026-01-12", "2026-01-13", "2026-01-14",
+                "2026-01-15", "2026-01-16", "2026-01-19", "2026-01-20",
+                "2026-01-21", "2026-01-22", "2026-01-23", "2026-01-26",
+                "2026-01-27", "2026-01-28", "2026-01-29"],
+               source="tinkoff")
+    # F2: has 1 moex bar → tier 1, even though small gap
+    _seed_bars(db_path, "BBG_F2",
+               ["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08",
+                "2026-01-09", "2026-01-12", "2026-01-13", "2026-01-14",
+                "2026-01-15", "2026-01-16", "2026-01-19", "2026-01-20",
+                "2026-01-21", "2026-01-22", "2026-01-23", "2026-01-26",
+                "2026-01-27", "2026-01-28", "2026-01-29",
+                # One moex bar
+                "2026-01-30"],
+               source="moex")
+    queue = compute_priority_queue(
+        db_path=db_path,
+        universe=[("F1", "BBG_F1"), ("F2", "BBG_F2")],
+        listed_from_lookup=lambda t: date(2026, 1, 1),
+        yesterday=date(2026, 1, 30),
+        gap_threshold_for_moex=0,
+    )
+    assert len(queue) == 2, queue
+    # F2 (moex-yielding) must be first despite smaller gap
+    assert queue[0][1] == "BBG_F2", f"expected BBG_F2 first, got {queue}"
+    assert queue[1][1] == "BBG_F1"
+
+
+# Scenario 8: Within-tier sort by gap size preserved
+def test_within_tier_sort_preserved(tmp_path):
+    db_path = _make_test_db(tmp_path)
+    # F1: has moex bar, gap=20 (only 1 weekday seeded)
+    _seed_bars(db_path, "BBG_F1", ["2026-01-15"], source="moex")
+    # F2: has moex bar, gap=10 (11 weekdays seeded)
+    _seed_bars(db_path, "BBG_F2",
+               ["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08",
+                "2026-01-09", "2026-01-12", "2026-01-13", "2026-01-14",
+                "2026-01-15", "2026-01-16", "2026-01-19"],
+               source="moex")
+    # F3: no moex bars, gap=200 (huge but tier 2)
+    _seed_bars(db_path, "BBG_F3", ["2026-01-15"], source="tinkoff")
+    queue = compute_priority_queue(
+        db_path=db_path,
+        universe=[("F1", "BBG_F1"), ("F2", "BBG_F2"), ("F3", "BBG_F3")],
+        listed_from_lookup=lambda t: date(2026, 1, 1),
+        yesterday=date(2026, 1, 29),
+        gap_threshold_for_moex=0,
+    )
+    figis_in_order = [q[1] for q in queue]
+    # Tier 1 first (F1, F2), then tier 2 (F3)
+    assert figis_in_order.index("BBG_F3") == 2, figis_in_order
+    # Within tier 1, F1 (gap=20) before F2 (gap=10)
+    assert figis_in_order.index("BBG_F1") < figis_in_order.index("BBG_F2"), figis_in_order

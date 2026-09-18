@@ -198,3 +198,35 @@ Given 5 figis are currently being fetched
 When a 6th figi is scheduled
 Then it waits until one of the in-flight figis completes before starting
 
+### Requirement: MOEX-Yielding Tier Sort
+
+The system SHALL rank figis in the priority queue with MOEX-yielding
+figis (≥1 moex bar in `bars`) ahead of non-yielding figis, regardless
+of gap size.
+
+#### Scenario: MOEX-yielding figi ranks ahead despite smaller gap
+
+Given figi F1 has 0 moex bars but gap=200 (large)
+And figi F2 has 1 moex bar but gap=5 (small)
+When `compute_priority_queue()` is called
+Then F2 appears before F1 in the returned queue
+
+#### Scenario: Within-tier sort by gap size preserved
+
+Given figis F1, F2, F3 all have ≥1 moex bar
+And F1 gap=10, F2 gap=100, F3 gap=50
+When `compute_priority_queue()` is called
+Then order is `[F2, F3, F1]` (gap size DESC within tier 1)
+
+#### Scenario: Mixed tiers
+
+Given F1, F2 have ≥1 moex bar, F3, F4 do not
+And gaps: F1=20, F2=10, F3=200, F4=100
+When `compute_priority_queue()` is called
+Then order is `[F1, F2, F3, F4]` (tier 1 first, then tier 2 by gap DESC)
+
+#### Scenario: SBER rank improves
+
+Given SBER has 1 moex bar (proves MOEX yield)
+When `compute_priority_queue()` is called with full universe
+Then SBER rank is ≤ 357 (was 3586 before this change)
