@@ -700,12 +700,17 @@ class BackfillRunner:
         today: date | None = None,
         max_workers: int = 5,
         delta_only: bool = True,
+        priority: bool = True,
     ) -> int:
         """Walk every tradeable figi from MOEX listed_from to min(yesterday, listed_till).
 
         Replaces the Tinkoff-only daily_backfill + full_history walk.
         Insertion is INSERT OR IGNORE on PRIMARY KEY (figi, ts), so existing
         Tinkoff bars (2021+) are never overwritten.
+
+        When `priority=True` (default), figis are sorted by gap size
+        descending before fetching so rate-limit budget is spent on
+        the biggest missing-history gaps first.
 
         Algorithm:
           1. List instruments via self._list_instruments().
@@ -732,6 +737,42 @@ class BackfillRunner:
         instruments = self._list_instruments()
         self._moex_meta: dict[str, dict | None] = {}
         self._moex_meta_lock = threading.Lock()
+
+        # Priority reorder: when priority=True, sort figis by gap size
+        # descending so rate-limit budget is spent on the biggest
+        # missing-history gaps first (SBER, large-cap stocks before
+        # newly-issued bonds).
+        if priority:
+            from algotrader_api.ingestion.priority import compute_priority_queue
+            universe = [(inst.get("ticker", ""), inst.get("figi", ""))
+                        for inst in instruments]
+            # For listed_from lookup we don't have it before MOEX probe;
+            # use 2014-01-01 as a conservative default (covers most
+            # tradable figis; sanctions-delisted fall back to Tinkoff).
+            def _lookup_default(ticker: str) -> date:
+                return date(2014, 1, 1)
+            priority_queue = compute_priority_queue(
+                db_path=self.db_path,
+                universe=universe,
+                listed_from_lookup=_lookup_default,
+                yesterday=yesterday,
+                gap_threshold_for_moex=0,
+            )
+            if priority_queue:
+                priority_order = {figi: i for i, (_, figi, _) in enumerate(priority_queue)}
+                # Stable sort: priority figis first (in order), then the rest.
+                instruments = sorted(
+                    instruments,
+                    key=lambda inst: (
+                        0 if inst.get("figi") in priority_order else 1,
+                        priority_order.get(inst.get("figi"), 0),
+                    ),
+                )
+                await self._log(
+                    "info",
+                    message=f"priority-aware fetch: {len(priority_queue)} figis "
+                            f"with gaps > 0, sorted by gap size descending",
+                )
 
         def _get_meta(ticker: str) -> dict | None:
             """Inline thin wrapper around the module-level helper, kept so
