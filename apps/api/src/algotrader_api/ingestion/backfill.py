@@ -805,11 +805,36 @@ class BackfillRunner:
                 self.db_path, figi, all_bars, replace=False, source="moex"
             )
 
-        # Outer parallelism: 5 figis in parallel. Each figi internally
-        # parallelizes its MOEX year-fetches.
-        _sem = asyncio.Semaphore(5)
+        # Pre-populate the meta cache for all instruments in parallel via
+        # asyncio.to_thread (the sync _get_meta_moex calls MOEX ISS).
+        # After this step, _moex_meta has entries for every ticker, so
+        # _process_one_bounded can read it without blocking the loop.
+        async def _prefetch_meta(inst: dict) -> None:
+            ticker = inst.get("ticker") or ""
+            if ticker:
+                await asyncio.to_thread(_get_meta, ticker)
+
+        await asyncio.gather(*[_prefetch_meta(inst) for inst in instruments])
+
+        # Outer parallelism:
+        # - 5 figis in parallel for MOEX path (cheap, MOEX ISS ~100 req/min per endpoint).
+        # - 1 figi at a time for Tinkoff fallback (sandbox/prod 600 req/min,
+        #   adaptive-retry backoff compounds when concurrent slots retry together).
+        # The split prevents rate-limited Tinkoff figis from starving MOEX
+        # figis of the shared semaphore.
+        _moex_sem = asyncio.Semaphore(5)
+        _tinkoff_sem = asyncio.Semaphore(1)
+
         async def _process_one_bounded(inst: dict) -> int:
-            async with _sem:
+            ticker = inst.get("ticker") or ""
+            meta = self._moex_meta.get(ticker) if ticker else None
+            # After prefetch, self._moex_meta contains either meta dict or
+            # None for every ticker. A second _get_meta would just hit the cache.
+            if meta is not None:
+                sem = _moex_sem
+            else:
+                sem = _tinkoff_sem
+            async with sem:
                 return await _process_one(inst)
 
         results = await asyncio.gather(
