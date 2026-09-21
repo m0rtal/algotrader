@@ -21,6 +21,8 @@ import asyncio
 import logging
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 # Ensure src/ is on sys.path when run directly: python worker.py
@@ -289,6 +291,46 @@ _DAILY_CHAIN_PHASES = (
 _CRITICAL_PHASES = frozenset({"migrations", "universe_sync", "backfill_moex"})
 
 
+# Heartbeat for supervisor watchdog (autonomous-chain-recovery
+# phase 2). Worker inserts a `pipeline` row every 5 min so the
+# supervisor's 30-sec DB poll can detect a stalled process and
+# SIGKILL it for restart. The constant is module-level so tests
+# can monkey-patch it down to ~0.1s.
+HEARTBEAT_INTERVAL_SECONDS = 300
+
+
+def heartbeat_loop(db_path: str, interval_seconds: float) -> None:
+    """Emit pipeline rows with phase='worker.heartbeat' every interval.
+
+    Daemon-friendly: catches and logs all exceptions, never raises.
+    Designed to run in a daemon thread started by main(); dies when
+    the process exits.
+
+    Tests call this directly with a short interval to assert ≥1 row
+    is inserted.
+    """
+    import sqlite3
+    while True:
+        try:
+            conn = sqlite3.connect(db_path, timeout=5.0)
+            try:
+                conn.execute(
+                    "INSERT INTO pipeline (phase, started_at, "
+                    "finished_at, rows_processed, status, detail) "
+                    "VALUES ('worker.heartbeat', datetime('now'), "
+                    "datetime('now'), 0, 'ok', ?)",
+                    (f"pid={os.getpid()}",),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "worker.heartbeat.emit_failed error=%s", exc,
+            )
+        time.sleep(interval_seconds)
+
+
 def _log_chain_phase(db_path: str, phase: str, result: str, *, detail: str = "") -> None:
     """Best-effort write to pipeline_log. Never raises."""
     import sqlite3
@@ -510,6 +552,17 @@ def run_daily_chain() -> int:
     )
 
     logger.info("worker.daily.start", sqlite=db_path)
+
+    # Heartbeat daemon (autonomous-chain-recovery phase 2):
+    # supervisor polls the DB every 30s for heartbeat freshness and
+    # SIGKILLs us if we stop emitting. Daemon thread dies with main.
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop,
+        args=(db_path, HEARTBEAT_INTERVAL_SECONDS),
+        daemon=True,
+        name="worker-heartbeat",
+    )
+    heartbeat_thread.start()
 
     rc = 0
     failed_phases: list[str] = []
