@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 from datetime import date, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -427,3 +428,106 @@ async def test_run_daily_guardian_releases_lock_on_failure(db, monkeypatch):
     )
     summary = await run_daily_guardian(db, runner)
     assert summary.figis_checked == 2
+
+
+# ── Stale-lock auto-clear tests (autonomous-chain-recovery) ──────────
+
+
+def test_acquire_guardian_lock_auto_clears_stale_pid(db, monkeypatch):
+    """A 7-hour-old sentinel owned by a dead PID is auto-cleared and
+    the caller acquires the lock."""
+    from algotrader_api.data_quality.service import (
+        _acquire_guardian_lock,
+        GuardianLocked,
+    )
+
+    # Seed a sentinel owned by a non-existent PID, started 7h ago.
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO guardian_lock (id, holder_pid, started_at) "
+        "VALUES (1, 99999, datetime('now', '-7 hours'))"
+    )
+    con.commit()
+    con.close()
+
+    # Acquire — should clear stale and succeed.
+    _acquire_guardian_lock(db)
+
+    con = sqlite3.connect(db)
+    row = con.execute(
+        "SELECT holder_pid FROM guardian_lock WHERE id = 1"
+    ).fetchone()
+    con.close()
+
+    assert row is not None
+    assert row[0] == os.getpid()  # caller now owns the lock
+
+
+def test_acquire_guardian_lock_does_not_steal_live_pid(db):
+    """A lock owned by an alive PID is NOT cleared, even if old."""
+    from algotrader_api.data_quality.service import (
+        _acquire_guardian_lock,
+        GuardianLocked,
+    )
+
+    # Seed a sentinel owned by *current* PID (simulates live holder).
+    my_pid = os.getpid()
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO guardian_lock (id, holder_pid, started_at) "
+        "VALUES (1, ?, datetime('now', '-10 hours'))",
+        (my_pid,),
+    )
+    con.commit()
+    con.close()
+
+    # Acquire from current PID — should succeed (same owner, just
+    # re-claim our own lock).
+    _acquire_guardian_lock(db)
+
+    con = sqlite3.connect(db)
+    row = con.execute(
+        "SELECT holder_pid FROM guardian_lock WHERE id = 1"
+    ).fetchone()
+    con.close()
+    assert row[0] == my_pid
+
+
+def test_acquire_guardian_lock_respects_ttl_boundary(db):
+    """TTL=6h: 5h59m → not cleared, 6h01m → cleared."""
+    from algotrader_api.data_quality.service import (
+        _acquire_guardian_lock,
+        GuardianLocked,
+    )
+
+    # Test 1: 5h59m → must raise (under TTL)
+    con = sqlite3.connect(db)
+    con.execute("DELETE FROM guardian_lock")
+    con.execute(
+        "INSERT INTO guardian_lock (id, holder_pid, started_at) "
+        "VALUES (1, 99998, datetime('now', '-5 hours', '-59 minutes'))"
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(GuardianLocked):
+        _acquire_guardian_lock(db)
+
+    # Test 2: 6h01m → must clear and succeed
+    con = sqlite3.connect(db)
+    con.execute("DELETE FROM guardian_lock")
+    con.execute(
+        "INSERT INTO guardian_lock (id, holder_pid, started_at) "
+        "VALUES (1, 99997, datetime('now', '-6 hours', '-1 minutes'))"
+    )
+    con.commit()
+    con.close()
+
+    _acquire_guardian_lock(db)  # must not raise
+
+    con = sqlite3.connect(db)
+    row = con.execute(
+        "SELECT holder_pid FROM guardian_lock WHERE id = 1"
+    ).fetchone()
+    con.close()
+    assert row[0] == os.getpid()
