@@ -30,10 +30,59 @@ if [[ -d "$SUP_CWD" && "$SUP_CWD" != "." ]]; then
   echo "[supervisor] $(date -Iseconds) cwd=$(pwd)" >> "$LOG"
 fi
 
+# Heartbeat watchdog (autonomous-chain-recovery phase 2). Look for a
+# pipeline row with phase='worker.heartbeat' that is younger than 30
+# minutes. If the latest is older (or absent), the worker is stalled —
+# SIGKILL its PID so the outer restart loop relaunches it.
+#
+# Watchdog runs in the background; the main restart loop is the
+# foreground. STATE_DB is `<cwd>/data/state.db` (matches the
+# supervisor's cwd pinning convention used by worker.py).
+STATE_DB="${PWD}/data/state.db"
+HEARTBEAT_MAX_AGE_DAYS=0.0208  # 30 minutes in days (SQLite julianday unit)
+
+_watchdog() {
+  while true; do
+    sleep 30
+    if [[ ! -f "$STATE_DB" ]]; then
+      continue
+    fi
+    # sqlite3 CLI may not be installed; use python via the
+    # system python (the supervisor runs on the host, not in venv).
+    AGE=$(STATE_DB="$STATE_DB" python3 -c "
+import sqlite3, os, sys
+p = os.environ.get('STATE_DB', '')
+if not p or not os.path.exists(p):
+    sys.exit(0)
+con = sqlite3.connect(p, timeout=5)
+row = con.execute(
+    \"SELECT IFNULL(julianday('now') - julianday(MAX(finished_at)), 999) \"
+    \"FROM pipeline WHERE phase='worker.heartbeat'\"
+).fetchone()
+print(row[0])
+" 2>/dev/null)
+    if [[ -n "$AGE" ]] && \
+       awk -v a="$AGE" -v max="$HEARTBEAT_MAX_AGE_DAYS" \
+         'BEGIN { exit !(a > max) }'; then
+      echo "[supervisor] $(date -Iseconds) worker stalled \
+(heartbeat age=${AGE}d, max=${HEARTBEAT_MAX_AGE_DAYS}d); killing" >> "$LOG"
+      if [[ -n "${WORKER_PID:-}" ]]; then
+        kill -9 "$WORKER_PID" 2>/dev/null || true
+      fi
+    fi
+  done
+}
+
+_watchdog &
+WATCHDOG_PID=$!
+
 while true; do
   echo "[supervisor] $(date -Iseconds) launching $*" >> "$LOG"
-  "$@" >> "$LOG" 2>&1
+  "$@" >> "$LOG" 2>&1 &
+  WORKER_PID=$!
+  wait "$WORKER_PID"
   RC=$?
+  WORKER_PID=""
   echo "[supervisor] $(date -Iseconds) $NAME exited rc=$RC; restarting in 5s" >> "$LOG"
   sleep 5
 done

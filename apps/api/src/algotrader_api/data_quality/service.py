@@ -148,6 +148,25 @@ def _acquire_guardian_lock(db_path: str) -> None:
                 row[0],
                 int(age_seconds),
             )
+            # Pipeline observability: record the recovery so QA
+            # can audit chain autonomy. Failure here is non-fatal.
+            try:
+                _sqlite_exec(
+                    db_path,
+                    "INSERT INTO pipeline (phase, started_at, finished_at, "
+                    "rows_processed, status, detail) VALUES "
+                    "('guardian_recovery', datetime('now'), "
+                    "datetime('now'), 1, 'ok', ?)",
+                    (
+                        f"auto_cleared_stale_pid={row[0]} "
+                        f"age_seconds={int(age_seconds)}",
+                    ),
+                )
+            except Exception as exc:
+                _LOG.warning(
+                    "guardian_recovery.pipeline_insert_failed error=%s",
+                    exc,
+                )
             return
 
         # Live (or recent) holder — refuse. Do NOT force-take.

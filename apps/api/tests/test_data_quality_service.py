@@ -531,3 +531,30 @@ def test_acquire_guardian_lock_respects_ttl_boundary(db):
     ).fetchone()
     con.close()
     assert row[0] == os.getpid()
+
+
+def test_phantom_recovery_pipeline_row_inserted(db):
+    """Stale-lock auto-clear inserts a `guardian_recovery` pipeline row."""
+    from algotrader_api.data_quality.service import _acquire_guardian_lock
+
+    # Seed stale sentinel.
+    con = sqlite3.connect(db)
+    con.execute("DELETE FROM guardian_lock")
+    con.execute(
+        "INSERT INTO guardian_lock (id, holder_pid, started_at) "
+        "VALUES (1, 99999, datetime('now', '-7 hours'))"
+    )
+    con.commit()
+    con.close()
+
+    _acquire_guardian_lock(db)
+
+    # Assert pipeline row was inserted.
+    con = sqlite3.connect(db)
+    row = con.execute(
+        "SELECT detail FROM pipeline WHERE phase='guardian_recovery'"
+    ).fetchone()
+    con.close()
+    assert row is not None, "guardian_recovery pipeline row missing"
+    assert "auto_cleared_stale_pid=99999" in row[0]
+    assert "age_seconds=" in row[0]
