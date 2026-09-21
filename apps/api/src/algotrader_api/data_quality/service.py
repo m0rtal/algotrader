@@ -34,6 +34,13 @@ from .recovery import recover_stale
 _LOG = logging.getLogger("algotrader_api.data_quality.service")
 
 
+# Stale-lock TTL (autonomous-chain-recovery). 6h is 10× a typical
+# guardian run duration (~2-5 min), so a healthy worker is never
+# mistaken for stale. Older than this AND the holder PID is dead
+# → auto-clear.
+STALE_TTL_SECONDS = 6 * 3600
+
+
 class GuardianLocked(RuntimeError):
     """Raised when another guardian run holds the single-flight lock.
 
@@ -77,8 +84,18 @@ def _acquire_guardian_lock(db_path: str) -> None:
     lock from a crashed process returns no row, which we treat
     as "locked" — a manual ``DELETE FROM guardian_lock`` clears
     the stale sentinel.
+
+    Stale-lock auto-recovery (autonomous-chain-recovery): if the
+    sentinel is older than ``STALE_TTL_SECONDS`` AND the holder
+    PID is no longer alive (``os.kill(pid, 0)`` raises
+    ``ProcessLookupError``), the sentinel is deleted and the
+    caller re-acquires. This prevents a crashed worker from
+    blocking the chain indefinitely. Single-flight for live
+    holders is preserved (cross-user ``PermissionError`` is
+    treated as "alive" to prevent stealing).
     """
     import sqlite3
+    from datetime import datetime, timedelta
 
     con = sqlite3.connect(db_path, timeout=30.0)
     try:
@@ -94,16 +111,51 @@ def _acquire_guardian_lock(db_path: str) -> None:
         if row is None:
             con.rollback()
             raise GuardianLocked("guardian_lock row missing after INSERT")
-        if row[0] != os.getpid():
-            # Another worker holds the lock — refuse. Do NOT force-take:
-            # the holder is live (the test pre-release pattern proves
-            # this), and stealing the lock would defeat the purpose of
-            # single-flight. The concurrent worker should abort cleanly.
-            con.rollback()
-            raise GuardianLocked(
-                f"guardian lock held by pid={row[0]} since {row[1]}"
+        if row[0] == os.getpid():
+            # We already own it (re-acquire by same PID is a no-op).
+            con.commit()
+            return
+
+        # Another worker holds the lock. Check if the holder is
+        # stale — TTL exceeded AND pid is no longer alive.
+        try:
+            started_at = datetime.strptime(row[1], "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            started_at = datetime.utcnow()
+        age_seconds = (datetime.utcnow() - started_at).total_seconds()
+
+        pid_alive = True
+        try:
+            os.kill(row[0], 0)
+        except ProcessLookupError:
+            pid_alive = False
+        except PermissionError:
+            # Foreign PID we can't signal — treat as alive to
+            # avoid cross-user lock stealing.
+            pid_alive = True
+
+        if age_seconds > STALE_TTL_SECONDS and not pid_alive:
+            # Stale sentinel from a dead worker. Clear and re-acquire.
+            con.execute("DELETE FROM guardian_lock WHERE id = 1")
+            con.execute(
+                "INSERT INTO guardian_lock (id, holder_pid, started_at) "
+                "VALUES (1, ?, datetime('now'))",
+                (os.getpid(),),
             )
-        con.commit()
+            con.commit()
+            _LOG.warning(
+                "guardian.lock.stale_cleared holder_pid=%s age_seconds=%s",
+                row[0],
+                int(age_seconds),
+            )
+            return
+
+        # Live (or recent) holder — refuse. Do NOT force-take.
+        con.rollback()
+        raise GuardianLocked(
+            f"guardian lock held by pid={row[0]} since {row[1]} "
+            f"(age={int(age_seconds)}s, alive={pid_alive})"
+        )
     except sqlite3.OperationalError as exc:
         # SQLITE_BUSY (5) on a held BEGIN IMMEDIATE — translate.
         con.rollback()
