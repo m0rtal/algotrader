@@ -19,6 +19,7 @@ export default defineConfig({
     },
   },
   server: {
+    host: '0.0.0.0', // listen on all interfaces so 192.168.1.101:5173 is reachable from LAN
     port: 5173,
     strictPort: true,
     // Proxy same-origin so MSW passthrough isn't needed for /api in dev:
