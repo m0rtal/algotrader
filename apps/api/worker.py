@@ -449,11 +449,21 @@ def _load_holiday_dates(
 def _load_restricted_dates(
     con: sqlite3.Connection, start: date, end: date,
 ) -> set[date]:
-    """Return the set of restricted_periods dates in [start, end]."""
-    rows = con.execute(
-        "SELECT date FROM restricted_periods WHERE date BETWEEN ? AND ?",
-        (start.isoformat(), end.isoformat()),
-    ).fetchall()
+    """Return the set of restricted_periods dates in [start, end].
+
+    Mirrors the defensive contract of ``_load_holiday_dates``: returns an
+    empty set if the table is missing (older schemas) so the trailing-gap
+    pass degrades gracefully. ``_collect_trailing_gaps`` advertises this
+    as part of its public contract — honour it on both calendar tables.
+    """
+    try:
+        rows = con.execute(
+            "SELECT date FROM restricted_periods WHERE date BETWEEN ? AND ?",
+            (start.isoformat(), end.isoformat()),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Table not yet migrated -> treat as "no restricted periods".
+        return set()
     return {date.fromisoformat(r["date"]) for r in rows}
 
 
@@ -500,6 +510,12 @@ def _collect_trailing_gaps(
     callers that mock gap_recovery but use a bare sqlite file.
     """
     with closing(sqlite3.connect(db_path)) as con:
+        # Mirror data_quality/gap_recovery.py:find_gaps — production code
+        # reads ``r["figi"]``/``r["date"]`` below so we MUST set the row
+        # factory; the default tuple rows would raise TypeError on those
+        # keyed accesses the first time the trailing pass runs against a
+        # real (non-test-mocked) database.
+        con.row_factory = sqlite3.Row
         try:
             rows = con.execute(
                 "SELECT figi, MAX(ts) AS last_ts FROM bars GROUP BY figi"
@@ -568,6 +584,9 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
             ticker_by_figi: dict[str, str] = {}
             con = sqlite3.connect(db_path)
             try:
+                # Same row_factory requirement as _collect_trailing_gaps
+                # above: r["figi"]/r["ticker"] below need keyed access.
+                con.row_factory = sqlite3.Row
                 placeholders = ",".join("?" for _ in figis)
                 ticker_rows = con.execute(
                     f"SELECT figi, ticker FROM instruments "
@@ -627,8 +646,8 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
             f"gap recovery: {total_added} bars filled "
             f"(historical={hist_added} across {len(gaps)} gaps, "
             f"trailing={trailing_added} across {len(trailing)} figis "
-            f"[moex={trailing_by_source['moex']}, "
-            f"tinkoff={trailing_by_source['tinkoff']}])"
+            f"[moex={trailing_by_source.get('moex', 0)}, "
+            f"tinkoff={trailing_by_source.get('tinkoff', 0)}])"
         )
     except Exception as exc:
         return False, f"gap recovery failed: {exc}"
