@@ -8,10 +8,12 @@ For each figi:
 2. If probe returns `None` (sanctions-delisted, MOEX has no boards for
    the ticker): fall back to Tinkoff for the full window via
    `BackfillRunner._fetch_tinkoff_fallback` (already implemented).
-3. Else: window = `[listed_from, yesterday]`. Split into
-   `[listed_from, max(earliest_local_bar - 1, listed_from + 8 months)]`
-   (MOEX) ∪ `[earliest_local_bar, yesterday]` (Tinkoff). If no local
-   bars exist yet, MOEX covers the full window.
+3. Else: window = `[listed_from, yesterday]`. Route purely on window
+   duration: if window > 270 days (9 months), walk each calendar year
+   in the window via `_fetch_year_moex(ticker, year)`, then bridge the
+   trailing 9 months (the last 270 days of the window) via
+   `_backfill_one_tinkoff`. If window ≤ 270 days, dispatch directly to
+   `_backfill_one_tinkoff` for the full window.
 
 ## Source-selection rule (`source="moex"`)
 Same as auto but skips the Tinkoff tail (caller wants pure-MOEX audit).
@@ -35,6 +37,9 @@ change.
 - Intraday (1-min / hour) bars. Daily only.
 - Bars for non-tradeable figi classes (`futures`, `options`). The 16
   current figis are all `share`.
+- Tail-shortening based on existing `earliest_local_bar_ts` is
+  intentionally not implemented in this PR — `_resolve_source` routes
+  purely on window duration. Future work can add this if needed.
 
 ## Risk: 5-year Tinkoff attempt leaves a `skipped` marker
 `BackfillRunner._backfill_one` (line 1144-1158) marks the figi
