@@ -357,6 +357,43 @@ def _fetch_year_moex(
     return out
 
 
+def _fetch_moex_range(
+    market: str,
+    board: str,
+    ticker: str,
+    from_d: date,
+    to_d: date,
+    *,
+    last_trading_day: date | None = None,
+) -> list[dict]:
+    """Fetch MOEX bars for an arbitrary [from_d, to_d] window.
+
+    Thin wrapper that walks the touched years via ``_fetch_year_moex``
+    and stitches the results together. Used by the recent-tail pass
+    where the window is days, not years, but MOEX ISS only serves a
+    full year per request, so we still issue one request per touched
+    calendar year.
+
+    The ``last_trading_day`` cap is forwarded so the current-year
+    request stops at ``last_trading_day`` instead of ``12-31`` — same
+    semantic as in ``_fetch_year_moex``.
+    """
+    if from_d > to_d:
+        return []
+    cap = last_trading_day or to_d
+    out: list[dict] = []
+    for year in range(from_d.year, to_d.year + 1):
+        # Per-year hard cap at `to_d` so we never return rows outside
+        # the requested window even if the year's response sneaks in
+        # an extra day (it shouldn't, but defensive).
+        year_cap = min(to_d, cap)
+        year_bars = _fetch_year_moex(
+            market, board, ticker, year, last_trading_day=year_cap
+        )
+        out.extend(year_bars)
+    return out
+
+
 async def _fetch_tinkoff_fallback_impl(
     client: Any,
     retry_mod: Any,
@@ -467,6 +504,7 @@ class BackfillRunner:
     # These bindings mirror the inner closures that used to live inside
     # backfill_from_moex — same logic, but reachable from outside.
     _fetch_year_moex = staticmethod(_fetch_year_moex)
+    _fetch_moex_range = staticmethod(_fetch_moex_range)
     _get_meta_moex = staticmethod(_get_meta_moex)
     _fetch_tinkoff_fallback = staticmethod(_fetch_tinkoff_fallback_impl)
 
@@ -726,6 +764,7 @@ class BackfillRunner:
         max_workers: int = 5,
         delta_only: bool = True,
         priority: bool = True,
+        recent_tail_days: int = 0,
     ) -> int:
         """Walk every tradeable figi from MOEX listed_from to min(yesterday, listed_till).
 
@@ -736,6 +775,17 @@ class BackfillRunner:
         When `priority=True` (default), figis are sorted by gap size
         descending before fetching so rate-limit budget is spent on
         the biggest missing-history gaps first.
+
+        When `recent_tail_days > 0`, a second pass runs after the
+        historical walk and fetches only the last `recent_tail_days`
+        trading days from MOEX ISS for every figi with a primary
+        board. Insertion is still INSERT OR IGNORE so any Tinkoff
+        bars already present are preserved. This is a fallback for
+        the daily chain when Tinkoff is stuck (worker on "Connection
+        reset by peer") — MOEX ISS often has yesterday/today data
+        even when the broker SDK is unreachable. Default 0
+        preserves the historical-only behavior so existing callers
+        and tests see no change.
 
         Algorithm:
           1. List instruments via self._list_instruments().
@@ -982,6 +1032,184 @@ class BackfillRunner:
             if isinstance(res, int):
                 written_total += res
 
+        # Optional recent-tail pass: when Tinkoff is stuck (e.g. worker
+        # wedged on "Connection reset by peer"), MOEX ISS often has
+        # yesterday/today data and the historical walk above won't
+        # have filled those dates. Only runs when the caller asks
+        # (recent_tail_days > 0); default is 0 to preserve existing
+        # behavior and tests.
+        if recent_tail_days > 0:
+            tail_written = await self.backfill_moex_recent_tail(
+                days=recent_tail_days, today=today,
+            )
+            written_total += tail_written
+
+        return written_total
+
+    # ─── MOEX recent-tail fallback ────────────────────────────────────
+
+    async def backfill_moex_recent_tail(
+        self,
+        *,
+        days: int = 5,
+        today: date | None = None,
+        max_concurrency: int = 5,
+        limit_to: list[str] | None = None,
+    ) -> int:
+        """Fetch the last `days` trading days from MOEX ISS for the tradeable universe.
+
+        Purpose: when the broker SDK is stuck (e.g. Tinkoff sandbox
+        throwing ``Connection reset by peer`` for several days), the
+        daily chain has no way to deliver recent bars. MOEX ISS is
+        independent of the broker and usually has yesterday/today data
+        for any figi on a primary board. This pass uses that as a
+        fallback so the chain stays fresh.
+
+        Algorithm:
+          1. Compute window = [yesterday - days, yesterday] using
+             ``_last_trading_day`` for the upper bound.
+          2. List instruments via ``self._list_instruments(limit_to=...)``.
+          3. Probe MOEX meta for each ticker (cached in ``self._moex_meta``,
+             same cache the historical walk uses — a probe done in
+             ``backfill_from_moex`` is reused here).
+          4. For figis with a primary board, fetch the window via
+             ``_fetch_moex_range`` (one HTTP request per touched year;
+             for ``days=5`` the window fits inside a single year so
+             this is at most 1 request per figi).
+          5. INSERT OR IGNORE via ``replace_bars_for_figi(..., replace=False)``,
+             so any Tinkoff bars already in the DB are preserved.
+          6. Tickers without a MOEX primary board (sanctions-delisted)
+             are skipped — Tinkoff is the only path for those and
+             this pass explicitly avoids waiting on it.
+
+        Concurrency is capped at ``max_concurrency`` figis in parallel;
+        with ``days=5`` a full universe of ~3000 figis completes in
+        roughly 60s on a 100 req/min MOEX ISS budget.
+
+        Returns total bars written across all figis.
+        """
+        from ..db.bars_sqlite import replace_bars_for_figi
+
+        if today is None:
+            today = date.today()
+        if days <= 0:
+            return 0
+        yesterday = _last_trading_day(today, self.db_path)
+        # Use calendar days for the lower bound (not trading days):
+        # MOEX will simply return no rows for non-trading days in
+        # [from_d, yesterday], so over-fetching is harmless and we
+        # don't need to walk a holiday calendar here. days*2 covers
+        # two-week-long holiday stretches (e.g. New Year window).
+        from_d = yesterday - timedelta(days=days * 2)
+        if from_d > yesterday:
+            return 0
+
+        instruments = self._list_instruments(limit_to=limit_to)
+        # Reuse / populate the meta cache that the historical walk
+        # already warmed — a second backfill_from_moex call after
+        # this one will skip the probe entirely.
+        if not hasattr(self, "_moex_meta") or self._moex_meta is None:
+            self._moex_meta = {}
+        if not hasattr(self, "_moex_meta_lock") or self._moex_meta_lock is None:
+            self._moex_meta_lock = threading.Lock()
+
+        def _get_meta(ticker: str) -> dict | None:
+            return self._get_meta_moex(
+                ticker, yesterday,
+                meta_cache=self._moex_meta,
+                meta_lock=self._moex_meta_lock,
+            )
+
+        async def _probe(inst: dict) -> None:
+            ticker = inst.get("ticker") or ""
+            if not ticker:
+                return
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(_get_meta, ticker),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        # Pre-populate the meta cache so the per-figi loop can read
+        # without blocking the event loop on HTTP.
+        await asyncio.gather(*[_probe(inst) for inst in instruments])
+
+        sem = asyncio.Semaphore(max_concurrency)
+        written_total = 0
+
+        async def _process_one(inst: dict) -> int:
+            if self._stop_flag.is_set():
+                return 0
+            figi = inst.get("figi")
+            ticker = inst.get("ticker") or ""
+            if not figi or not ticker:
+                return 0
+            meta = self._moex_meta.get(ticker)
+            if meta is None:
+                # No primary MOEX board → skip silently. Tinkoff
+                # fallback is intentionally NOT attempted here; the
+                # whole point of this pass is to bypass Tinkoff.
+                return 0
+            listed_till_iso = meta.get("listed_till") or yesterday.isoformat()
+            try:
+                listed_till_d = date.fromisoformat(listed_till_iso[:10])
+            except (TypeError, ValueError):
+                return 0
+            # Don't fetch dates after the instrument was delisted.
+            to_d = min(yesterday, listed_till_d)
+            if from_d > to_d:
+                return 0
+            # Fetch off the loop — _fetch_moex_range is sync.
+            try:
+                bars = await asyncio.to_thread(
+                    self._fetch_moex_range,
+                    meta["market"], meta["board"], ticker,
+                    from_d, to_d, last_trading_day=yesterday,
+                )
+            except Exception as e:  # noqa: BLE001 — defensive
+                await self._log(
+                    "warn", figi=figi,
+                    message=f"moex_recent_tail fetch failed for {ticker}: {e!r}",
+                )
+                return 0
+            for b in bars:
+                b["figi"] = figi
+            if not bars:
+                return 0
+            return replace_bars_for_figi(
+                self.db_path, figi, bars, replace=False, source="moex"
+            )
+
+        async def _bounded(inst: dict) -> int:
+            async with sem:
+                return await _process_one(inst)
+
+        results = await asyncio.gather(
+            *[_bounded(inst) for inst in instruments],
+            return_exceptions=True,
+        )
+        for i, res in enumerate(results):
+            if isinstance(res, Exception):
+                figi = instruments[i].get("figi", "?")
+                ticker = instruments[i].get("ticker", "?")
+                await self._log(
+                    "warn", figi=figi,
+                    message=f"moex_recent_tail failed for {ticker}: {res!r}",
+                )
+                continue
+            if isinstance(res, int):
+                written_total += res
+
+        await self._log(
+            "info", figi=None,
+            message=(
+                f"moex_recent_tail: wrote {written_total} bars "
+                f"across {len(instruments)} figis "
+                f"(window {from_d.isoformat()}..{yesterday.isoformat()})"
+            ),
+        )
         return written_total
 
     # ─── universe discovery ──────────────────────────────────────────
