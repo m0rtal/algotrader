@@ -484,11 +484,18 @@ class BackfillRunner:
         history_years: int = 5,
         incremental_threshold_days: int = 2,
         *,
+        source: str = "auto",
         limit_to: list[str] | None = None,
     ) -> None:
         """Run the full lifecycle: discover → backfill → done.
 
         Errors per ticker are logged but don't abort the run.
+
+        `source` (R9) selects the data source for each ticker's fetch:
+        `"auto"` lets `_backfill_one` pick MOEX vs Tinkoff per window;
+        `"moex"` forces the MOEX year walker; `"tinkoff"` forces the
+        Tinkoff chunk loop. The HTTP route validates the enum before
+        reaching this method.
 
         `limit_to` (used by the data-quality recovery loop) restricts
         the backfill queue to the given figis. When set, we skip
@@ -578,7 +585,8 @@ class BackfillRunner:
                     return (figi, 0, None)
                 try:
                     bars = await self._backfill_one(
-                        figi=figi, ticker=ticker, from_=from_, to=to
+                        figi=figi, ticker=ticker, from_=from_, to=to,
+                        source=source,
                     )
                     return (figi, bars, None)
                 except Exception as e:  # noqa: BLE001
