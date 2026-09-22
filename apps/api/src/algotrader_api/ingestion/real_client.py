@@ -180,12 +180,47 @@ class RealTinkoffClient:
         return self._request_timeout
 
     async def _ensure(self) -> Any:
-        """Open the AsyncClient and cache the resulting AsyncServices."""
+        """Open the AsyncClient and cache the resulting AsyncServices.
+
+        The HTTP/2 handshake inside ``client.__aenter__()`` can hang
+        indefinitely against a stuck/rate-limited Tinkoff endpoint.
+        Per-RPC timeouts (PR #97) only fire after the channel is
+        open, so we wrap ``__aenter__`` in ``asyncio.wait_for``
+        here.
+
+        Raises ``RealClientTimeoutError`` on timeout; caller is
+        expected to retry via the existing UNAVAILABLE retry loop.
+        The sync ``AsyncClient(token, target=...)`` constructor is
+        left unwrapped — in practice it only stores config and does
+        not perform network I/O, so it cannot hang.
+        """
         if self._services is None:
             AsyncClient = getattr(self._sdk, "AsyncClient")
             self._client = AsyncClient(self._token, target=self._target)
-            self._services = await self._client.__aenter__()
+            try:
+                self._services = await asyncio.wait_for(
+                    self._client.__aenter__(),
+                    timeout=self._request_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                # Channel handshake timed out — drop the partial client.
+                await self._safe_aexit(self._client)
+                self._client = None
+                raise RealClientTimeoutError(
+                    "AsyncClient.__aenter__", self._request_timeout,
+                ) from exc
         return self._services
+
+    async def _safe_aexit(self, client: Any) -> None:
+        """Best-effort close of a partially-constructed AsyncClient."""
+        if client is None:
+            return
+        try:
+            await asyncio.wait_for(
+                client.__aexit__(None, None, None), timeout=5.0,
+            )
+        except BaseException:  # noqa: BLE001 — best-effort cleanup
+            pass
 
     async def _reset_channel(self) -> None:
         """Tear down the current gRPC channel so the next RPC rebuilds it.
