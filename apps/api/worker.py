@@ -20,9 +20,12 @@ import argparse
 import asyncio
 import logging
 import os
+import sqlite3
 import sys
 import threading
 import time
+from contextlib import closing
+from datetime import date, timedelta
 from pathlib import Path
 
 # Ensure src/ is on sys.path when run directly: python worker.py
@@ -420,9 +423,122 @@ def _step_backfill_moex(db_path: str) -> tuple[bool, str]:
         return False, f"backfill_moex failed: {exc}"
 
 
+def _load_holiday_dates(
+    con: sqlite3.Connection, start: date, end: date,
+) -> set[date]:
+    """Return the set of MOEX public-holiday dates in [start, end].
+
+    Mirrors the same query used by ``find_gaps`` in data_quality.gap_recovery
+    so the trailing-gap pass agrees with the historical-gap pass on what
+    counts as a non-trading day. Returns an empty set if the table is
+    missing (older schemas) so the recovery step degrades gracefully.
+    """
+    try:
+        rows = con.execute(
+            "SELECT date FROM moex_holidays WHERE date BETWEEN ? AND ?",
+            (start.isoformat(), end.isoformat()),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Table not yet migrated -> treat as "no holidays known".
+        return set()
+    return {date.fromisoformat(r["date"]) for r in rows}
+
+
+def _load_restricted_dates(
+    con: sqlite3.Connection, start: date, end: date,
+) -> set[date]:
+    """Return the set of restricted_periods dates in [start, end]."""
+    rows = con.execute(
+        "SELECT date FROM restricted_periods WHERE date BETWEEN ? AND ?",
+        (start.isoformat(), end.isoformat()),
+    ).fetchall()
+    return {date.fromisoformat(r["date"]) for r in rows}
+
+
+def _trailing_trading_days(
+    last_ts: date,
+    today: date,
+    holidays: set[date],
+    restricted: set[date],
+) -> list[date]:
+    """Return the trading days strictly after ``last_ts`` up to ``today``.
+
+    A "trading day" is a weekday that is neither a MOEX holiday nor a
+    restricted period. The returned list is sorted ascending and may be
+    empty when ``last_ts >= today``.
+    """
+    if last_ts >= today:
+        return []
+    out: list[date] = []
+    cur = last_ts + timedelta(days=1)
+    while cur <= today:
+        if cur.weekday() < 5 and cur not in holidays and cur not in restricted:
+            out.append(cur)
+        cur += timedelta(days=1)
+    return out
+
+
+def _collect_trailing_gaps(
+    db_path: str, today: date,
+) -> list[tuple[str, date, date, bool]]:
+    """For every figi with bars, find the trailing missing-trading-days block.
+
+    Returns a list of ``(figi, from_, to_, stale)`` tuples where ``stale``
+    is True when ``last_ts < today - 7 days`` (the brief: prefer MOEX ISS
+    for those figis instead of Tinkoff).
+
+    The window is (last_ts, today] — strictly past the latest bar — so we
+    never duplicate work that the historical ``find_gaps`` already covers.
+    Returns an empty list when every figi is already up to date, or when
+    the schema isn't present (e.g. during unit-test fixtures that only
+    mock find_gaps/recover_gaps).
+
+    Defensive against missing ``bars`` / ``moex_holidays`` /
+    ``restricted_periods`` tables — the trailing pass must not break
+    callers that mock gap_recovery but use a bare sqlite file.
+    """
+    with closing(sqlite3.connect(db_path)) as con:
+        try:
+            rows = con.execute(
+                "SELECT figi, MAX(ts) AS last_ts FROM bars GROUP BY figi"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # No bars table yet -> nothing to trail.
+            return []
+        if not rows:
+            return []
+        # Pull holiday + restricted calendars once for the whole (last_ts..today) span.
+        earliest = min(date.fromisoformat(r["last_ts"]) for r in rows)
+        holidays = _load_holiday_dates(con, earliest, today)
+        restricted = _load_restricted_dates(con, earliest, today)
+
+    out: list[tuple[str, date, date, bool]] = []
+    for r in rows:
+        last_ts = date.fromisoformat(r["last_ts"])
+        trading_days = _trailing_trading_days(
+            last_ts, today, holidays, restricted,
+        )
+        if not trading_days:
+            continue
+        stale = last_ts < (today - timedelta(days=7))
+        out.append((r["figi"], trading_days[0], trading_days[-1], stale))
+    return out
+
+
 def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
     """Detect missing trading days per figi and fill them via
-    BackfillRunner._backfill_one with explicit from_/to_."""
+    BackfillRunner._backfill_one with explicit from_/to_.
+
+    Two passes run in sequence:
+      1. Historical gaps via ``find_gaps`` / ``recover_gaps`` — covers
+         any missing days inside [min(ts), max(ts)] for each figi.
+      2. Trailing gaps — covers missing days strictly after ``max(ts)``
+         up to today. Weekend + MOEX-holiday + restricted-period days
+         are filtered out so we never burn a Tinkoff call on a closed
+         exchange day. When ``last_ts < today - 7 days`` the trailing
+         window is routed to MOEX ISS (cheaper, no rate-limit pressure)
+         instead of Tinkoff.
+    """
     try:
         from algotrader_api.data_quality.gap_recovery import (
             find_gaps, recover_gaps,
@@ -433,12 +549,84 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
         runner = BackfillRunner(client=client, db_path=db_path,
                                 event_sink=_async_noop_sink)
         gaps = find_gaps(db_path)
-        if not gaps:
+        if gaps:
+            result = asyncio.run(recover_gaps(db_path, runner, gaps))
+            hist_added = sum(result.values())
+        else:
+            hist_added = 0
+
+        # Trailing gap pass — fetch days strictly after each figi's last bar.
+        today = date.today()
+        trailing = _collect_trailing_gaps(db_path, today)
+        trailing_added = 0
+        trailing_by_source: dict[str, int] = {"moex": 0, "tinkoff": 0}
+        if trailing:
+            # Resolve tickers once for all figis in the trailing set.
+            figis = [t[0] for t in trailing]
+            ticker_by_figi: dict[str, str] = {}
+            con = sqlite3.connect(db_path)
+            try:
+                placeholders = ",".join("?" for _ in figis)
+                ticker_rows = con.execute(
+                    f"SELECT figi, ticker FROM instruments "
+                    f"WHERE figi IN ({placeholders})",
+                    tuple(figis),
+                ).fetchall()
+                ticker_by_figi = {r["figi"]: r["ticker"] for r in ticker_rows}
+            finally:
+                con.close()
+
+            logger.info(
+                "worker.gap_recovery.trailing",
+                n_figis=len(trailing),
+                dates=[(f, f_.isoformat(), t_.isoformat(), s)
+                       for f, f_, t_, s in trailing],
+            )
+
+            async def _fill_trailing() -> dict[str, int]:
+                added_total: dict[str, int] = {}
+                for figi, from_, to_, stale in trailing:
+                    ticker = ticker_by_figi.get(figi)
+                    if ticker is None:
+                        logger.warning(
+                            "worker.gap_recovery.no_ticker",
+                            figi=figi,
+                        )
+                        continue
+                    source = "moex" if stale else "tinkoff"
+                    logger.info(
+                        "worker.gap_recovery.fill",
+                        figi=figi, ticker=ticker,
+                        from_=from_.isoformat(), to=to_.isoformat(),
+                        source=source, stale=stale,
+                    )
+                    try:
+                        n = await runner._backfill_one(
+                            figi=figi, ticker=ticker,
+                            from_=from_, to=to_, source=source,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "worker.gap_recovery.fill_failed",
+                            figi=figi, error=str(exc),
+                        )
+                        continue
+                    added_total[figi] = added_total.get(figi, 0) + int(n or 0)
+                    trailing_by_source[source] += int(n or 0)
+                return added_total
+
+            trailing_added_total = asyncio.run(_fill_trailing())
+            trailing_added = sum(trailing_added_total.values())
+
+        total_added = hist_added + trailing_added
+        if not gaps and not trailing:
             return True, "gap recovery: no gaps"
-        result = asyncio.run(recover_gaps(db_path, runner, gaps))
         return True, (
-            f"gap recovery: {sum(result.values())} bars filled "
-            f"across {len(gaps)} gaps"
+            f"gap recovery: {total_added} bars filled "
+            f"(historical={hist_added} across {len(gaps)} gaps, "
+            f"trailing={trailing_added} across {len(trailing)} figis "
+            f"[moex={trailing_by_source['moex']}, "
+            f"tinkoff={trailing_by_source['tinkoff']}])"
         )
     except Exception as exc:
         return False, f"gap recovery failed: {exc}"
