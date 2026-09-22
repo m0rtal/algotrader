@@ -111,13 +111,13 @@ elapsed = time.time() - baseline_time
 print(f"hb_age={hb_age_days:.4f}d bar_age={bar_age_days:.4f}d bars_growth={bars_growth} elapsed={elapsed:.0f}s")
 # Kill if any of:
 # - heartbeat stale (worker truly dead)
-# - worker alive >5 min but added 0 bars (stuck at startup)
+# - worker alive >10 min but added 0 bars (stuck at startup)
 #   (HTTP/2 flow control: fresh worker can be stuck from call 1).
 # - heartbeat fresh AND no bars progress for >90 min
 #   (worker alive but main loop stuck — HTTP/2 issue).
 if hb_age_days > hb_max:
     print("STALL")
-elif elapsed > 300 and bars_growth == 0:
+elif elapsed > 600 and bars_growth == 0:
     print("STUCK_AT_STARTUP")
 elif hb_age_days < hb_max / 2 and bar_age_days > pg_max:
     print("STALL")

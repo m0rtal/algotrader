@@ -98,8 +98,8 @@ def _patch_sdk(monkeypatch: pytest.MonkeyPatch, services: _StubServices, client:
 # ─── Config tests ─────────────────────────────────────────────────────
 
 
-def test_default_request_timeout_is_30_seconds() -> None:
-    assert DEFAULT_REQUEST_TIMEOUT == 30.0
+def test_default_request_timeout_is_10_seconds() -> None:
+    assert DEFAULT_REQUEST_TIMEOUT == 10.0
 
 
 def test_constructor_rejects_non_positive_timeout(monkeypatch: pytest.MonkeyPatch) -> None:

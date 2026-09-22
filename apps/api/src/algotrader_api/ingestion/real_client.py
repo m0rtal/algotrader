@@ -80,7 +80,7 @@ logger = get_logger("algotrader_api.ingestion.real_client")
 
 # Default per-RPC timeout in seconds. Override per-instance via the
 # ``request_timeout`` constructor kwarg.
-DEFAULT_REQUEST_TIMEOUT: float = 30.0
+DEFAULT_REQUEST_TIMEOUT: float = 10.0
 
 # Retry policy for the Tinkoff SDK call layer on gRPC UNAVAILABLE
 # ("Connection reset by peer", "failed to connect to all addresses").
