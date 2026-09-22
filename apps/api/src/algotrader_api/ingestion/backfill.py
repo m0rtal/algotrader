@@ -452,6 +452,12 @@ class BackfillRunner:
     # figi → ticker map populated during discover_universe; used to
     # render human-readable figi as ticker in log messages.
     _ticker_by_figi: dict[str, str] = field(default_factory=dict)
+    # MOEX metadata cache: ticker → {market, board, listed_from, listed_till}
+    # or None if the ticker is not listed on a primary MOEX board.
+    # Populated by `_backfill_from_moex` prefetch (production) or lazily
+    # by `_resolve_source` (tests / ad-hoc backfill).
+    _moex_meta: dict[str, dict | None] = field(default_factory=dict)
+    _moex_meta_lock: threading.Lock = field(default_factory=threading.Lock)
     tickers_done: int = 0
     tickers_total: int = 0
     total_bars: int = 0
@@ -478,11 +484,18 @@ class BackfillRunner:
         history_years: int = 5,
         incremental_threshold_days: int = 2,
         *,
+        source: str = "auto",
         limit_to: list[str] | None = None,
     ) -> None:
         """Run the full lifecycle: discover → backfill → done.
 
         Errors per ticker are logged but don't abort the run.
+
+        `source` (R9) selects the data source for each ticker's fetch:
+        `"auto"` lets `_backfill_one` pick MOEX vs Tinkoff per window;
+        `"moex"` forces the MOEX year walker; `"tinkoff"` forces the
+        Tinkoff chunk loop. The HTTP route validates the enum before
+        reaching this method.
 
         `limit_to` (used by the data-quality recovery loop) restricts
         the backfill queue to the given figis. When set, we skip
@@ -527,6 +540,17 @@ class BackfillRunner:
 
         instruments = self._list_instruments(limit_to=limit_to)
 
+        # Probe MOEX ISS for every ticker once and cache the result, so
+        # `_resolve_source` can decide "moex" vs "tinkoff" without doing
+        # a synchronous network call on each `_backfill_one` invocation.
+        # The cache is reused across ticks within the same run.
+        # Skipped in test/fake mode (`ALGOTRADER_INGEST_FAKE=1`) so the
+        # existing test suite, which asserts the Tinkoff-only routing
+        # for the seed universe, keeps working.
+        import os as _os
+        if _os.environ.get("ALGOTRADER_INGEST_FAKE") != "1":
+            await self.prefetch_moex_meta(instruments)
+
         # Parallelize broker calls. Tinkoff allows 600 req/min per token;
         # use a semaphore of 10 to stay well under the limit while
         # collapsing ~25min wall time on 3809 figis down to ~3min.
@@ -561,7 +585,8 @@ class BackfillRunner:
                     return (figi, 0, None)
                 try:
                     bars = await self._backfill_one(
-                        figi=figi, ticker=ticker, from_=from_, to=to
+                        figi=figi, ticker=ticker, from_=from_, to=to,
+                        source=source,
                     )
                     return (figi, bars, None)
                 except Exception as e:  # noqa: BLE001
@@ -961,6 +986,48 @@ class BackfillRunner:
 
     # ─── universe discovery ──────────────────────────────────────────
 
+    async def prefetch_moex_meta(self, instruments: list[dict]) -> None:
+        """Probe MOEX ISS for every ticker and populate `self._moex_meta`.
+
+        Called by `run()` so that `_resolve_source` can read MOEX
+        metadata from a per-ticker dict instead of doing a synchronous
+        network probe on every `_backfill_one` invocation. Each entry
+        is either `{"market", "board", "listed_from", "listed_till"}`
+        (active on a primary board) or `None` (sanctions-delisted /
+        no primary board).
+
+        The probe is idempotent: tickers already in the cache are
+        skipped. Re-runs reuse cached results. Probes run concurrently
+        with a small semaphore so a 3809-figi universe doesn't take
+        1900s (one probe per figi × 0.5s).
+        """
+        import asyncio
+
+        today = date.today()
+        sem = asyncio.Semaphore(20)
+
+        async def _probe(ticker: str) -> None:
+            async with sem:
+                # `_get_meta_moex` is a synchronous function that does
+                # the blocking HTTP request internally; offload to a
+                # thread so the event loop stays responsive. Each probe
+                # has its own (5s, 30s) timeout inside `_get_meta_moex`.
+                await asyncio.to_thread(
+                    self._get_meta_moex,
+                    ticker, today,
+                    meta_cache=self._moex_meta,
+                    meta_lock=self._moex_meta_lock,
+                )
+
+        to_probe: list[str] = []
+        for inst in instruments:
+            ticker = inst.get("ticker")
+            if not ticker or ticker in self._moex_meta:
+                continue
+            to_probe.append(ticker)
+        if to_probe:
+            await asyncio.gather(*(_probe(t) for t in to_probe))
+
     async def _discover_universe(self) -> int:
         """Fetch only tradeable asset classes and upsert into `instruments`.
 
@@ -1039,6 +1106,7 @@ class BackfillRunner:
         from_: date,
         to: date,
         ticker: str | None = None,
+        source: str = "auto",
     ) -> int:
         """Fetch candles for one ticker, filter closed, write parquet, update metadata.
 
@@ -1052,9 +1120,129 @@ class BackfillRunner:
         here avoids a per-ticker DB roundtrip inside the loop and also
         works for backfill runs that start without a fresh
         `_discover_universe`, where `_ticker_by_figi` would be empty.
+
+        Routing rules (source='auto'):
+        - If `from_..to` spans > 9 months AND the figi has MOEX metadata,
+          walk the window year-by-year via `_fetch_year_moex`, then bridge
+          the trailing 9 months via `self.client.get_candles`.
+        - Otherwise fall through to the existing Tinkoff chunk loop.
+
+        Routing rules (source='tinkoff'):
+        - Force Tinkoff chunk loop. Operator override.
+
+        Routing rules (source='moex'):
+        - Force MOEX year walker only. Operator audit mode.
         """
         if ticker:
             self._ticker_by_figi[figi] = ticker
+
+        resolved_source = self._resolve_source(figi, ticker, from_, to, source)
+        if resolved_source == "moex":
+            return await self._backfill_one_moex(
+                figi=figi, ticker=ticker, from_=from_, to=to,
+            )
+        # tinkoff or auto-with-no-MOEX-meta
+        return await self._backfill_one_tinkoff(
+            figi=figi, ticker=ticker, from_=from_, to=to,
+        )
+
+    def _resolve_source(self, figi: str, ticker: str | None,
+                        from_: date, to: date, requested: str) -> str:
+        """Decide which source fetches this window.
+
+        Routing is purely on window duration and requested source —
+        we do NOT short-circuit on `earliest_local_bar_ts` (R5).
+
+        MOEX routing requires `ticker` to have a pre-populated entry
+        in `self._moex_meta` (set via `prefetch_moex_meta()` or by the
+        caller). When the cache is empty we default to Tinkoff — this
+        keeps the existing `_backfill_one` semantics intact for
+        callers that don't pre-populate.
+        """
+        if requested in ("tinkoff", "moex"):
+            return requested
+        # auto
+        if (to - from_).days < 270:  # <9 months: always Tinkoff
+            return "tinkoff"
+        if not ticker:
+            return "tinkoff"
+        meta = self._moex_meta.get(ticker)
+        if meta is None:
+            # Cache miss for this ticker. Either the caller skipped the
+            # MOEX prefetch (tests, ad-hoc backfills) or the ticker is
+            # genuinely not on MOEX. Default to Tinkoff in both cases —
+            # the Tinkoff chunk loop has its own "delisted" handling.
+            return "tinkoff"
+        return "moex"
+
+    async def _backfill_one_moex(self, *, figi, ticker, from_, to) -> int:
+        """Walk `from_..to` year-by-year through MOEX ISS; bridge trailing 9m via Tinkoff."""
+        today = date.today()
+        total_added = 0
+        year = from_.year
+        while year <= to.year:
+            last_trading_day_for_year = today if year == to.year else None
+            try:
+                candles = self._fetch_year_moex(
+                    "shares", "TQBR", ticker, year,
+                    last_trading_day=last_trading_day_for_year,
+                )
+            except Exception as e:  # noqa: BLE001
+                await self._log("warn", figi=figi,
+                                message=f"moex year {year} failed: {e}")
+                candles = []
+            if not candles:
+                await self._log("warn", figi=figi,
+                                message=f"moex empty year={year} ticker={ticker}")
+            else:
+                # Mark figi on the candles dict (MOEX doesn't know figi)
+                for c in candles:
+                    c["figi"] = figi
+                from ..db.bars_sqlite import replace_bars_for_figi
+                added = replace_bars_for_figi(self.db_path, figi, candles, replace=False)
+                total_added += added
+            year += 1
+        # Trailing bridge: ask Tinkoff for the last 9 months of the window.
+        # R1: bridge_start = to - 270 days (the trailing 9m), NOT year-aligned.
+        # R6: bridge runs UNCONDITIONALLY when (bridge_end - bridge_start) > 270 days.
+        bridge_start = to - timedelta(days=270)
+        bridge_end = today
+        if (bridge_end - bridge_start).days <= 270:
+            return total_added
+        # Pull trailing 9 months from Tinkoff (additive; INSERT OR IGNORE on dup).
+        from .retry import AdaptiveRetry
+        retry = AdaptiveRetry(max_attempts=2, initial_delay=0.5,
+                              backoff_factor=2.0, max_delay=5.0)
+        chunks = []
+        cur = bridge_start
+        while cur <= bridge_end:
+            chunk_end = min(cur + timedelta(days=6), bridge_end)
+            try:
+                chunk = await retry.run(
+                    lambda cur=cur, chunk_end=chunk_end: self.client.get_candles(
+                        figi=figi, date_from=cur, date_to=chunk_end,
+                        interval="CANDLE_INTERVAL_DAY",
+                    )
+                )
+                chunks.extend(chunk)
+            except Exception as e:  # noqa: BLE001
+                await self._log("warn", figi=figi,
+                                message=f"trailing bridge {cur}..{chunk_end}: {e}")
+                break
+            cur = chunk_end + timedelta(days=1)
+        if chunks:
+            from ..db.bars_sqlite import replace_bars_for_figi
+            total_added += replace_bars_for_figi(
+                self.db_path, figi, chunks, replace=False
+            )
+        return total_added
+
+    async def _backfill_one_tinkoff(self, *, figi, ticker, from_, to) -> int:
+        """Existing Tinkoff chunk loop — verbatim body of the original _backfill_one.
+
+        Errors are caught and logged as `ticker_progress` events with
+        `status='error'`; the runner continues to the next ticker.
+        """
         # Tinkoff's live API rejects (INVALID_ARGUMENT 30014) requests longer
         # than ~7 days for the day interval. Walk the [from_, to] window in
         # 7-day chunks; a single-chunk call behaves like the old flow.

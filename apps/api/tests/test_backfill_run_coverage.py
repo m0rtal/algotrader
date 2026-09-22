@@ -89,8 +89,13 @@ async def test_run_emits_skipped_event_for_up_to_date_ticker(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_run_emits_ticker_error_event_when_get_candles_raises(tmp_path):
+async def test_run_emits_ticker_error_event_when_get_candles_raises(tmp_path, monkeypatch):
     """get_candles() raises → _backfill_one catches and emits ticker_progress error event."""
+    # Skip the MOEX prefetch in `run()` so the ticker routes through the
+    # Tinkoff chunk loop (where the simulated `get_candles` raise lives).
+    # Without this, a real MOEX probe would route the figi to the MOEX
+    # year walker and bypass the broker-error path we want to exercise.
+    monkeypatch.setenv("ALGOTRADER_INGEST_FAKE", "1")
     db = tmp_path / "state.db"
     from algotrader_api.db.sqlite import run_migrations as _rm
     _rm(str(db), str(_migrations_dir()))
