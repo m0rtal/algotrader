@@ -7,6 +7,7 @@ SQLite) map to the underlying query.
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Optional
 
@@ -14,6 +15,7 @@ from fastapi import APIRouter
 
 from ..data_quality.gap_recovery import find_gaps
 from ..db.sqlite import execute as sqlite_exec
+from ..domain.tradeable import TRADEABLE_CLASSES
 from ..observability.logging import get_logger
 
 # Cache the per-figi gap count to avoid recomputing on every request.
@@ -23,6 +25,10 @@ from ..observability.logging import get_logger
 # nightly, so 60-second freshness is plenty for UI purposes.
 _GAPS_CACHE_TTL_SEC = 60.0
 _gaps_cache: Optional[tuple[float, dict[str, int]]] = None
+# Serialises the slow rebuild path so concurrent /api/tickers callers
+# share a single find_gaps() scan instead of each triggering one.
+# Cache hits stay lock-free; only the rebuild acquires it.
+_gaps_cache_lock = threading.Lock()
 
 logger = get_logger("algotrader_api.data_reads")
 
@@ -161,46 +167,83 @@ def _gaps_by_figi() -> dict[str, int]:
     /api/admin/backfill/pending request. The chain rebuilds gaps
     nightly, so a 60-second TTL keeps the UI honest while keeping
     latency low. Returns counts keyed by figi.
+
+    Uses double-checked locking: cache hits stay lock-free, and
+    concurrent slow-path callers collapse to a single ``find_gaps()``
+    scan per TTL window — without this, N dashboard tabs refreshing
+    in parallel each trigger their own ~8s scan and starve the
+    worker pool (the original "hang" symptom).
     """
     global _gaps_cache
-    now = time.monotonic()
-    if _gaps_cache is not None and (now - _gaps_cache[0]) < _GAPS_CACHE_TTL_SEC:
-        return _gaps_cache[1]
-    counts: dict[str, int] = {}
-    for g in find_gaps(_get_sqlite_path()):
-        counts[g.figi] = counts.get(g.figi, 0) + 1
-    _gaps_cache = (now, counts)
-    return counts
+    # Fast path: lock-free read for the common warm-cache case.
+    cached = _gaps_cache
+    if cached is not None:
+        now = time.monotonic()
+        if (now - cached[0]) < _GAPS_CACHE_TTL_SEC:
+            return cached[1]
+    # Slow path: serialise rebuild so only one thread runs find_gaps().
+    with _gaps_cache_lock:
+        cached = _gaps_cache
+        if cached is not None and (time.monotonic() - cached[0]) < _GAPS_CACHE_TTL_SEC:
+            return cached[1]
+        counts: dict[str, int] = {}
+        for g in find_gaps(_get_sqlite_path()):
+            counts[g.figi] = counts.get(g.figi, 0) + 1
+        _gaps_cache = (time.monotonic(), counts)
+        return counts
 
 
 @router.get("/tickers")
 def get_tickers() -> list:
     """Per-ticker metadata for the Bars tab.
 
-    `fileSize` is preserved (always 0) so the UI header strip keeps
-    rendering - there is no on-disk file to size any more.
+    The universe here is the full set of tradable instruments
+    (``TRADEABLE_CLASSES`` = share/etf/bond) joined LEFT to the
+    bars aggregate. The previous query grouped ``FROM bars b`` so
+    figis with zero bars were silently dropped from the response
+    and never contributed to the UI's Полнота denominator — making
+    98% look honest when the real number of tradable figis was
+    3833, not 3795.
+
+    Starting from ``instruments`` keeps every tradable figi in
+    the result; the LEFT JOIN yields NULL ``first_ts``/``last_ts``
+    for zero-bar figis, which we coerce to empty strings so the
+    frontend's ``new Date(...)`` doesn't get a bogus timestamp.
+    ``bars`` is coalesced to 0.
     """
+    # Expand the frozenset into a comma-separated list of literals for the
+    # SQL IN clause. frozenset iteration order is not guaranteed, but for
+    # 3 elements on a hot path the planner doesn't care.
+    tradeable_classes_sql = ",".join(f"'{c}'" for c in TRADEABLE_CLASSES)
     overview_rows = sqlite_exec(
         _get_sqlite_path(),
-        """
+        f"""
         SELECT
-            b.figi                                   AS figi,
-            COUNT(*)                                 AS bars,
-            MIN(b.ts)                                AS first_ts,
-            MAX(b.ts)                                AS last_ts
-        FROM bars b
-        WHERE b.figi IS NOT NULL
-        GROUP BY b.figi
+            i.figi                                    AS figi,
+            i.ticker                                  AS ticker,
+            i.name                                    AS name,
+            i.sector                                  AS sector,
+            i.currency                                AS currency,
+            i.lot_size                                AS lot_size,
+            COALESCE(b.bars, 0)                       AS bars,
+            b.first_ts                                AS first_ts,
+            b.last_ts                                 AS last_ts
+        FROM instruments i
+        LEFT JOIN (
+            SELECT
+                figi,
+                COUNT(*) AS bars,
+                MIN(ts)  AS first_ts,
+                MAX(ts)  AS last_ts
+            FROM bars
+            WHERE figi IS NOT NULL
+            GROUP BY figi
+        ) b ON b.figi = i.figi
+        WHERE i.class IN ({tradeable_classes_sql})
+          AND i.figi IS NOT NULL
         """,
         (),
     )
-    instrument_rows = sqlite_exec(
-        _get_sqlite_path(),
-        "SELECT ticker, name, sector, currency, lot_size, figi FROM instruments",
-        (),
-    )
-    by_figi = {r["figi"]: r for r in instrument_rows if r["figi"]}
-    by_ticker = {r["ticker"]: r for r in instrument_rows if r["ticker"]}
 
     # Real gap counts from find_gaps() — keyed by figi so two figis
     # sharing a ticker (relisted shares) don't collide. find_gaps() is
@@ -209,21 +252,22 @@ def get_tickers() -> list:
 
     out: list[dict] = []
     for r in overview_rows:
-        meta = by_figi.get(r["figi"]) or by_ticker.get(r["figi"])
-        symbol = meta["ticker"] if meta else r["figi"]
         out.append(
             {
-                "symbol": symbol,
-                "name": meta["name"] if meta else "",
-                "sector": meta["sector"] if meta and meta["sector"] else "",
+                "symbol": r["ticker"] or r["figi"],
+                "name": r["name"] or "",
+                "sector": r["sector"] or "",
                 "price": 0,
                 "bars": int(r["bars"]),
-                "firstDate": str(r["first_ts"]),
-                "lastDate": str(r["last_ts"]),
+                # Explicit NULL → "" so zero-bar tradable figis don't
+                # show up with the string "None" or blow up the
+                # frontend's Date parser.
+                "firstDate": "" if r["first_ts"] is None else str(r["first_ts"]),
+                "lastDate": "" if r["last_ts"] is None else str(r["last_ts"]),
                 "fileSize": 0,
                 "gaps": gaps_by_figi.get(r["figi"], 0),
-                "currency": meta["currency"] if meta and meta["currency"] else "",
-                "lotSize": int(meta["lot_size"]) if meta and meta["lot_size"] else 0,
+                "currency": r["currency"] or "",
+                "lotSize": int(r["lot_size"]) if r["lot_size"] else 0,
             }
         )
     return out

@@ -58,7 +58,13 @@ export function DataTab() {
     // gaps across tickers (the previous global-span / sum-gaps formula
     // showed 0% when sum_gaps > global_span, e.g. 73016 gaps in 1861
     // days).
+    //
+    // Zero-bar figis (no rows in `bars`, returned by /api/tickers
+    // for tradable instruments that have never been backfilled)
+    // must contribute 0% to the average — otherwise the UI lies
+    // about Полнота by silently dropping them from the denominator.
     const perTicker = tickers!.map((t) => {
+      if (t.bars === 0) return 0;
       const startMs = new Date(t.firstDate).getTime();
       const endMs = new Date(t.lastDate).getTime();
       const span = Math.max(1, Math.round((endMs - startMs) / 86_400_000));
