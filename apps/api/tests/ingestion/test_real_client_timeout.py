@@ -453,3 +453,61 @@ def test_is_unavailable_recognises_real_grpc_status() -> None:
         RealTinkoffClient._is_unavailable(_StubExc(_StubStatus("INTERNAL")))
         is False
     )
+
+
+# ----------------------------------------------------------------------------
+# _ensure() timeout coverage — PR #99 regression fix
+# ----------------------------------------------------------------------------
+
+
+def test_ensure_times_out_on_slow_async_client_ctor(monkeypatch):
+    """A blocking AsyncClient() constructor must be timed out, not awaited forever."""
+    import asyncio as _asyncio
+    import time as _time
+
+    client = RealTinkoffClient(token="t", target="sandbox", request_timeout=0.3)
+
+    class _BlockingCtor:
+        def __init__(self, *args, **kwargs):
+            _time.sleep(2.0)  # would hang forever without timeout
+
+    class _FakeSDK:
+        AsyncClient = _BlockingCtor
+    monkeypatch.setattr(client, "_sdk", _FakeSDK())
+
+    async def run() -> None:
+        with pytest.raises(RealClientTimeoutError) as ei:
+            await client._ensure()
+        assert ei.value.label == "AsyncClient.__init__"
+        assert ei.value.timeout == 0.3
+
+    _asyncio.run(run())
+
+
+def test_ensure_times_out_on_slow_aenter(monkeypatch):
+    """A blocking __aenter__ must be timed out, not awaited forever."""
+    import asyncio as _asyncio
+
+    client = RealTinkoffClient(token="t", target="sandbox", request_timeout=0.3)
+
+    class _BlockingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            await _asyncio.sleep(2.0)  # would hang forever
+
+        async def __aexit__(self, *args):
+            return None
+
+    class _FakeSDK2:
+        AsyncClient = _BlockingClient
+    monkeypatch.setattr(client, "_sdk", _FakeSDK2())
+
+    async def run() -> None:
+        with pytest.raises(RealClientTimeoutError) as ei:
+            await client._ensure()
+        assert ei.value.label == "AsyncClient.__aenter__"
+        assert ei.value.timeout == 0.3
+
+    _asyncio.run(run())
