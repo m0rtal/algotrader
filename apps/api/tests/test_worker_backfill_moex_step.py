@@ -31,11 +31,16 @@ def fake_db_path(tmp_path, monkeypatch):
 
 
 def test_step_backfill_moex_calls_runner(fake_db_path):
-    """Worker step calls BackfillRunner.backfill_from_moex."""
-    calls = {"n": 0}
+    """Worker step calls BackfillRunner.backfill_from_moex with the
+    recent-tail kwarg so the PR #100 fallback is exercised after the
+    historical walk (see PR review: the feature shipped as dead code
+    until the worker opted in).
+    """
+    calls = {"n": 0, "kw": None}
 
-    async def _fake_backfill():
+    async def _fake_backfill(**kwargs):
         calls["n"] += 1
+        calls["kw"] = kwargs
         return 137
 
     fake_runner = MagicMock()
@@ -52,6 +57,13 @@ def test_step_backfill_moex_calls_runner(fake_db_path):
     assert calls["n"] == 1, f"backfill_from_moex called {calls['n']} times, want 1"
     MockCls.assert_called_once()
     assert MockCls.call_args.kwargs["db_path"] == fake_db_path
+    # PR #100 fix: worker wires the recent-tail fallback on so the new
+    # code path is no longer dead. Asserting the kwarg is forwarded is
+    # what catches accidental regressions of the wiring.
+    assert calls["kw"].get("recent_tail_days", 0) > 0, (
+        f"worker must opt the chain into recent_tail_days>0; "
+        f"got kwargs={calls['kw']!r}"
+    )
 
 
 def test_step_backfill_moex_returns_false_on_exception(fake_db_path):
