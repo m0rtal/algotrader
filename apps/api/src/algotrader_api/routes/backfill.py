@@ -26,6 +26,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from ..config import get_settings
+from ..db.secrets import get_broker_token
 from ..db.sqlite import execute as _exec
 from ..ingestion.backfill import BackfillRunner, BackfillEvent
 from ..observability.logging import get_logger
@@ -100,6 +101,13 @@ async def start_backfill(body: dict | None = None) -> dict:
     body = body or {}
     history_years = body.get("history_years", 5)
     incremental_threshold_days = body.get("incremental_threshold_days", 2)
+    source = body.get("source", "auto")
+    if source not in ("auto", "moex", "tinkoff"):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_source",
+                    "message": f"source must be auto|moex|tinkoff, got {source!r}"},
+        )
 
     settings = get_settings()
     db_path = settings.sqlite_path
@@ -107,7 +115,6 @@ async def start_backfill(body: dict | None = None) -> dict:
     # Construct a client for the runner. The runner's only contract is
     # the Protocol shape (get_shares/bonds/etfs/futures/options/candles);
     # RealTinkoffClient implements all of these, so we use it directly.
-    from ..db.secrets import get_broker_token
     from ..ingestion.client import make_client
 
     token = get_broker_token(db_path)
@@ -144,6 +151,7 @@ async def start_backfill(body: dict | None = None) -> dict:
             await runner.run(
                 history_years=history_years,
                 incremental_threshold_days=incremental_threshold_days,
+                source=source,
             )
         except Exception as e:  # noqa: BLE001  # pragma: no cover — runner exceptions only fire during live broker run
             logger.error("backfill.runner.failed", error=str(e))
