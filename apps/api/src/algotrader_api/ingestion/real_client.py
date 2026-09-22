@@ -36,6 +36,25 @@ a tight loop (~30/min). The timeout here is enforced at the wrapper
 layer (not in the vendored SDK) and, on fire, the channel is closed
 and the next call rebuilds it — a poisoned HTTP/2 connection is not
 salvageable by retry.
+
+Why we also retry on gRPC UNAVAILABLE: live logs show every Tinkoff
+chunk fails with ``(<StatusCode.UNAVAILABLE: (14, 'unavailable')>,
+'failed to connect to all addresses; last error: UNAVAILABLE:
+ipv4:178.130.128.33:443: Handshake read failed (recvmsg:Connection
+reset by peer (104))')``. UNAVAILABLE is a transient peer/network
+condition — the next attempt on a fresh HTTP/2 connection typically
+succeeds. We rebuild the channel between attempts (see
+``_reset_channel``) because retrying over the same poisoned socket
+just re-fails.
+
+Why each public method uses an async factory that re-calls ``_ensure``
+on every attempt: after ``_reset_channel`` has torn down the cached
+``_services`` handle, the only path to a fresh HTTP/2 connection is
+``_ensure()`` (it sees ``_services is None`` and constructs a new
+``AsyncClient``). A closure that captured the services object before
+the reset would silently keep using the dead channel. Calling
+``_ensure()`` from inside the factory on every attempt keeps the
+retry path honest.
 """
 from __future__ import annotations
 
@@ -63,6 +82,15 @@ logger = get_logger("algotrader_api.ingestion.real_client")
 # ``request_timeout`` constructor kwarg.
 DEFAULT_REQUEST_TIMEOUT: float = 30.0
 
+# Retry policy for the Tinkoff SDK call layer on gRPC UNAVAILABLE
+# ("Connection reset by peer", "failed to connect to all addresses").
+# 3 total attempts (1 initial + up to 2 retries) with exponential
+# backoff [1s, 2s, 4s] — the 3rd entry is unused at 3 attempts but
+# keeps the schedule complete for future relaxation. Channel is
+# rebuilt between attempts (see ``_reset_channel``).
+RETRY_ON_UNAVAILABLE_ATTEMPTS: int = 3
+RETRY_ON_UNAVAILABLE_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0)
+
 
 class RealClientTimeoutError(asyncio.TimeoutError):
     """Raised when an SDK RPC exceeds ``request_timeout`` seconds.
@@ -79,6 +107,32 @@ class RealClientTimeoutError(asyncio.TimeoutError):
         )
         self.label = label
         self.timeout = timeout
+
+
+class RealClientUnavailableError(Exception):
+    """Raised after retries are exhausted on gRPC UNAVAILABLE.
+
+    Distinct from :class:`RealClientTimeoutError`: UNAVAILABLE is a
+    peer-side / network-level gRPC status (HTTP/2 RST_STREAM,
+    "failed to connect to all addresses", "Connection reset by peer")
+    that the SDK surfaces as ``t_tech.invest.exceptions.AioRequestError``
+    with ``code == StatusCode.UNAVAILABLE``. We retry on it
+    (channel rebuild + exponential backoff) before giving up, because
+    in practice the Tinkoff sandbox/prod fleet has transient flakiness
+    where the next attempt on a fresh HTTP/2 connection succeeds.
+
+    Not a subclass of ``asyncio.TimeoutError`` — the failure mode is
+    different and operator alerting keys off the type.
+    """
+
+    def __init__(self, label: str, attempts: int, details: str) -> None:
+        super().__init__(
+            f"Tinkoff RPC {label!r} failed with UNAVAILABLE after "
+            f"{attempts} attempts: {details}"
+        )
+        self.label = label
+        self.attempts = attempts
+        self.details = details
 
 
 class RealTinkoffClient:
@@ -136,10 +190,10 @@ class RealTinkoffClient:
     async def _reset_channel(self) -> None:
         """Tear down the current gRPC channel so the next RPC rebuilds it.
 
-        Called after a timeout: a hung HTTP/2 connection will never
-        recover, so we close the AsyncClient and drop our cached
-        ``_services`` handle. The next call to ``_ensure()`` opens a
-        fresh channel.
+        Called after a timeout or an UNAVAILABLE retry. A poisoned
+        HTTP/2 connection will not recover on its own, so we close
+        the AsyncClient and drop our cached ``_services`` handle.
+        The next call to ``_ensure()`` opens a fresh channel.
         """
         client = self._client
         self._client = None
@@ -153,30 +207,111 @@ class RealTinkoffClient:
                     extra={"err": repr(exc)},
                 )
 
-    async def _call(self, label: str, awaitable: Any) -> Any:
-        """Wrap an SDK RPC coroutine in ``asyncio.wait_for``.
+    @staticmethod
+    def _is_unavailable(exc: BaseException) -> bool:
+        """Return True iff ``exc`` carries a gRPC UNAVAILABLE status.
 
-        ``label`` is used for the timeout error message and structured
-        log so operators can tell which call (e.g. ``users.get_accounts``)
-        is the one that's stuck. We deliberately do NOT swallow the
-        ``TimeoutError`` — the caller (worker loop) needs to know the
-        call didn't succeed. After the timeout we reset the channel so
-        the next RPC gets a clean HTTP/2 connection.
+        The SDK wraps raw gRPC ``AioRpcError`` into
+        ``t_tech.invest.exceptions.AioRequestError`` carrying the
+        ``grpc.StatusCode`` on ``.code``. We compare against the
+        canonical ``grpc.StatusCode.UNAVAILABLE`` enum when ``.code``
+        is an instance of that exact type, otherwise fall back to a
+        duck-typed check on ``code.name == "UNAVAILABLE"`` so tests
+        and any future SDK variant can stub the shape without
+        depending on the real enum.
         """
-        try:
-            return await asyncio.wait_for(
-                awaitable, timeout=self._request_timeout
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "tinkoff_rpc_timeout",
-                extra={
-                    "label": label,
-                    "timeout_s": self._request_timeout,
-                },
-            )
-            await self._reset_channel()
-            raise RealClientTimeoutError(label, self._request_timeout) from None
+        code = getattr(exc, "code", None)
+        if code is None:
+            return False
+        try:  # pragma: no cover — exercised only when grpc is installed
+            from grpc import StatusCode  # type: ignore[import-not-found]
+
+            if isinstance(code, StatusCode):
+                return code == StatusCode.UNAVAILABLE
+        except ImportError:
+            pass
+        return getattr(code, "name", None) == "UNAVAILABLE"
+
+    async def _call(self, label: str, factory: Any) -> Any:
+        """Wrap an SDK RPC coroutine factory in timeout + UNAVAILABLE retries.
+
+        ``factory`` is a zero-argument async callable that returns the
+        RPC result. It is invoked fresh on every attempt; retries call
+        it again after a channel reset, which rebuilds the cached
+        ``_services`` handle because the factory calls ``self._ensure``
+        itself.
+
+        ``label`` is used for log/exception messages so operators can
+        tell which call (e.g. ``users.get_accounts``) is the one that
+        is stuck or flapping.
+
+        Failure handling
+        ----------------
+
+        * ``asyncio.TimeoutError`` — the per-RPC timeout fired; reset
+          the channel (a hung HTTP/2 connection is never salvageable)
+          and raise :class:`RealClientTimeoutError`. No retry: by the
+          time we hit the timeout it's typically a persistent outage.
+
+        * gRPC UNAVAILABLE (``AioRequestError.code == StatusCode.UNAVAILABLE``)
+          — reset the channel, sleep with exponential backoff, and
+          retry up to ``RETRY_ON_UNAVAILABLE_ATTEMPTS`` total times
+          (default 3: initial + 2 retries). After exhausting retries
+          raise :class:`RealClientUnavailableError` with the last
+          error's details. The retry+channel-rebuild path is critical
+          on observed "Connection reset by peer" transient blips.
+
+        * Any other exception — propagate untouched.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await asyncio.wait_for(
+                    factory(), timeout=self._request_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "tinkoff_rpc_timeout",
+                    extra={
+                        "label": label,
+                        "timeout_s": self._request_timeout,
+                        "attempt": attempt,
+                    },
+                )
+                await self._reset_channel()
+                raise RealClientTimeoutError(label, self._request_timeout) from None
+            except BaseException as exc:  # noqa: BLE001 — see ``_is_unavailable``
+                if not self._is_unavailable(exc):
+                    raise
+                details = (
+                    getattr(exc, "details", None)
+                    or getattr(getattr(exc, "code", None), "name", "UNAVAILABLE")
+                )
+                if attempt >= RETRY_ON_UNAVAILABLE_ATTEMPTS:
+                    logger.error(
+                        "tinkoff_rpc_unavailable_exhausted",
+                        extra={
+                            "label": label,
+                            "attempts": attempt,
+                            "details": details,
+                        },
+                    )
+                    raise RealClientUnavailableError(label, attempt, details) from exc
+                backoff = RETRY_ON_UNAVAILABLE_BACKOFF_SECONDS[
+                    min(attempt - 1, len(RETRY_ON_UNAVAILABLE_BACKOFF_SECONDS) - 1)
+                ]
+                logger.warning(
+                    "tinkoff_rpc_unavailable_retry",
+                    extra={
+                        "label": label,
+                        "attempt": attempt,
+                        "next_attempt_in_s": backoff,
+                        "details": details,
+                    },
+                )
+                await self._reset_channel()
+                await asyncio.sleep(backoff)
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -193,10 +328,11 @@ class RealTinkoffClient:
         await self.aclose()
 
     async def get_accounts(self) -> list[dict]:
-        services = await self._ensure()
-        response = await self._call(
-            "users.get_accounts", services.users.get_accounts()
-        )
+        async def factory() -> Any:
+            services = await self._ensure()
+            return await services.users.get_accounts()
+
+        response = await self._call("users.get_accounts", factory)
         return [_acct_to_dict(a) for a in response.accounts]
 
     async def _instruments(
@@ -214,16 +350,18 @@ class RealTinkoffClient:
         return the right slice. The `instrument_type_attr` argument is
         kept for interface symmetry / future-proofing but ignored.
         """
-        services = await self._ensure()
         instrument_status = getattr(
             self._sdk.InstrumentStatus, "INSTRUMENT_STATUS_BASE"
         )
-        response = await self._call(
-            f"instruments.{method_name}",
-            getattr(services.instruments, method_name)(
+        method_attr = method_name
+
+        async def factory() -> Any:
+            services = await self._ensure()
+            return await getattr(services.instruments, method_attr)(
                 instrument_status=instrument_status,
-            ),
-        )
+            )
+
+        response = await self._call(f"instruments.{method_name}", factory)
         return [converter(i) for i in response.instruments]
 
     async def get_shares(self) -> list[dict]:
@@ -259,21 +397,21 @@ class RealTinkoffClient:
         date_to: str | date,
         interval: str = "CANDLE_INTERVAL_DAY",
     ) -> list[dict]:
-        services = await self._ensure()
         CandleInterval = getattr(self._sdk, "CandleInterval")
         interval_enum = getattr(CandleInterval, interval, CandleInterval.CANDLE_INTERVAL_DAY)
 
         # SDK expects datetime objects for from_/to, not ISO strings.
         # Our Protocol accepts both for ergonomics.
-        response = await self._call(
-            "market_data.get_candles",
-            services.market_data.get_candles(
+        async def factory() -> Any:
+            services = await self._ensure()
+            return await services.market_data.get_candles(
                 instrument_id=figi,
                 from_=_to_datetime(date_from),
                 to=_to_datetime(date_to),
                 interval=interval_enum,
-            ),
-        )
+            )
+
+        response = await self._call("market_data.get_candles", factory)
         return [_candle_to_dict(c) for c in response.candles]
 
     async def get_dividends(
@@ -291,14 +429,14 @@ class RealTinkoffClient:
         proto accepts either and the SDK has been observed to return empty
         when only one is supplied on some sandbox builds.
         """
-        services = await self._ensure()
-        response = await self._call(
-            "instruments.get_dividends",
-            services.instruments.get_dividends(
+        async def factory() -> Any:
+            services = await self._ensure()
+            return await services.instruments.get_dividends(
                 figi=figi,
                 from_=_to_datetime(from_),
                 to=_to_datetime(to),
                 instrument_id=figi,
-            ),
-        )
+            )
+
+        response = await self._call("instruments.get_dividends", factory)
         return [_dividend_to_dict(d, figi=figi) for d in response.dividends]
