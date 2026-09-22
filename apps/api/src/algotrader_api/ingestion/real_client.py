@@ -180,12 +180,55 @@ class RealTinkoffClient:
         return self._request_timeout
 
     async def _ensure(self) -> Any:
-        """Open the AsyncClient and cache the resulting AsyncServices."""
+        """Open the AsyncClient and cache the resulting AsyncServices.
+
+        Both the AsyncClient constructor (sync, runs gRPC channel
+        setup on first access) and the ``__aenter__`` awaitable
+        (opens the actual HTTP/2 connection) can hang indefinitely
+        against a stuck or rate-limited Tinkoff endpoint. We wrap
+        both in ``asyncio.wait_for`` so a poisoned channel is
+        detected at init time, not at the first RPC.
+
+        Raises ``RealClientTimeoutError`` on timeout. Caller is
+        expected to retry via the existing UNAVAILABLE retry loop.
+        """
         if self._services is None:
             AsyncClient = getattr(self._sdk, "AsyncClient")
-            self._client = AsyncClient(self._token, target=self._target)
-            self._services = await self._client.__aenter__()
+            # Constructor is synchronous but can block on TLS / channel
+            # setup. Run it in a thread so we can time it out.
+            try:
+                self._client = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        AsyncClient, self._token, target=self._target,
+                    ),
+                    timeout=self._request_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RealClientTimeoutError(
+                    "AsyncClient.__init__", self._request_timeout,
+                ) from exc
+            try:
+                self._services = await asyncio.wait_for(
+                    self._client.__aenter__(),
+                    timeout=self._request_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                # Channel handshake timed out — drop the partial client.
+                await self._safe_aexit(self._client)
+                self._client = None
+                raise RealClientTimeoutError(
+                    "AsyncClient.__aenter__", self._request_timeout,
+                ) from exc
         return self._services
+
+    async def _safe_aexit(self, client: Any) -> None:
+        """Best-effort close of a partially-constructed AsyncClient."""
+        if client is None:
+            return
+        try:
+            await asyncio.wait_for(client.__aexit__(None, None, None), timeout=5.0)
+        except BaseException:  # noqa: BLE001 — best-effort cleanup
+            pass
 
     async def _reset_channel(self) -> None:
         """Tear down the current gRPC channel so the next RPC rebuilds it.
