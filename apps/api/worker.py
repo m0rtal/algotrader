@@ -412,7 +412,9 @@ def _step_backfill_moex(db_path: str) -> tuple[bool, str]:
             db_path=db_path,
             event_sink=_async_noop_sink,
         )
-        written = asyncio.run(runner.backfill_from_moex())
+        written = asyncio.run(
+            runner.backfill_from_moex(recent_tail_days=5)
+        )
         pre, post, delta = assert_bars_increased(
             db_path, phase="backfill_moex", pre_count=pre_count,
         )

@@ -383,14 +383,30 @@ def _fetch_moex_range(
     cap = last_trading_day or to_d
     out: list[dict] = []
     for year in range(from_d.year, to_d.year + 1):
-        # Per-year hard cap at `to_d` so we never return rows outside
-        # the requested window even if the year's response sneaks in
-        # an extra day (it shouldn't, but defensive).
+        # Per-year hard cap at `to_d` so we never request rows outside
+        # the window.
+        # NB: ``_fetch_year_moex`` only honors ``last_trading_day`` when
+        # ``year == last_trading_day.year`` (it asks MOEX for the full
+        # year otherwise). For any other year, the response can contain
+        # bars outside [from_d, to_d]; we filter those out below.
         year_cap = min(to_d, cap)
         year_bars = _fetch_year_moex(
             market, board, ticker, year, last_trading_day=year_cap
         )
-        out.extend(year_bars)
+        # Defensive post-filter: keep only bars whose TRADEDATE falls
+        # inside the requested window. This closes the gap when
+        # `_fetch_year_moex` returned the full year for a year other
+        # than ``last_trading_day.year`` (e.g. a January request for a
+        # recent-tail window that crosses Dec → Jan). Without this,
+        # ``backfill_moex_recent_tail`` would silently INSERT OR IGNORE
+        # bars dated outside the requested tail window, polluting the
+        # bars table with out-of-window rows.
+        window_lo = from_d.isoformat()
+        window_hi = year_cap.isoformat()
+        for b in year_bars:
+            ts = b.get("ts") or ""
+            if window_lo <= str(ts)[:10] <= window_hi:
+                out.append(b)
     return out
 
 
@@ -1178,9 +1194,40 @@ class BackfillRunner:
                 b["figi"] = figi
             if not bars:
                 return 0
-            return replace_bars_for_figi(
+            # `replace_bars_for_figi` returns rows-ATTEMPTED, not
+            # rows-actually-inserted (with `replace=False` it does
+            # INSERT OR IGNORE — duplicates silently skipped, but the
+            # return value counts every attempted row). For ops triage
+            # we want the real number of new bars added by this pass,
+            # so compute the diff between pre- and post-call row count
+            # for the figi in the requested window.
+            from ..db.bars_sqlite import get_connection
+            try:
+                _conn = get_connection(self.db_path)
+                pre_rows = _conn.execute(
+                    "SELECT COUNT(*) FROM bars WHERE figi = ? AND ts BETWEEN ? AND ?",
+                    (figi, from_d.isoformat(), yesterday.isoformat()),
+                ).fetchone()[0]
+            except Exception:
+                pre_rows = None  # fall back to attempted count below
+            replace_bars_for_figi(
                 self.db_path, figi, bars, replace=False, source="moex"
             )
+            if pre_rows is None:
+                # Could not read pre-count; report attempted rows so
+                # the operator at least sees that the pass tried to
+                # write something for this figi.
+                return len(bars)
+            try:
+                _conn = get_connection(self.db_path)
+                post_rows = _conn.execute(
+                    "SELECT COUNT(*) FROM bars WHERE figi = ? AND ts BETWEEN ? AND ?",
+                    (figi, from_d.isoformat(), yesterday.isoformat()),
+                ).fetchone()[0]
+            except Exception:
+                return len(bars)
+            inserted = max(0, post_rows - pre_rows)
+            return inserted
 
         async def _bounded(inst: dict) -> int:
             async with sem:
