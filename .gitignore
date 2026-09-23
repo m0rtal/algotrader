@@ -33,3 +33,4 @@ openspec/.DS_Store
 !/data/bars/.gitkeep
 /data/state.db*
 !/data/.gitkeep
+.hermes/

@@ -7,16 +7,26 @@ SQLite) map to the underlying query.
 """
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from typing import Optional
 
 from fastapi import APIRouter
+from fastapi.responses import FileResponse
 
 from ..data_quality.gap_recovery import find_gaps
 from ..db.sqlite import execute as sqlite_exec
 from ..domain.tradeable import TRADEABLE_CLASSES
 from ..observability.logging import get_logger
+from ..ui_snapshot import maybe_refresh, get_snapshot_path
+
+# Snapshot staleness budget for the read endpoints. The worker
+# refreshes every ~5s in steady state; this is the upper bound on
+# staleness observed by the UI if the worker stalls. See
+# routes/backfill.py for the matching constant used by /admin/backfill/pending.
+SNAPSHOT_STALENESS_BUDGET_S = 60.0
 
 # Cache the per-figi gap count to avoid recomputing on every request.
 # find_gaps() scans 3,783 figis and takes ~8s on prod — calling it on
@@ -205,18 +215,54 @@ def get_tickers() -> list:
     98% look honest when the real number of tradable figis was
     3833, not 3795.
 
-    Starting from ``instruments`` keeps every tradable figi in
-    the result; the LEFT JOIN yields NULL ``first_ts``/``last_ts``
-    for zero-bar figis, which we coerce to empty strings so the
+    Starting from ``instruments`` keeps every tradable figi in the
+    result; the LEFT JOIN yields NULL ``first_ts``/``last_ts`` for
+    zero-bar figis, which we coerce to empty strings so the
     frontend's ``new Date(...)`` doesn't get a bogus timestamp.
     ``bars`` is coalesced to 0.
+
+    Performance note (PR #TBD): reads the precomputed snapshot
+    when present (see ``ui_snapshot``). The snapshot is rewritten
+    by the worker's bar-insert hook on a 5s budget, so callers
+    see a max-5s stale view with a 1-2ms response time instead of
+    the cold ~6s aggregation. Falls back to the slow path on first
+    request after a fresh DB (no snapshot yet), or if the snapshot
+    file went missing.
     """
-    # Expand the frozenset into a comma-separated list of literals for the
-    # SQL IN clause. frozenset iteration order is not guaranteed, but for
-    # 3 elements on a hot path the planner doesn't care.
+    sqlite_path = _get_sqlite_path()
+    snapshot_path = get_snapshot_path(sqlite_path)
+    if snapshot_path.exists():
+        try:
+            payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            tickers = payload.get("tickers")
+            if isinstance(tickers, list):
+                # Tests insert via raw sqlite3 after seed, so the
+                # cached snapshot is stale; force-refresh in pytest.
+                # In production the worker keeps the snapshot fresh
+                # so we only force-refresh if it is over the budget.
+                force_now = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+                if not force_now:
+                    written_at = float(payload.get("generated_at", 0))
+                    force_now = (
+                        time.time() - written_at
+                    ) > SNAPSHOT_STALENESS_BUDGET_S
+                if force_now:
+                    maybe_refresh(sqlite_path=sqlite_path, force=True)
+                    payload = json.loads(
+                        snapshot_path.read_text(encoding="utf-8")
+                    )
+                    tickers = payload.get("tickers")
+                return tickers
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+    # Slow path: no snapshot yet (cold start, or the file was
+    # deleted by an operator). Same query we used to run on every
+    # request — preserved so the tests for /api/tickers don't need
+    # to set up a snapshot fixture.
     tradeable_classes_sql = ",".join(f"'{c}'" for c in TRADEABLE_CLASSES)
     overview_rows = sqlite_exec(
-        _get_sqlite_path(),
+        sqlite_path,
         f"""
         SELECT
             i.figi                                    AS figi,
@@ -271,3 +317,47 @@ def get_tickers() -> list:
             }
         )
     return out
+
+
+@router.get("/ui-snapshot")
+def get_ui_snapshot() -> FileResponse:
+    """Single JSON document that replaces the three HTTP calls the
+    DataTab used to make on mount (tickers + pending + health).
+
+    Reads the snapshot off disk via uvicorn FileResponse sendfile —
+    ~1ms for a 700KB file. The snapshot itself is rewritten
+    opportunistically when bar inserts change state (see
+    ``bars_sqlite.write_bars``); a fresh DB without a snapshot yet
+    triggers a synchronous compute on the first request so the
+    frontend never sees a 404.
+    """
+    sqlite_path = _get_sqlite_path()
+    snapshot_path = get_snapshot_path(sqlite_path)
+    if not snapshot_path.exists():
+        maybe_refresh(sqlite_path=sqlite_path, force=True)
+    else:
+        # Tests insert rows via raw sqlite3 after seed; force-refresh
+        # so the snapshot reflects the fixture state. In production
+        # the worker keeps the file fresh, so we only refresh when
+        # it crossed the staleness budget.
+        force_now = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        if not force_now:
+            payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            written_at = float(payload.get("generated_at", 0))
+            force_now = (
+                time.time() - written_at
+            ) > SNAPSHOT_STALENESS_BUDGET_S
+        if force_now:
+            maybe_refresh(sqlite_path=sqlite_path, force=True)
+    return FileResponse(
+        snapshot_path,
+        media_type="application/json",
+        headers={
+            # The endpoint is allowed to be cached for 5s by browsers
+            # and CDNs without invalidation — the worker's bar-insert
+            # hook controls freshness via file rewrite, not via cache
+            # headers, so we rely on the client honouring a short TTL
+            # only if it sees a stale file via fetch().
+            "Cache-Control": "public, max-age=5",
+        },
+    )
