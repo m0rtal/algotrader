@@ -45,16 +45,18 @@ fi
 sleep 8
 
 # ---- 2. uvicorn (FastAPI backend on :8000) ----
-if ! pgrep -f 'uvicorn algotrader_api.main' >/dev/null 2>&1; then
-    cd "$API_DIR" || { echo "[startup] cd failed: $API_DIR"; exit 1; }
-    nohup "$UVICORN" algotrader_api.main:app \
-        --host 0.0.0.0 --port 8000 \
-        >> "$LOG_DIR/algotrader-uvicorn.log" 2>&1 &
+# Wrapped in algotrader-api-supervisor.sh (PR #121): the supervisor's
+# HTTP watchdog polls /health every 10s and SIGKILLs uvicorn if 3
+# consecutive checks fail, so the outer restart loop relaunches it.
+# This replaces the bare nohup invocation that died silently when its
+# parent (an execute_code kernel session) was reaped.
+if ! pgrep -f 'algotrader-api-supervisor' >/dev/null 2>&1; then
+    nohup bash "$PROJECT/scripts/algotrader-api-supervisor.sh" \
+        >> "$LOG_DIR/algotrader-api.log" 2>&1 &
     disown
-    cd - >/dev/null
-    echo "[startup] uvicorn launched (pid $!)"
+    echo "[startup] api-supervisor launched (pid $!)"
 else
-    echo "[startup] uvicorn already running"
+    echo "[startup] api-supervisor already running"
 fi
 
 # ---- 3. vite (web frontend on :5173) ----
