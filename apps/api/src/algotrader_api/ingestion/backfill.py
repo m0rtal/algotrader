@@ -948,11 +948,37 @@ class BackfillRunner:
         async def _process_tinkoff(inst: dict) -> int:
             figi = inst["figi"]
             ticker = inst["ticker"]
+            # PR #124 (2026-09-23): only fetch missing dates, not the
+            # figi's full history. The previous code passed
+            # ``inst.listed_from`` (often 2014) as from_d, so for a
+            # figi missing one day the Tinkoff fallback walked 12 years
+            # of history in 7-day chunks before returning. With 714
+            # figis in the no-MOEX-board fallback, the cycle never
+            # converged. Use ``compute_missing_dates`` to get the actual
+            # gap set and ask Tinkoff for only ``[min(missing), yesterday]``.
             try:
                 listed_from_iso = (inst.get("listed_from") or "2014-01-01")[:10]
-                from_d = date.fromisoformat(listed_from_iso)
+                listed_from_d = date.fromisoformat(listed_from_iso)
             except (TypeError, ValueError):
-                from_d = date(2014, 1, 1)
+                listed_from_d = date(2014, 1, 1)
+            # If the listing date is suspiciously old (empty-string
+            # default path, or older than 2014 — the project's earliest
+            # data), bound it so we don't walk pre-data history. The
+            # missing-dates set will still correctly identify recent gaps.
+            if listed_from_d < date(2014, 1, 1):
+                listed_from_d = date(2014, 1, 1)
+            missing = compute_missing_dates(
+                figi=figi,
+                listed_from=listed_from_d,
+                yesterday=yesterday,
+                db_path=self.db_path,
+            )
+            if not missing:
+                # Already complete through yesterday — skip silently.
+                # Returning here avoids the Tinkoff round-trip that
+                # would have walked 12 years of history anyway.
+                return 0
+            from_d = min(missing)
             try:
                 candles = await asyncio.wait_for(
                     self._fetch_tinkoff_fallback(
@@ -963,11 +989,16 @@ class BackfillRunner:
             except asyncio.TimeoutError:
                 await self._log(
                     "warn", figi=figi,
-                    message=f"Tinkoff fallback timeout after {_figi_timeout_s}s for {ticker}; skipping",
+                    message=f"Tinkoff fallback timeout after {_figi_timeout_s}s for {ticker} "
+                            f"window={from_d}..{yesterday}; skipping",
                 )
                 return 0
             if not candles:
-                await self._log("warn", figi=figi, message="Tinkoff fallback: no data")
+                await self._log(
+                    "warn", figi=figi,
+                    message=f"Tinkoff fallback: no data for {ticker} "
+                            f"window={from_d}..{yesterday}",
+                )
                 return 0
             return replace_bars_for_figi(self.db_path, figi, candles, replace=False)
 
