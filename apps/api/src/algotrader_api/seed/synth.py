@@ -148,4 +148,16 @@ def seed_bars_sqlite(sqlite_path: str, *, start_date: date | None = None) -> int
         ]
         replace_bars_for_figi(sqlite_path, figi, candles)
         total += len(candles)
+    # Final snapshot refresh after all synth tickers are committed —
+    # the per-ticker `replace_bars_for_figi` calls also try to
+    # refresh the UI snapshot, but the per-write 5s budget keeps
+    # the snapshot at version=1 (only the first ticker) for the
+    # whole seed. We re-evaluate here so tests and first-time
+    # installs see a complete view immediately.
+    try:
+        from ..ui_snapshot import maybe_refresh
+
+        maybe_refresh(sqlite_path=sqlite_path, force=True)
+    except Exception:
+        pass
     return total

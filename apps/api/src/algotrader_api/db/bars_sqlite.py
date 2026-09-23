@@ -165,6 +165,19 @@ def replace_bars_for_figi(
     except Exception:
         conn.rollback()
         raise
+    # Snapshot rebuild hook — runs after the commit so the file
+    # rewrite never races with an in-flight transaction. Cost is
+    # bounded by REFRESH_BUDGET_S: hot figis (every minute) only
+    # trigger a real recompute when the budget elapses.
+    try:
+        from ..ui_snapshot import maybe_refresh
+
+        maybe_refresh(sqlite_path=sqlite_path)
+    except Exception:
+        # Snapshot is a cache — a failed recompute must never block
+        # a successful bar write. The next request will fall back to
+        # computing synchronously.
+        pass
     return len(rows)
 
 
