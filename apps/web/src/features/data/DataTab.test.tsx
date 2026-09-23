@@ -418,4 +418,82 @@ describe('DataTab', () => {
     const gapsBlock = gapsLabels[0].parentElement;
     expect(gapsBlock?.textContent).not.toMatch(/^\s*—\s*$/);
   });
+
+  it('renders Период using the earliest NON-EMPTY firstDate (zero-bar figis have empty firstDate and must be ignored)', async () => {
+    /**
+     * Regression test for PR #TBD: the prod DB has 37 tradable figis with
+     * zero bars (zero-bar coverage gap from sanctions / delisting). The
+     * backend serialises those as `firstDate: ""` / `lastDate: ""` (see
+     * data_reads.py line ~265). JS string comparison says `"" < "2013-..."`
+     * is true, so a naive
+     *   tickers.reduce((acc, t) => (acc === null || t.firstDate < acc ? t.firstDate : acc), null)
+     * would pick the empty string and the UI would render the literal
+     * "…" placeholder forever (the period block is gated on
+     * `firstDate ? "с ${firstDate.slice(0,4)}" : "…"`).
+     *
+     * Correct behaviour: skip empty strings in the reduce; render the
+     * earliest real firstDate (which on prod is 2013-03-25, displayed
+     * as "с 2013").
+     */
+    server.use(
+      http.get('/api/tickers', () =>
+        HttpResponse.json([
+          // 37 stub zero-bar figis to mirror prod universe.
+          ...Array.from({ length: 37 }, (_, i) => ({
+            symbol: `STUB${i}`,
+            name: '',
+            sector: '',
+            price: 0,
+            bars: 0,
+            firstDate: '',
+            lastDate: '',
+            fileSize: 0,
+            gaps: 0,
+          })),
+          {
+            symbol: 'OLDEST',
+            name: 'Eldest',
+            sector: '',
+            price: 0,
+            bars: 3000,
+            firstDate: '2013-03-25',
+            lastDate: '2026-09-22',
+            fileSize: 0,
+            gaps: 0,
+          },
+          {
+            symbol: 'MID',
+            name: 'Mid',
+            sector: '',
+            price: 0,
+            bars: 1500,
+            firstDate: '2021-09-01',
+            lastDate: '2026-09-22',
+            fileSize: 0,
+            gaps: 0,
+          },
+        ]),
+      ),
+    );
+
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+
+    const periodLabels = await screen.findAllByText(/^Период$/);
+    // Wait for the period VALUE (not the static "Период" label) to render.
+    // The KPI block shows "…" until useTickers resolves; only then does it
+    // become "с 2013". Use the same await-findAllByText-with-callback
+    // pattern as the sibling test on line ~351 so we synchronise on the
+    // post-resolve DOM, not the placeholder.
+    await screen.findAllByText(
+      (content) => /^с\s+2013/.test(content.trim()),
+      undefined,
+      { timeout: 3000 },
+    );
+    const periodValue = periodLabels[0].parentElement?.querySelector('p:nth-of-type(2)');
+    expect(periodValue?.textContent?.trim()).toMatch(/^с\s+2013/);
+  });
 });
