@@ -681,3 +681,70 @@ async def test_backfill_from_moex_skips_remaining_chunks_on_tinkoff_rate_limit(
         f"expected ≤2 calls (one + one retry), got {call_count['n']} "
         f"— chain didn't bail out on RESOURCE_EXHAUSTED"
     )
+
+
+async def test_backfill_from_moex_uses_concurrency_5_for_tinkoff_semaphore(
+    fresh_db, monkeypatch
+):
+    """Pin the Tinkoff semaphore to 5 so we notice if someone
+    accidentally reverts it to 1 (the original value that made the
+    chain crawl)."""
+    from algotrader_api.ingestion.backfill import BackfillRunner
+    import asyncio
+
+    observed: dict[str, int] = {}
+
+    real_Semaphore = asyncio.Semaphore
+
+    class _SpySemaphore(real_Semaphore):  # type: ignore[misc]
+        def __init__(self, value: int = 1) -> None:
+            super().__init__(value)
+            # We only care about the second Semaphore created inside
+            # backfill_from_moex (the Tinkoff one). The first is the
+            # MOEX semaphore, which is already 5 — ignore it.
+            if not observed:
+                observed["first"] = value
+            else:
+                observed["second"] = value
+
+    monkeypatch.setattr(
+        "algotrader_api.ingestion.backfill.asyncio.Semaphore",
+        _SpySemaphore,
+    )
+
+    # Seed at least one figi so the loop runs.
+    import sqlite3 as _sq
+    con = _sq.connect(fresh_db)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin, sector) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("DUMMY", "BBG-DUMMY", "share", "Dummy", "rub", 1, "T", "test"),
+    )
+    con.commit()
+    con.close()
+
+    # Stub both MOEX and Tinkoff responses so the loop completes.
+    import responses as _responses
+    _responses.start()
+    try:
+        _responses.add(
+            _responses.GET,
+            "https://iss.moex.com/iss/securities/DUMMY.json",
+            json={"boards": {"data": []}},  # empty → fall through to Tinkoff
+        )
+        from unittest.mock import AsyncMock, MagicMock
+        client = MagicMock()
+        client.get_candles = AsyncMock(return_value=[])
+
+        runner = BackfillRunner(
+            client=client, db_path=fresh_db, event_sink=_noop_sink,
+        )
+        await runner.backfill_from_moex(today=date(2026, 9, 15))
+    finally:
+        _responses.stop()
+        _responses.reset()
+
+    # MOEX semaphore is created first (value 5), Tinkoff second.
+    assert observed.get("second") == 5, (
+        f"Tinkoff semaphore must be 5, got {observed.get('second')!r}"
+    )
