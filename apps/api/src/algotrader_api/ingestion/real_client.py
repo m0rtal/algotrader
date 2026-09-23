@@ -194,19 +194,16 @@ class RealTinkoffClient:
         """
         if self._services is None:
             AsyncClient = getattr(self._sdk, "AsyncClient")
-            # Constructor is synchronous but can block on TLS / channel
-            # setup. Run it in a thread so we can time it out.
-            try:
-                self._client = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        AsyncClient, self._token, target=self._target,
-                    ),
-                    timeout=self._request_timeout,
-                )
-            except asyncio.TimeoutError as exc:
-                raise RealClientTimeoutError(
-                    "AsyncClient.__init__", self._request_timeout,
-                ) from exc
+            # Constructor is synchronous AND requires a running event
+            # loop in the current thread (grpc.aio.Channel.__init__
+            # calls cygrpc.get_working_loop()). Calling it directly
+            # inside an async function is fine — it returns in
+            # microseconds (channel is lazy; no network until
+            # __aenter__). The previous off-thread wrap (dispatched
+            # via the default executor, which has no event loop)
+            # surfaced as "There is no current event loop in thread
+            # 'asyncio_0'" during universe_sync.
+            self._client = AsyncClient(self._token, target=self._target)
             try:
                 self._services = await asyncio.wait_for(
                     self._client.__aenter__(),
