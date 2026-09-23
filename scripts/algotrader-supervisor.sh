@@ -109,26 +109,22 @@ current_bars = con.execute("SELECT COUNT(*) FROM bars").fetchone()[0]
 bars_growth = current_bars - baseline_bars
 elapsed = time.time() - baseline_time
 print(f"hb_age={hb_age_days:.4f}d bar_age={bar_age_days:.4f}d bars_growth={bars_growth} elapsed={elapsed:.0f}s")
-# Kill if any of:
-# - heartbeat stale (worker truly dead)
-# - worker alive >10 min but added 0 bars (stuck at startup)
-#   (HTTP/2 flow control: fresh worker can be stuck from call 1).
-#
-# The third "heartbeat fresh AND no bars progress for >90 min" check
-# was removed: with Tinkoff production endpoints frequently
-# rate-limited (bars lag measured in days, not minutes), this rule
-# produced constant false positives and prevented the chain from
-# ever reaching its self-recovery path. Fresh heartbeat already
-# proves the worker is alive — its inability to make bar progress
-# is communicated through the heartbeat age and bar count themselves.
+# Kill if the heartbeat is stale (worker truly dead). The previous
+# "elapsed > 600 and bars_growth == 0" STUCK_AT_STARTUP rule was
+# removed in PR #123 (2026-09-23): after PR #120 fixed the asyncio
+# event-loop bug and PR #122 cut prefetch from infinite to ~8 min,
+# the worker is now alive for ~30 min per backfill cycle (8 min
+# prefetch + ~22 min _process_one_bounded walking 3800 figis at
+# Semaphore(5)). The old 600 s threshold killed the worker 5 min
+# before any bar could be written. Heartbeat freshness is the
+# right liveness signal; bar-progress is communicated via the
+# heartbeat age + bar count which the operator already monitors.
 if hb_age_days > hb_max:
     print("STALL")
-elif elapsed > 600 and bars_growth == 0:
-    print("STUCK_AT_STARTUP")
 PYEOF
 )
 
-    # Always log diagnostic, kill on STALL/STUCK_AT_STARTUP.
+    # Always log diagnostic, kill on STALL.
     echo "[supervisor] $(date -Iseconds) watchdog check: $OUT" >> "$LOG"
     if grep -qE "STALL|STUCK_AT_STARTUP" <<< "$OUT"; then
       WORKER_PID=""
