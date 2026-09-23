@@ -45,11 +45,19 @@ export function DataTab() {
   // showing start–end as a range misleads operators into thinking
   // we have e.g. 5 years of SBER when actually SBER is listed since
   // 1996 and we just don't have older bars.
+  //
+  // Skip empty `firstDate` values: the backend serialises zero-bar
+  // tradable figis as `firstDate: ""` so the UI's per-ticker
+  // completeness formula can detect them, but `"" < "2013-..."` is
+  // true in JS so a naive min-reduce would pick the empty string
+  // and the period block would render "…" forever.
   const firstDate = ready
-    ? tickers!.reduce<string | null>(
-        (acc, t) => (acc === null || t.firstDate < acc ? t.firstDate : acc),
-        null,
-      )
+    ? tickers!
+        .filter((t) => t.firstDate && t.firstDate.length > 0)
+        .reduce<string | null>(
+          (acc, t) => (acc === null || t.firstDate < acc ? t.firstDate : acc),
+          null,
+        )
     : null;
   const completeness = (() => {
     if (!ready || tickersCount === 0) return null;
