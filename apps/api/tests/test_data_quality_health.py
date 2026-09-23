@@ -319,3 +319,81 @@ def test_compute_all_surfaces_bar_corruption_bulk(db):
     assert figi_bad in reports
     assert HealthIssue.BAR_CORRUPTION not in reports[figi_ok].issues
     assert HealthIssue.BAR_CORRUPTION in reports[figi_bad].issues
+
+
+def test_compute_all_expected_bars_matches_int_arithmetic_path(db):
+    """Regression test for PR #TBD: the optimised integer-arithmetic
+    weekday math in compute_all must produce the same `expected_bars`
+    as an integer-arithmetic reference computed directly (no per-day
+    date arithmetic and no double-subtraction of weekend holidays).
+
+    The legacy `_weekdays_minus_holiday_set` helper subtracts every
+    holiday in [start, end] regardless of weekday, then counts weekdays;
+    because every Saturday/Sunday holiday gets counted in the weekdays
+    total AND subtracted from it, the result is an under-count of ~29
+    days over 11 years. The integer-arithmetic path in `compute_all`
+    matches the canonical expected formula (weekdays - weekday_holidays)
+    and is what the rest of the data-quality pipeline already assumes
+    via `_INCOMPLETE_HISTORY_RATIO = 0.95`.
+    """
+    from datetime import date as _date
+    from algotrader_api.data_quality.health import (
+        compute_all,
+        _HEALTH_EPOCH,
+        _expected_weekdays_int,
+    )
+
+    today = _date(2026, 9, 12)
+    figis = [
+        ("MID", _date(2024, 1, 1)),
+        ("EARLY", _date(2015, 6, 15)),
+        ("LATE", _date(2026, 6, 1)),
+    ]
+    con = sqlite3.connect(db)
+    for tag, start in figis:
+        figi = f"FIGI-{tag}"
+        con.execute(
+            "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+            "VALUES (?, ?, 'share', ?, 'rub', 1)",
+            (tag, figi, tag),
+        )
+        # One bar so first_bar resolves correctly in compute_all.
+        con.execute(
+            "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+            "VALUES (?, ?, 100, 110, 95, 105, 1000)",
+            (figi, start.isoformat()),
+        )
+    con.commit()
+    con.close()
+
+    # Reference: replicate the integer-arithmetic formula directly so we
+    # are comparing the compute_all implementation against a literal
+    # transcription of the spec (not against the legacy buggy helper).
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    holidays = {
+        _date.fromisoformat(r["date"]) for r in con.execute(
+            "SELECT date FROM moex_holidays"
+        ).fetchall()
+    }
+    con.close()
+    holidays_int = {(d - _HEALTH_EPOCH).days for d in holidays}
+    today_int = (today - _HEALTH_EPOCH).days
+
+    def reference_expected(start: _date) -> int:
+        f_int = (start - _HEALTH_EPOCH).days
+        wd = _expected_weekdays_int(f_int, today_int)
+        wd -= sum(
+            1 for h_int in holidays_int
+            if f_int <= h_int <= today_int and (h_int + 3) % 7 < 5
+        )
+        return wd
+
+    expected_ref = {tag: reference_expected(start) for tag, start in figis}
+    reports = compute_all(db, today=today)
+    expected_fast = {
+        tag: reports[f"FIGI-{tag}"].expected_bars for tag, _ in figis
+    }
+    assert expected_fast == expected_ref, (
+        f"compute_all disagrees with reference: {expected_fast} vs {expected_ref}"
+    )
