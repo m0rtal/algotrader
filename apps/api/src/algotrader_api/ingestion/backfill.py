@@ -1013,12 +1013,14 @@ class BackfillRunner:
 
         # Outer parallelism:
         # - 5 figis in parallel for MOEX path (cheap, MOEX ISS ~100 req/min per endpoint).
-        # - 1 figi at a time for Tinkoff fallback (sandbox/prod 600 req/min,
-        #   adaptive-retry backoff compounds when concurrent slots retry together).
+        # - 5 figis in parallel for Tinkoff fallback (sandbox/prod 600 req/min
+        #   = 10 RPS, adaptive-retry backoff compounds when concurrent slots
+        #   retry together; 5 in flight keeps burst RPS at ~25 which the
+        #   token-bucket absorbs).
         # The split prevents rate-limited Tinkoff figis from starving MOEX
         # figis of the shared semaphore.
         _moex_sem = asyncio.Semaphore(5)
-        _tinkoff_sem = asyncio.Semaphore(1)
+        _tinkoff_sem = asyncio.Semaphore(5)
 
         async def _process_one_bounded(inst: dict) -> int:
             ticker = inst.get("ticker") or ""
