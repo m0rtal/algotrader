@@ -27,7 +27,10 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
+import time
 import urllib.parse
+import requests
+import requests.adapters  # HTTPAdapter lives here, not on requests namespace
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -166,6 +169,48 @@ def decide_strategy(
 # This is the standard pattern (see Flask, requests).
 
 
+# Module-level pooled HTTP session for MOEX ISS probes.
+#
+# Why this exists (PR #122, 2026-09-23):
+#   The previous code did ``import requests; requests.get(url, timeout=(5, 30))``
+#   inside ``_get_meta_moex``. Each call opened a fresh TCP+TLS connection,
+#   incurring DNS+handshake latency for every one of the 3837 figis the
+#   prefetch walks. Combined with urllib3's default-retry chain (3 retries
+#   on connection errors, ~3.3 s each), an intermittent DNS hiccup on
+#   ``iss.moex.com`` cost ~10 s per failed call — turning the prefetch from
+#   a 5-minute warm-up into a 14-minute (often timeout-killed) stall.
+#
+#   A single ``requests.Session`` with a bounded ``HTTPAdapter`` reuses
+#   connections across calls so DNS is paid once per host (and the
+#   underlying socket is reused). ``Retry(total=0)`` short-circuits the
+#   default 3-retry chain so a DNS failure surfaces in one 5 s attempt
+#   instead of 10 s, and the bounded pool size (``pool_maxsize=16``)
+#   matches the prefetch Semaphore below — the worker can't outrun the
+#   pool it has to drain into.
+_MOEX_SESSION: requests.Session | None = None
+
+
+def _get_moex_session() -> requests.Session:
+    """Return the module-level pooled MOEX ISS session, creating on first use."""
+    global _MOEX_SESSION
+    if _MOEX_SESSION is None:
+        s = requests.Session()
+        # Retry(total=0) — disable urllib3's default 3-retry chain so a
+        # transient DNS hiccup fails fast (5 s) rather than 3 × ~3.3 s.
+        # Connection pooling (pool_connections / pool_maxsize=16) lets
+        # the prefetch reuse TCP+TLS sessions across figis instead of
+        # paying DNS+handshake per call.
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=16,
+            pool_maxsize=16,
+            max_retries=0,
+        )
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _MOEX_SESSION = s
+    return _MOEX_SESSION
+
+
 def _get_meta_moex(
     ticker: str,
     yesterday: date,
@@ -175,19 +220,22 @@ def _get_meta_moex(
 ) -> dict | None:
     """Probe MOEX for ticker. Return {market, board, listed_from, listed_till} or None.
 
-    Extracted from inner closure so tests can patch it.
-    Caches results in ``meta_cache`` (guarded by ``meta_lock``) — same
-    caching the inline closure used so concurrent access behaves identically.
+    Uses the module-level pooled ``_MOEX_SESSION`` so the prefetch reuses
+    TCP+TLS connections across all 3837 figis instead of opening a fresh
+    connection per call. Caches results in ``meta_cache`` (guarded by
+    ``meta_lock``).
     """
-    import requests
     with meta_lock:
         if ticker in meta_cache:
             return meta_cache[ticker]
+    session = _get_moex_session()
     url = f"https://iss.moex.com/iss/securities/{urllib.parse.quote(ticker)}.json"
     try:
         # (connect_timeout, read_timeout) — prevents indefinite hangs
         # when MOEX ISS accepts the TCP connection but stalls mid-response.
-        data = requests.get(url, timeout=(5, 30)).json()
+        # Default urllib3 retries are disabled at the Session adapter level
+        # so DNS hiccups surface in one 5 s attempt, not 3 × ~3.3 s.
+        data = session.get(url, timeout=(5, 30)).json()
     except Exception:
         return None
     boards = data.get("boards", {}).get("data", [])
@@ -995,19 +1043,64 @@ class BackfillRunner:
         # asyncio.to_thread (the sync _get_meta_moex calls MOEX ISS).
         # After this step, _moex_meta has entries for every ticker, so
         # _process_one_bounded can read it without blocking the loop.
+        #
+        # Concurrency bounded via Semaphore(16): MOEX ISS docs advertise
+        # ~30 req/s, 16 in flight gives ~16 RPS peak (well under the limit)
+        # and keeps the default-executor thread count low enough that
+        # futures don't pile up in the executor's internal queue. Without
+        # this cap, asyncio.gather of 3837 tasks submits all 3837 to the
+        # default ThreadPoolExecutor (~8 workers) and the rest sit in the
+        # queue until workers free — that's the original bug.
+        #
+        # Per-figi self._log ensures a stalled prefetch is visible in
+        # the structured log as a silence-pattern (the systematic-debugging
+        # skill's "silent swallow" red flag — the 2026-09-23 symptom was
+        # zero log lines between backfill_moex phase_start and watchdog
+        # kill, 10 min later).
+        _prefetch_sem = asyncio.Semaphore(16)
+        prefetch_done = 0
+
         async def _prefetch_meta(inst: dict) -> None:
+            nonlocal prefetch_done
             ticker = inst.get("ticker") or ""
-            if ticker:
-                # 30s per-ticker timeout — if MOEX ISS hangs on one ticker,
-                # we don't want to block the whole prefetch.
-                try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(_get_meta, ticker),
-                        timeout=30.0,
+            figi = inst.get("figi")
+            if not ticker:
+                return
+            t0 = time.monotonic()
+            result = "ok"
+            try:
+                async with _prefetch_sem:
+                    try:
+                        # 30s per-ticker timeout — if MOEX ISS hangs on one
+                        # ticker, we don't want to block the whole prefetch.
+                        # (30s is the upper bound; the underlying TCP read
+                        # timeout is 30s and connect is 5s.)
+                        await asyncio.wait_for(
+                            asyncio.to_thread(_get_meta, ticker),
+                            timeout=30.0,
+                        )
+                    except asyncio.TimeoutError:
+                        result = "timeout"
+                    except Exception as e:
+                        result = f"err:{type(e).__name__}"
+            finally:
+                prefetch_done += 1
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                # Log every N=50 + first 5 + last 5 so we don't flood
+                # ingestion_logs but a stalled prefetch shows up as
+                # missing incremental progress. The first and last are
+                # always logged.
+                if prefetch_done <= 5 or prefetch_done % 50 == 0 \
+                        or prefetch_done == len(instruments):
+                    await self._log(
+                        "info",
+                        figi=figi,
+                        message=(
+                            f"prefetch_meta {result} "
+                            f"progress={prefetch_done}/{len(instruments)} "
+                            f"elapsed_ms={elapsed_ms}"
+                        ),
                     )
-                except asyncio.TimeoutError:
-                    pass  # Cache will be empty for this ticker; _process_one
-                    # will fall back to Tinkoff as before.
 
         await asyncio.gather(*[_prefetch_meta(inst) for inst in instruments])
 
