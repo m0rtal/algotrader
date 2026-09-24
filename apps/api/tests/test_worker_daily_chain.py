@@ -89,11 +89,19 @@ def _patch_all_steps(monkeypatch, *, results: dict | None = None):
 
 
 def test_chain_runs_all_8_phases_in_order(monkeypatch):
+    """After ml-data-readiness PR-2 decomposition, both subsets together
+    cover all 8 phases in the documented order. Run each subset
+    explicitly via the ``subset`` kwarg so the test exercises the full
+    chain end-to-end."""
     worker, calls = _patch_all_steps(monkeypatch)
 
-    rc = worker.run_daily_chain()
+    # First subset: migrations → gap_recovery.
+    rc0 = worker.run_daily_chain(subset="first")
+    # Derived subset: corporate_actions → guardian.
+    rc1 = worker.run_daily_chain(subset="derived")
 
-    assert rc == 0
+    assert rc0 == 0
+    assert rc1 == 0
     expected = [
         "migrations",
         "universe_sync",
@@ -122,7 +130,8 @@ def test_chain_aborts_when_backfill_moex_shrinks_bars(monkeypatch):
         },
     )
 
-    rc = worker.run_daily_chain()
+    # ml-data-readiness PR-2: backfill_moex lives in the "first" subset.
+    rc = worker.run_daily_chain(subset="first")
 
     assert rc == 1
     actual = [c[0] for c in calls]
@@ -153,7 +162,8 @@ def test_chain_continues_past_dividends_failure(monkeypatch):
         },
     )
 
-    rc = worker.run_daily_chain()
+    # ml-data-readiness PR-2: dividends is in the "derived" subset.
+    rc = worker.run_daily_chain(subset="derived")
 
     assert rc == 1  # degraded, but chain completed
     actual = [c[0] for c in calls]
@@ -179,7 +189,8 @@ def test_chain_aborts_when_backfill_moex_fails(monkeypatch):
         },
     )
 
-    rc = worker.run_daily_chain()
+    # ml-data-readiness PR-2: backfill_moex is in the "first" subset.
+    rc = worker.run_daily_chain(subset="first")
 
     assert rc == 1
     actual = [c[0] for c in calls]

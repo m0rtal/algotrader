@@ -52,7 +52,9 @@ def _init_pipeline_log(db_path: Path) -> None:
 
 
 def test_run_daily_chain_executes_all_phases_in_order(tmp_path: Path):
-    """All 6 phases run in the documented order."""
+    """After ml-data-readiness PR-2 decomposition, the ``first`` subset
+    covers the legacy 4-phase half (migrations → gap_recovery). Run both
+    subsets via the kwarg to verify all phases in order end-to-end."""
     _init_pipeline_log(tmp_path / "test.db")
 
     calls: list[str] = []
@@ -71,7 +73,8 @@ def test_run_daily_chain_executes_all_phases_in_order(tmp_path: Path):
         with patch("worker.get_settings") as gs, \
              patch("worker.setup_logging"):
             gs.return_value = MagicMock(sqlite_path=str(tmp_path / "test.db"))
-            run_daily_chain()
+            run_daily_chain(subset="first")
+            run_daily_chain(subset="derived")
 
     assert calls == list(_DAILY_CHAIN_PHASES)
 
@@ -103,7 +106,8 @@ def test_run_daily_chain_aborts_on_phase_failure(tmp_path: Path):
         with patch("worker.get_settings") as gs, \
              patch("worker.setup_logging"):
             gs.return_value = MagicMock(sqlite_path=str(tmp_path / "test.db"))
-            rc = run_daily_chain()
+            # ml-data-readiness PR-2: backfill_moex is in the "first" subset.
+            rc = run_daily_chain(subset="first")
 
     assert rc == 1
     assert "backfill_moex" in calls
@@ -113,7 +117,10 @@ def test_run_daily_chain_aborts_on_phase_failure(tmp_path: Path):
 
 
 def test_run_daily_chain_logs_each_step_to_pipeline_log(tmp_path: Path):
-    """Every successful phase writes a row with result='ok'."""
+    """Every successful phase writes a row with result='ok'.
+
+    ml-data-readiness PR-2: runs both subsets so the union covers all
+    8 phases."""
     db_path = tmp_path / "test.db"
     _init_pipeline_log(db_path)
 
@@ -135,7 +142,8 @@ def test_run_daily_chain_logs_each_step_to_pipeline_log(tmp_path: Path):
         with patch("worker.get_settings") as gs, \
              patch("worker.setup_logging"):
             gs.return_value = MagicMock(sqlite_path=str(db_path))
-            run_daily_chain()
+            run_daily_chain(subset="first")
+            run_daily_chain(subset="derived")
 
     conn = sqlite3.connect(str(db_path))
     rows = conn.execute(

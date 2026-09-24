@@ -29,7 +29,14 @@ start_guard() {
     echo "[startup] starting $name"
 }
 
-# ---- 1. supervisor-managed worker (moex-backfill chain) ----
+# ---- 1. supervisor-managed workers (first + derived subsets) ----
+# ml-data-readiness PR-2 (2026-09-24): the daily chain is decomposed
+# into two independently-runnable subsets. The "first" subset keeps the
+# historic algotrader-moex-backfill slot (data-acquisition core). The
+# new "derived" slot (algotrader-derived) runs corporate_actions,
+# dividends, freshness_check, and guardian so they do NOT block behind
+# a slow backfill_moex. Both slots share SQLite via WAL mode with 5s
+# busy_timeout.
 if ! pgrep -f 'worker.py daily' >/dev/null 2>&1; then
     nohup bash "$PROJECT/scripts/algotrader-supervisor.sh" \
         algotrader-moex-backfill \
@@ -39,6 +46,22 @@ if ! pgrep -f 'worker.py daily' >/dev/null 2>&1; then
     echo "[startup] worker launched (pid $!)"
 else
     echo "[startup] worker already running"
+fi
+
+# ml-data-readiness PR-2: spawn the derived subset in parallel. It runs
+# the corporate_actions / dividends / freshness_check / guardian phases
+# which historically waited 39+ hours behind a stalled backfill_moex.
+# Distinct supervisor slot (algotrader-derived) so its watchdog does not
+# interfere with the algotrader-moex-backfill watchdog.
+if ! pgrep -f 'worker.py daily derived' >/dev/null 2>&1; then
+    nohup bash "$PROJECT/scripts/algotrader-supervisor.sh" \
+        algotrader-derived \
+        "$PY" worker.py daily derived "$API_DIR" \
+        >> "$LOG_DIR/algotrader-derived.log" 2>&1 &
+    disown
+    echo "[startup] derived worker launched (pid $!)"
+else
+    echo "[startup] derived worker already running"
 fi
 
 # Give worker 8s to release DB write-lock for migration phase.
