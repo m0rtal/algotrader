@@ -60,12 +60,24 @@ class _CallRecorder:
         return []
 
 
-def _seed_db(db_path: str, figis: list[tuple[str, str, str]]) -> None:
+def _seed_db(
+    db_path: str,
+    figis: list[tuple[str, str, str]],
+    *,
+    bars_through: date | None = None,
+) -> date:
     """Create a minimal schema with one or more figis + bars through
-    2026-09-21. 2026-09-22 (Mon) is the only missing trading day.
+    ``bars_through`` (default: ``date.today() - timedelta(days=1)``).
+    The day after is the only missing trading day at the end of the
+    window.
+
+    Returns ``bars_through`` so callers can compute the expected
+    ``yesterday`` / missing-window dates without hardcoding them.
 
     ``figis`` is a list of (figi, ticker, listed_from) tuples.
     """
+    yesterday = date.today() - timedelta(days=1)
+    end = bars_through or yesterday
     con = sqlite3.connect(db_path)
     try:
         con.executescript(
@@ -117,10 +129,10 @@ def _seed_db(db_path: str, figis: list[tuple[str, str, str]]) -> None:
                 "VALUES (?, ?, 'share', ?, '2099-12-31')",
                 (figi, ticker, listed_from),
             )
-            # Bars through 2026-09-21 (weekdays only). 2026-09-22 is
-            # the only missing trading day at the end of the window.
+            # Bars through ``end`` (weekdays only). The day after
+            # ``end`` is the only missing trading day at the end of
+            # the window.
             cur = date(2014, 1, 1)
-            end = date(2026, 9, 21)
             while cur <= end:
                 if cur.weekday() < 5:
                     con.execute(
@@ -138,6 +150,7 @@ def _seed_db(db_path: str, figis: list[tuple[str, str, str]]) -> None:
         con.commit()
     finally:
         con.close()
+    return end
 
 
 # ─── Driver ───────────────────────────────────────────────────────
@@ -202,7 +215,17 @@ async def test_tinkoff_fallback_uses_only_missing_dates_window():
     """
     with tempfile.TemporaryDirectory() as td:
         db_path = str(Path(td) / "test.db")
-        _seed_db(db_path, [("BBG000000001", "TEST", "2014-01-01")])
+        # Seed bars through 2 days before yesterday so the only gap is
+        # yesterday (a weekday). For example, on a Thursday seed bars
+        # through Tuesday, leaving Wednesday as the missing day.
+        yesterday = date.today() - timedelta(days=1)
+        bars_through = yesterday - timedelta(days=1)
+        while bars_through.weekday() >= 5:
+            bars_through -= timedelta(days=1)
+        _seed_db(
+            db_path, [("BBG000000001", "TEST", "2014-01-01")],
+            bars_through=bars_through,
+        )
         recorder = _CallRecorder()
 
         await _drive_backfill_from_moex(db_path, recorder)
@@ -213,13 +236,13 @@ async def test_tinkoff_fallback_uses_only_missing_dates_window():
         figi, ticker, from_d, to_d = recorder.calls[0]
         assert figi == "BBG000000001"
         assert ticker == "TEST"
-        assert from_d == date(2026, 9, 22), (
+        assert from_d == yesterday, (
             f"_fetch_tinkoff_fallback called with from_d={from_d}, "
             f"ticker={ticker}. The fix should make it min(missing) = "
-            f"2026-09-22 (NOT 2014-01-01). Regression: Tinkoff walks "
+            f"{yesterday} (NOT 2014-01-01). Regression: Tinkoff walks "
             f"the full history."
         )
-        assert to_d == date(2026, 9, 22)
+        assert to_d == yesterday
 
 
 @pytest.mark.asyncio
@@ -230,12 +253,15 @@ async def test_tinkoff_fallback_skips_when_no_missing_dates():
     """
     with tempfile.TemporaryDirectory() as td:
         db_path = str(Path(td) / "test.db")
-        _seed_db(db_path, [("BBG000000001", "TEST", "2014-01-01")])
-        # Add 2026-09-22 to bars so there are no missing dates.
+        bars_through = _seed_db(
+            db_path, [("BBG000000001", "TEST", "2014-01-01")],
+        )
+        # Add the next-day bar so there are no missing dates.
         con = sqlite3.connect(db_path)
         con.execute(
             "INSERT INTO bars(figi, ts, open, high, low, close, volume, source) "
-            "VALUES ('BBG000000001', '2026-09-22', 100, 101, 99, 100, 1000, 'tinkoff')"
+            "VALUES ('BBG000000001', ?, 100, 101, 99, 100, 1000, 'tinkoff')",
+            ((bars_through + timedelta(days=1)).isoformat(),),
         )
         con.commit()
         con.close()
@@ -275,16 +301,30 @@ async def test_tinkoff_fallback_bounded_when_listed_from_empty():
     with tempfile.TemporaryDirectory() as td:
         db_path = str(Path(td) / "test.db")
         _seed_db(db_path, [("BBG000000001", "TEST", "2014-01-01")])
+        # Pick a weekday near the trailing edge of the seeded window
+        # (3 weekdays back from yesterday). After DELETE-ing bars on
+        # and after that weekday, gap_anchor is the earliest missing
+        # trading day — min(missing) = gap_anchor.
+        yesterday = date.today() - timedelta(days=1)
+        gap_anchor = yesterday
+        # Walk back 3 weekdays.
+        for _ in range(3):
+            gap_anchor -= timedelta(days=1)
+            while gap_anchor.weekday() >= 5:
+                gap_anchor -= timedelta(days=1)
+        expected_from_d = gap_anchor
+
         con = sqlite3.connect(db_path)
         # Set listed_from = '' (the empty-string default that the
         # closure falls back to).
         con.execute(
             "UPDATE instruments SET listed_from = '' WHERE figi = 'BBG000000001'"
         )
-        # 2026-09-21 is a Monday. Remove Mon+Tue of the trailing week so
-        # the figi has a recent gap (last bar = Friday 2026-09-18).
+        # Remove bars on and after gap_anchor so the figi has a recent
+        # gap. The last bar is then the weekday before gap_anchor.
         con.execute(
-            "DELETE FROM bars WHERE figi='BBG000000001' AND ts >= '2026-09-21'"
+            "DELETE FROM bars WHERE figi='BBG000000001' AND ts >= ?",
+            (gap_anchor.isoformat(),),
         )
         con.commit()
         con.close()
@@ -294,12 +334,12 @@ async def test_tinkoff_fallback_bounded_when_listed_from_empty():
 
         # Either Tinkoff was not called (figi is complete), or it was
         # called with from_d = the trading day after the most recent bar.
-        # Bars end on 2026-09-18, so min(missing) is 2026-09-21.
         if recorder.calls:
             _, _, from_d, _to_d = recorder.calls[0]
-            assert from_d == date(2026, 9, 21), (
-                f"from_d={from_d} — figi has bars through 2026-09-18, "
-                f"so the next missing trading day is 2026-09-21. The "
-                f"fix must use compute_missing_dates() to bound the "
-                f"window — not 2014-01-01."
+            assert from_d == expected_from_d, (
+                f"from_d={from_d} — figi's most recent bar is the "
+                f"weekday before {gap_anchor}, so the next missing "
+                f"trading day is {expected_from_d}. The fix must use "
+                f"compute_missing_dates() to bound the window — "
+                f"not 2014-01-01."
             )
