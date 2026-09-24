@@ -226,6 +226,19 @@ def _stale_breakdown(db_path: str) -> dict:
             except (TypeError, ValueError):
                 age_hours[phase] = None
 
+        # ml-throttling PR-3 (2026-09-24): Surface the retry-queue
+        # size so operators see "dividends are behind" at a glance.
+        # The queue table was added in migration 022; older DBs (or
+        # fresh test fixtures that haven't run migrations yet)
+        # legitimately don't have it. Fail-soft: return 0 instead
+        # of 500-ing the dashboard.
+        try:
+            dividends_pending_retry = conn.execute(
+                "SELECT COUNT(*) FROM dividends_throttle_pending"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            dividends_pending_retry = 0
+
         return {
             "as_of": today.isoformat(),
             "yesterday": yesterday.isoformat(),
@@ -242,6 +255,7 @@ def _stale_breakdown(db_path: str) -> dict:
                 "samples_no_bars": no_bars[:10],
             },
             "pipeline_age_hours": age_hours,
+            "dividends_pending_retry": dividends_pending_retry,
         }
     finally:
         conn.close()
