@@ -30,10 +30,12 @@ class Settings(BaseSettings):
 
     cors_origins: str = '["http://localhost:5173","http://192.168.1.101:5173"]'
 
-    # OpenTelemetry
-    otel_endpoint: str = "http://localhost:4317"
-    otel_service_name: str = "algotrader-api"
-    otel_resource_attributes: str = "service.version=0.1.0,deployment.environment=dev"
+    # PR #126 (2026-09-24): removed ``otel_endpoint``,
+    # ``otel_service_name``, ``otel_resource_attributes``. Tracing is
+    # disabled (no collector deployed, structlog already records
+    # duration_ms for every HTTP request). Settings kept defined names
+    # in pydantic-settings are read-only — we delete them rather than
+    # leave them as dead config.
 
     @property
     def sqlite_path(self) -> str:

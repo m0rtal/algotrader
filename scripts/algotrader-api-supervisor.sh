@@ -28,21 +28,6 @@ PIDFILE="/home/hermes/algotrader/apps/api/data/${NAME}.pid"
 APPS_API="/home/hermes/algotrader/apps/api"
 UVICORN="${APPS_API}/.venv/bin/uvicorn"
 HEALTH_URL="http://127.0.0.1:${PORT}/health"
-
-# PR #125 (2026-09-24): disable OpenTelemetry SDK by default.
-# The app configures ``OTLPSpanExporter(endpoint=http://localhost:4317)``
-# at module level. When no OTel collector is listening on that port, the
-# BatchSpanProcessor's background export thread gets stuck in an
-# exponential-backoff retry loop against a refused TCP connection. The
-# thread join in ``processor.shutdown()`` then blocks uvicorn's lifespan
-# exit, so the api-supervisor watchdog sees /health fail (or hangs on
-# shutdown), kills uvicorn with SIGKILL, and enters a tight restart loop
-# that never converges. Set ``OTEL_SDK_DISABLED=true`` so the exporter
-# is a no-op. Operators who *do* run a collector can override this by
-# exporting ``ALGOTRADER_API_OTEL=1`` before launching the supervisor.
-if [ -z "${ALGOTRADER_API_OTEL:-}" ]; then
-  export OTEL_SDK_DISABLED=true
-fi
 HEALTH_TIMEOUT_S=3
 HEALTH_MAX_AGE_S=30   # 3 failed health checks → kill
 
