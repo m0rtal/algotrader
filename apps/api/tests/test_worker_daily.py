@@ -66,10 +66,10 @@ def test_run_daily_chain_executes_all_phases_in_order(tmp_path: Path):
     fake_steps = {phase: make_step(phase) for phase in _DAILY_CHAIN_PHASES}
 
     with patch.dict(_STEP_FUNCS, fake_steps, clear=True):
+        # PR #128 (2026-09-24): setup_tracing/shutdown_tracing removed
+        # from worker.py; their patches here dropped alongside.
         with patch("worker.get_settings") as gs, \
-             patch("worker.setup_logging"), \
-             patch("worker.setup_tracing"), \
-             patch("worker.shutdown_tracing"):
+             patch("worker.setup_logging"):
             gs.return_value = MagicMock(sqlite_path=str(tmp_path / "test.db"))
             run_daily_chain()
 
@@ -101,9 +101,7 @@ def test_run_daily_chain_aborts_on_phase_failure(tmp_path: Path):
 
     with patch.dict(_STEP_FUNCS, fake_steps, clear=True):
         with patch("worker.get_settings") as gs, \
-             patch("worker.setup_logging"), \
-             patch("worker.setup_tracing"), \
-             patch("worker.shutdown_tracing"):
+             patch("worker.setup_logging"):
             gs.return_value = MagicMock(sqlite_path=str(tmp_path / "test.db"))
             rc = run_daily_chain()
 
@@ -135,9 +133,7 @@ def test_run_daily_chain_logs_each_step_to_pipeline_log(tmp_path: Path):
 
     with patch.dict(step_funcs, fake_steps, clear=True):
         with patch("worker.get_settings") as gs, \
-             patch("worker.setup_logging"), \
-             patch("worker.setup_tracing"), \
-             patch("worker.shutdown_tracing"):
+             patch("worker.setup_logging"):
             gs.return_value = MagicMock(sqlite_path=str(db_path))
             run_daily_chain()
 
