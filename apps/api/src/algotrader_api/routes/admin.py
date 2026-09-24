@@ -257,6 +257,54 @@ async def data_stale_breakdown() -> dict:
     return _stale_breakdown(db_path)
 
 
+# ml-data-readiness PR-1 (2026-09-24): ML readiness visibility.
+#
+# Why this exists:
+#   Operators had to grep the database to know how much ML-ready
+#   data is on disk. This endpoint surfaces one row of summary
+#   numbers so the DataTab can show them inline:
+#     - ``rows``: tradeable rows in ``ml_features`` (the long panel)
+#     - ``min_ts`` / ``max_ts``: coverage window
+#     - ``forward_adjusted_rows``: ``bars_adjusted.adj_close IS NOT NULL``
+#       count. Will be 0 until PR-3 ships; the UI shows the value
+#       as-is (no special-casing).
+#
+# The endpoint is read-only; safe to poll (60s interval on the
+# frontend side).
+
+@router.get("/ml-readiness")
+async def ml_readiness() -> dict:
+    """ML-ready row count + last data date. Cheap; safe to poll.
+
+    Used by ``DataTab`` to show a one-line summary so operators do not
+    have to grep the database for coverage and lag. ``forward_adjusted_rows``
+    will be ``0`` until PR-3 ships ``bars_adjusted`` population; the
+    UI shows the value as-is (no special-casing).
+    """
+    db_path = _get_sqlite_path()
+    import sqlite3
+
+    from ..ml.features import row_count, date_range
+
+    rows = row_count(db_path)
+    mn, mx = date_range(db_path)
+    con = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        adj = con.execute(
+            "SELECT COUNT(*) FROM bars_adjusted "
+            "WHERE adj_close IS NOT NULL"
+        ).fetchone()[0]
+    finally:
+        con.close()
+
+    return {
+        "rows": rows,
+        "min_ts": mn,
+        "max_ts": mx,
+        "forward_adjusted_rows": adj,
+    }
+
+
 @router.get("/fetch/status")
 async def fetch_status() -> dict:
     """Quick health probe: is the broker token set in DB?
