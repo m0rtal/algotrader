@@ -30,6 +30,24 @@ THROTTLED_RPM = 10
 THROTTLE_DURATION_SEC = 300.0
 
 
+# Process-wide singleton — callers that don't need a custom rate/period
+# (the dividends fetcher, the dividends cycle, etc.) acquire() through
+# this. Tests monkeypatch the symbol to inject a fresh limiter and
+# avoid cross-test bucket state.
+_GLOBAL: RateLimiter | None = None
+_GLOBAL_LOCK = threading.Lock()
+
+
+def get_global() -> RateLimiter:
+    """Return the process-wide RateLimiter, creating it on first use."""
+    global _GLOBAL
+    if _GLOBAL is None:
+        with _GLOBAL_LOCK:
+            if _GLOBAL is None:
+                _GLOBAL = RateLimiter()
+    return _GLOBAL
+
+
 @dataclass
 class ThrottleEvent:
     """Snapshot of a throttle signal for the operator UI."""
@@ -188,3 +206,12 @@ class RateLimiter:
                 self._on_throttle(method, until)
             except Exception:
                 logger.warn("tinkoff.rate_limit.throttle_callback_failed")
+
+
+# Initialise the process-wide limiter so callers can read
+# `rl._GLOBAL` directly (and so the limit is enforced from the first
+# request after import). Without this, `rl._GLOBAL` would be `None` at
+# module-import time and tests that use `monkeypatch.setattr(rl, "_GLOBAL",
+# rl.RateLimiter(...))` would still work, but production callers reading the
+# symbol directly would see `None`.
+_GLOBAL = RateLimiter()
