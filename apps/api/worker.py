@@ -206,7 +206,13 @@ def run_backfill() -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="algotrader data-fetch worker")
+    parser = argparse.ArgumentParser(
+        description="algotrader data-fetch worker",
+        # Allow ``python worker.py daily derived`` (ml-data-readiness
+        # PR-2, 2026-09-24) without argparse rejecting the unknown
+        # 3rd positional. We accept it and dispatch inside run_daily_chain.
+        allow_abbrev=False,
+    )
     parser.add_argument(
         "mode",
         nargs="?",
@@ -216,12 +222,28 @@ def main() -> int:
             "Invocation mode. 'scheduled'/'manual' are one-shot fetch flows; "
             "'backfill' runs the persistent universe + historical backfill "
             "lifecycle (systemd-timer driven); 'guardian' runs the daily "
-            "data-quality sweep; 'daily' runs the full refresh chain "
-            "(migrations → universe sync → daily backfill → corporate "
-            "actions → dividends → guardian) — the recommended cron mode."
+            "data-quality sweep; 'daily' runs the refresh chain "
+            "(see also: optional subset positional below) — the "
+            "recommended cron mode."
         ),
     )
-    args = parser.parse_args()
+    # ml-data-readiness PR-2: optional subset selector for ``daily`` mode.
+    # Only valid values are accepted; the helper does the actual mapping
+    # (see _select_subset). argparse does not enforce here so unknown
+    # tokens surface as a clear ValueError from the worker rather than a
+    # confusing argparse error during supervisor startup.
+    parser.add_argument(
+        "subset",
+        nargs="?",
+        default=None,
+        help=(
+            "For ``daily`` mode only. 'first' (default if omitted) runs "
+            "migrations/universe_sync/backfill_moex/gap_recovery. "
+            "'derived' runs corporate_actions/dividends/freshness_check/"
+            "guardian. Unknown tokens fail loudly."
+        ),
+    )
+    args, _unknown = parser.parse_known_args()
     if args.mode == "backfill":
         return run_backfill()
     if args.mode == "guardian":
@@ -272,16 +294,56 @@ def run_guardian() -> int:
 # --------------------------------------------------------------------------- #
 
 
-_DAILY_CHAIN_PHASES = (
+# ml-data-readiness PR-2 (2026-09-24): the daily chain is now decomposed
+# into two independently-runnable subsets so derived phases
+# (corporate_actions, dividends, freshness_check, guardian) do NOT wait
+# behind a slow backfill_moex. The structural fix for the 39+ hour stall
+# documented on 2026-09-22 (corporate_actions hadn't been invoked since
+# then). Both subsets share SQLite via WAL mode with 5s busy_timeout.
+_DAILY_CHAIN_FIRST_PHASES: tuple[str, ...] = (
     "migrations",
     "universe_sync",
     "backfill_moex",      # replaces daily_backfill + full_history (MOEX ISS, dynamic listed_from→yesterday)
     "gap_recovery",
+)
+_DAILY_CHAIN_DERIVED_PHASES: tuple[str, ...] = (
     "corporate_actions",
     "dividends",
     "freshness_check",
     "guardian",
 )
+
+# Back-compat for ops scripts and any test fixture that still imports the
+# superset. Old code that iterates ``_DAILY_CHAIN_PHASES`` keeps working
+# unchanged — the union is just the historical ordering.
+_DAILY_CHAIN_PHASES: tuple[str, ...] = (
+    *_DAILY_CHAIN_FIRST_PHASES, *_DAILY_CHAIN_DERIVED_PHASES,
+)
+
+
+def _select_subset(arg: str) -> str:
+    """Map CLI token → subset name.
+
+    ``"daily"`` (default) → ``"first"`` (mirrors old behaviour).
+    Anything else (e.g. ``"derived"``) → itself. Unknown tokens raise so
+    a misconfigured cron fails loudly rather than silently doing the
+    wrong thing.
+    """
+    if arg == "daily":
+        return "first"
+    if arg in ("first", "derived"):
+        return arg
+    raise ValueError(f"unknown subset: {arg!r}")
+
+
+def _selected_phases(subset: str) -> tuple[str, ...]:
+    """Return the phase tuple that belongs to ``subset``."""
+    if subset == "first":
+        return _DAILY_CHAIN_FIRST_PHASES
+    if subset == "derived":
+        return _DAILY_CHAIN_DERIVED_PHASES
+    raise ValueError(f"unknown subset: {subset!r}")
+
 
 # Phases whose failure aborts the rest of the chain. universe_sync and
 # backfill_moex are the data-acquisition core — without them there is
@@ -745,16 +807,44 @@ _STEP_FUNCS = {
 }
 
 
-def run_daily_chain() -> int:
-    """Run the full daily refresh chain. Exits 0 on success, non-zero on
-    the first failed phase. Phases run strictly in order."""
+def run_daily_chain(subset: str | None = None) -> int:
+    """Run one subset of the daily refresh chain. Exits 0 on success,
+    non-zero on the first failed phase. Phases run strictly in order.
+
+    Subset selection (ml-data-readiness PR-2, 2026-09-24):
+      - ``python worker.py daily``        → first subset
+        (migrations, universe_sync, backfill_moex, gap_recovery)
+      - ``python worker.py daily derived`` → derived subset
+        (corporate_actions, dividends, freshness_check, guardian)
+
+    Each subset is its own long-running worker process so the derived
+    phases do not block behind a slow backfill_moex. The ``subset``
+    kwarg is only honoured in tests; production always reads it from
+    ``sys.argv[2]`` so the supervisor can spawn distinct processes.
+    """
     settings = get_settings()
     db_path = settings.sqlite_path
+
+    # ml-data-readiness PR-2: subset selector driven by argv[2] (also
+    # parsed by argparse as ``args.subset`` — we use the raw argv so the
+    # selector works even if main() is bypassed by tests). The
+    # historical default ``python worker.py daily`` continues to run
+    # the first subset, preserving back-compat with the existing
+    # supervisor slot and any operator cron.
+    if subset is None:
+        subset = _select_subset(
+            sys.argv[2] if len(sys.argv) > 2 else "daily"
+        )
+    else:
+        subset = _select_subset(subset)
+    phases = _selected_phases(subset)
 
     setup_logging(level=settings.log_level, health_sample_rate=1.0)
     # PR #128 (2026-09-24): removed ``setup_tracing(...)``. See above.
 
-    logger.info("worker.daily.start", sqlite=db_path)
+    logger.info(
+        "worker.daily.start", sqlite=db_path, subset=subset, phases=list(phases),
+    )
 
     # Heartbeat daemon (autonomous-chain-recovery phase 2):
     # supervisor polls the DB every 30s for heartbeat freshness and
@@ -770,7 +860,7 @@ def run_daily_chain() -> int:
     rc = 0
     failed_phases: list[str] = []
     try:
-        for phase in _DAILY_CHAIN_PHASES:
+        for phase in phases:
             logger.info("worker.daily.phase_start", phase=phase)
             step_fn = _STEP_FUNCS[phase]
             ok, detail = step_fn(db_path)
