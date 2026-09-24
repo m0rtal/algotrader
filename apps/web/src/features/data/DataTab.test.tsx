@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -48,6 +48,31 @@ const defaultPending = {
   up_to_date: 12,
   error: 0,
   total: 16,
+};
+
+// PR #130 (2026-09-24): default response for the multi-level stale
+// breakdown. Numbers are deliberately non-zero (and the
+// corporate-actions age is 38h, matching what production was
+// showing at merge time) so the visible UI text reads naturally.
+// Individual tests override specific fields when they want to assert
+// a different number in the breakdown card.
+const defaultStaleBreakdown = {
+  as_of: '2026-09-24',
+  yesterday: '2026-09-23',
+  bars: {
+    fresh_or_today: 1234,
+    stale_more_than_1_day: 1008,
+    stale_more_than_2_days: 1561,
+    no_bars_ever: 35,
+    tradable_total: 3838,
+    samples_stale_1d: [['F1', 'TICKER1', 'bond']],
+    samples_stale_2d: [['F2', 'TICKER2', 'bond']],
+    samples_no_bars: [['F3', 'TICKER3', 'bond']],
+  },
+  pipeline_age_hours: {
+    corporate_actions: 38.4,
+    dividends: 38.4,
+  },
 };
 
 const sampleTickers = [
@@ -105,7 +130,15 @@ function makeWrapper() {
   return Wrapper;
 }
 
-const Wrap = makeWrapper();
+// PR #130: each test gets its own QueryClient (and thus its own
+// cache) to avoid stale React Query state from previous tests
+// poisoning the assertions in tests that override MSW handlers.
+// Storing the wrapper in a module-level const meant every test
+// shared one cache; the second test to render would resolve from
+// cache, not from MSW, and assertions like "I set stale_more_than_1_day
+// to 42" silently failed. We rebuild the wrapper per test instead.
+let currentWrapper: ReturnType<typeof makeWrapper>;
+let Wrap: ReturnType<typeof makeWrapper>;
 
 describe('DataTab', () => {
   beforeEach(() => {
@@ -113,6 +146,9 @@ describe('DataTab', () => {
     // test (e.g. the running-status override) do not leak into the
     // current test's MSW responses.
     server.resetHandlers();
+    // PR #130: build a fresh wrapper per test so the React Query
+    // cache from the previous test does not leak through.
+    Wrap = makeWrapper();
     server.use(
       http.get('/api/admin/backfill/status', () =>
         HttpResponse.json(defaultStatus),
@@ -121,6 +157,12 @@ describe('DataTab', () => {
         HttpResponse.json(defaultPending),
       ),
       http.get('/api/tickers', () => HttpResponse.json(sampleTickers)),
+      // PR #130 (2026-09-24): multi-level stale breakdown endpoint.
+      // Default to a healthy response — individual tests can re-use
+      // the same handler with custom numbers to pin specific UI text.
+      http.get('/api/admin/data-stale-breakdown', () =>
+        HttpResponse.json(defaultStaleBreakdown),
+      ),
       http.post('/api/admin/backfill/stop', () =>
         HttpResponse.json({ ok: true }),
       ),
@@ -495,5 +537,139 @@ describe('DataTab', () => {
     );
     const periodValue = periodLabels[0].parentElement?.querySelector('p:nth-of-type(2)');
     expect(periodValue?.textContent?.trim()).toMatch(/^с\s+2013/);
+  });
+
+  // ─── PR #130: multi-level stale indicator ────────────────────────
+
+  it('renders the multi-level stale breakdown card with bucket counts', async () => {
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+    // Each bucket label is unique. The card should be present once
+    // the useStaleBreakdown query resolves.
+    const card = await screen.findByTestId('data-stale-breakdown');
+    expect(card).toBeInTheDocument();
+    // "Свежие" + "Устаревшие (>1 дн)" + "Устаревшие (>2 дн)" + "Без баров"
+    // are all inside the card. The regex strings live in a sibling
+    // `.ts` file because Hermes's TSX parser sees the leading ``/>``
+    // inside a regex literal as a closing JSX tag.
+    expect(within(card).getByText(/^Свежие$/)).toBeInTheDocument();
+    // Use a callback matcher to dodge JSX ambiguity around the
+    // ``/>`` in ``>1`` (the leading ``/>`` confuses Hermes's TSX
+    // parser). The callback only needs the substring.
+    const matchesU1 = (content: string) =>
+      content.includes('Устаревшие (>1 дн)');
+    const matchesU2 = (content: string) =>
+      content.includes('Устаревшие (>2 дн)');
+    expect(within(card).getByText(matchesU1)).toBeInTheDocument();
+    expect(within(card).getByText(matchesU2)).toBeInTheDocument();
+    expect(within(card).getByText(/^Без баров$/)).toBeInTheDocument();
+  });
+
+  it('renders the operator-specific 1-day stale bucket count', async () => {
+    // The operator asked for "устаревшие (>1 день)" specifically.
+    // This test pins that the bucket value is visible in the UI,
+    // not buried under a fold or hidden behind a "show more" link.
+    server.resetHandlers();
+    server.use(
+      http.get('/api/admin/backfill/status', () =>
+        HttpResponse.json(defaultStatus),
+      ),
+      http.get('/api/admin/backfill/pending', () =>
+        HttpResponse.json(defaultPending),
+      ),
+      http.get('/api/tickers', () => HttpResponse.json(sampleTickers)),
+      http.get('/api/admin/data-stale-breakdown', () =>
+        HttpResponse.json({
+          ...defaultStaleBreakdown,
+          bars: {
+            ...defaultStaleBreakdown.bars,
+            stale_more_than_1_day: 42,
+          },
+        }),
+      ),
+    );
+
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+
+    const bucket = await screen.findByTestId('bars-stale-1d');
+    expect(bucket).toHaveTextContent('42');
+  });
+
+  it('shows corporate-actions age in human-readable form', async () => {
+    // 38.4h becomes "1д 14ч" (more than 24h, less than 48h).
+    server.resetHandlers();
+    server.use(
+      http.get('/api/admin/backfill/status', () =>
+        HttpResponse.json(defaultStatus),
+      ),
+      http.get('/api/admin/backfill/pending', () =>
+        HttpResponse.json(defaultPending),
+      ),
+      http.get('/api/tickers', () => HttpResponse.json(sampleTickers)),
+      http.get('/api/admin/data-stale-breakdown', () =>
+        HttpResponse.json({
+          ...defaultStaleBreakdown,
+          pipeline_age_hours: {
+            corporate_actions: 38.4,
+            dividends: 38.4,
+          },
+        }),
+      ),
+    );
+
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+
+    const corp = await screen.findByTestId('pipeline-age-corp-actions');
+    // The exact Russian phrasing is governed by formatPipelineAge;
+    // we only assert it's not the placeholder dash and contains the
+    // expected 'д' (days) character.
+    expect(corp.textContent).not.toBe('—');
+    expect(corp.textContent).toMatch(/д/);
+  });
+
+  it('shows em-dash placeholder when pipeline has never run', async () => {
+    // Important: if corporate_actions has never logged a successful
+    // run, the UI must NOT show a misleading '0 часов' (which would
+    // imply 'just ran'). The em-dash tells the operator the truth:
+    // 'we have no data point yet'.
+    server.resetHandlers();
+    server.use(
+      http.get('/api/admin/backfill/status', () =>
+        HttpResponse.json(defaultStatus),
+      ),
+      http.get('/api/admin/backfill/pending', () =>
+        HttpResponse.json(defaultPending),
+      ),
+      http.get('/api/tickers', () => HttpResponse.json(sampleTickers)),
+      http.get('/api/admin/data-stale-breakdown', () =>
+        HttpResponse.json({
+          ...defaultStaleBreakdown,
+          pipeline_age_hours: {
+            corporate_actions: null,
+            dividends: null,
+          },
+        }),
+      ),
+    );
+
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+
+    const corp = await screen.findByTestId('pipeline-age-corp-actions');
+    expect(corp.textContent).toBe('—');
   });
 });

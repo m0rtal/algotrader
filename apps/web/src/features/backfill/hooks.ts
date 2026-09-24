@@ -55,6 +55,47 @@ export function usePendingCount(refetchInterval = 60_000) {
   });
 }
 
+// PR #130 (2026-09-24): multi-level stale breakdown.
+//
+// Replaces the single ``pending.stale`` (2-day threshold) with three
+// buckets the operator actually cares about:
+// - ``fresh_or_today``: today-or-yesterday bars; no action needed
+// - ``stale_more_than_1_day``: bars from the day before yesterday
+//   (this is the bucket the user asked for — anything that lags
+//   yesterday gets a callout)
+// - ``stale_more_than_2_days``: figis that haven't moved despite
+//   multiple worker cycles
+//
+// Plus pipeline age for corporate_actions and dividends, so the
+// operator can see when the chain last reached those phases without
+// grepping the logs.
+export type StaleBreakdown = {
+  as_of: string;
+  yesterday: string;
+  bars: {
+    fresh_or_today: number;
+    stale_more_than_1_day: number;
+    stale_more_than_2_days: number;
+    no_bars_ever: number;
+    tradable_total: number;
+    samples_stale_1d: Array<[string, string, string]>;
+    samples_stale_2d: Array<[string, string, string]>;
+    samples_no_bars: Array<[string, string, string]>;
+  };
+  pipeline_age_hours: {
+    corporate_actions: number | null;
+    dividends: number | null;
+  };
+};
+
+export function useStaleBreakdown(refetchInterval = 60_000) {
+  return useQuery<StaleBreakdown>({
+    queryKey: ['admin-stale-breakdown'],
+    queryFn: () => api<StaleBreakdown>('/admin/data-stale-breakdown'),
+    refetchInterval,
+  });
+}
+
 export function useForceReset() {
   const qc = useQueryClient();
   return useMutation<{ deleted_rows: number }, Error, void>({

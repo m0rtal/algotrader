@@ -8,12 +8,47 @@ import {
   useStartBackfill,
   useStopBackfill,
   useForceReset,
+  useStaleBreakdown,
 } from '@features/backfill/hooks';
+
+// PR #130 (2026-09-24): format pipeline-age hours into a friendly
+// relative-time label for the DataTab. Returns "—" if the chain
+// has never finished that phase (None from the API). Once we have
+// data, "2ч 13м" / "1д 4ч" tells the operator at a glance whether
+// the sweep ran today or a couple days ago.
+function formatPipelineAge(hours: number | null): string {
+  if (hours === null || hours === undefined) return '—';
+  if (hours < 1) {
+    return `${Math.max(1, Math.round(hours * 60))}м`;
+  }
+  if (hours < 24) {
+    const h = Math.floor(hours);
+    const m = Math.round((hours - h) * 60);
+    return m === 0 ? `${h}ч` : `${h}ч ${m}м`;
+  }
+  const days = Math.floor(hours / 24);
+  const h = Math.round(hours - days * 24);
+  return h === 0 ? `${days}д` : `${days}д ${h}ч`;
+}
+
+// Stale indicator colour: red-tinged if either buckets hold a real
+// number of items, neutral otherwise. Green means everything is
+// fresh; red means it's high time to look at the worker logs.
+function staleToneClass(hasStale1d: number, hasStale2d: number): string {
+  if (hasStale2d > 0) return 'text-red-400';
+  if (hasStale1d > 0) return 'text-amber-400';
+  return 'text-green-400';
+}
 
 export function DataTab() {
   const { data: status, isLoading: statusLoading } = useBackfillStatus();
   const { data: pending } = usePendingCount();
   const { data: tickers, isLoading: tickersLoading } = useTickers();
+  // PR #130 (2026-09-24): pull the multi-level stale breakdown so
+  // we can render "устаревшие (>1 день)" — the operator asked for
+  // this bucket specifically after the single "stale" count of 4
+  // hid ~1000 figis that lag yesterday.
+  const { data: staleBreakdown } = useStaleBreakdown();
   const start = useStartBackfill();
   const stop = useStopBackfill();
   const reset = useForceReset();
@@ -138,7 +173,7 @@ export function DataTab() {
         </div>
       </section>
 
-      {/* Section 2 — Backfill queue (write) */}
+      {/* Section 2 — Backfill queue + multi-level stale (read+write) */}
       <section
         data-testid="data-queue"
         className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4 space-y-4"
@@ -176,6 +211,136 @@ export function DataTab() {
               </div>
             </div>
           </>
+        )}
+
+        {/* PR #130: multi-level stale breakdown — the numbers the
+            operator actually wants. Rendered as a three-up grid next
+            to the queue counts so the contrast between "4 stale" and
+            "1008 stale" is visible without drill-down. */}
+        {staleBreakdown && (
+          <div
+            data-testid="data-stale-breakdown"
+            className="rounded border border-[var(--border)] p-3 space-y-2"
+          >
+            <p className="text-xs text-[var(--muted-foreground)] uppercase tracking-wide">
+              Устаревание баров (по состоянию на {staleBreakdown.as_of})
+            </p>
+            <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+              <div>
+                <p className="text-[var(--muted-foreground)] uppercase tracking-wide">
+                  Свежие
+                </p>
+                <p
+                  className={
+                    'font-mono text-base mt-1 ' +
+                    staleToneClass(
+                      staleBreakdown.bars.stale_more_than_1_day,
+                      staleBreakdown.bars.stale_more_than_2_days,
+                    )
+                  }
+                  data-testid="bars-fresh"
+                >
+                  {staleBreakdown.bars.fresh_or_today}
+                </p>
+                <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">
+                  сегодня / вчера
+                </p>
+              </div>
+              <div>
+                <p className="text-[var(--muted-foreground)] uppercase tracking-wide">
+                  Устаревшие (&gt;1 дн)
+                </p>
+                <p
+                  className={
+                    'font-mono text-base mt-1 ' +
+                    staleToneClass(
+                      staleBreakdown.bars.stale_more_than_1_day,
+                      staleBreakdown.bars.stale_more_than_2_days,
+                    )
+                  }
+                  data-testid="bars-stale-1d"
+                >
+                  {staleBreakdown.bars.stale_more_than_1_day}
+                </p>
+                <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">
+                  отстают на 1 день
+                </p>
+              </div>
+              <div>
+                <p className="text-[var(--muted-foreground)] uppercase tracking-wide">
+                  Устаревшие (&gt;2 дн)
+                </p>
+                <p
+                  className={
+                    'font-mono text-base mt-1 ' +
+                    staleToneClass(
+                      staleBreakdown.bars.stale_more_than_1_day,
+                      staleBreakdown.bars.stale_more_than_2_days,
+                    )
+                  }
+                  data-testid="bars-stale-2d"
+                >
+                  {staleBreakdown.bars.stale_more_than_2_days}
+                </p>
+                <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">
+                  2+ дня без обновления
+                </p>
+              </div>
+              <div>
+                <p className="text-[var(--muted-foreground)] uppercase tracking-wide">
+                  Без баров
+                </p>
+                <p className="font-mono text-base mt-1 text-amber-400" data-testid="bars-no-bars">
+                  {staleBreakdown.bars.no_bars_ever}
+                </p>
+                <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">
+                  нет данных вовсе
+                </p>
+              </div>
+            </div>
+
+            {/* PR #130: corporate-actions / dividends pipeline age.
+                The previous UI only had the generic "freshness" flag
+                from /admin/data-pipeline/status which was hidden in a
+                folded block. The operator screen should call out when
+                corporate actions last ran in plain language so we
+                don't need to dig through /admin/data-pipeline/status
+                logs to answer "shouldn't this be running on its own?". */}
+            <div className="pt-2 border-t border-[var(--border)] grid grid-cols-2 gap-2 text-xs">
+              <div>
+                <p className="text-[var(--muted-foreground)] uppercase tracking-wide">
+                  Корп. действия
+                </p>
+                <p
+                  className="font-mono text-base mt-1"
+                  data-testid="pipeline-age-corp-actions"
+                >
+                  {formatPipelineAge(
+                    staleBreakdown.pipeline_age_hours.corporate_actions,
+                  )}
+                </p>
+                <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">
+                  с последней фазы
+                </p>
+              </div>
+              <div>
+                <p className="text-[var(--muted-foreground)] uppercase tracking-wide">
+                  Дивиденды
+                </p>
+                <p
+                  className="font-mono text-base mt-1"
+                  data-testid="pipeline-age-dividends"
+                >
+                  {formatPipelineAge(
+                    staleBreakdown.pipeline_age_hours.dividends,
+                  )}
+                </p>
+                <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">
+                  с последней фазы
+                </p>
+              </div>
+            </div>
+          </div>
         )}
 
         {/* Progress bar — visible only while a run is in progress. */}
