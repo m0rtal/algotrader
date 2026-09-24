@@ -96,6 +96,167 @@ async def data_pipeline_status() -> dict:
     return {"last_run": last_run, "freshness": freshness}
 
 
+# PR #130 (2026-09-24): Multi-level stale indicator for the DataTab.
+#
+# Why this exists:
+#   The operator screen showed only ``pending_counts.stale=4`` — a
+#   2-day threshold that hid the real picture. Operationally we
+#   care about three different stalenesses, each with its own
+#   upstream cause and recovery:
+#
+#   1. **Bars more than 1 day stale** — yesterday's data hasn't
+#      arrived for these figis. Usually a Tinkoff timeout
+#      workaround is needed (PR #129) or a fetch needs replaying.
+#      ``last_bar_ts == yesterday or today`` is *fresh*;
+#      everything older is at least 1-day stale.
+#
+#   2. **Bars more than 2 days stale** — figis the worker chain
+#      hasn't been able to update despite multiple cycles; reflects
+#      hard upstream problems (figi no longer listed, source
+#      unavailable, network proxy blocked).
+#
+#   3. **Corporate-actions / dividends pipeline age** — read
+#      directly from ``pipeline_log.finished_at`` so the operator
+#      sees "last corporate-actions sweep ran 38 hours ago"
+#      instead of just a generic ``freshness.stale`` flag.
+#
+# All three are computed in a single short SQLite transaction per
+# request. The endpoint is read-only — no broker calls.
+
+
+def _stale_breakdown(db_path: str) -> dict:
+    """Compute the multi-level stale breakdown for the DataTab.
+
+    Returns a dict with three buckets plus the chain age of each
+    non-bars phase (corporate_actions, dividends). The numbers are
+    absolute counts of *tradable* figis (share/etf/bond); figis
+    that have never had a row in ``bars`` are bucketed into
+    ``no_bars_ever`` separately so the UI can call them out.
+    """
+    from datetime import date, datetime, timedelta
+
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    two_days_ago = today - timedelta(days=2)
+    import sqlite3
+
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        # ``pipeline_log`` is created lazily by the admin endpoint
+        # in production, but tests / fresh DBs may not have it yet.
+        # Create it here so the breakdown always succeeds and we
+        # always return well-formed JSON for the frontend.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pipeline_log ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "phase TEXT NOT NULL, "
+            "started_at TEXT NOT NULL, "
+            "finished_at TEXT NOT NULL, "
+            "result TEXT NOT NULL, "
+            "detail TEXT"
+            ")"
+        )
+
+        # Tradable figis (share/etf/bond only — futures/options are
+        # explicitly excluded from backfill by ingestion).
+        tradable = conn.execute(
+            "SELECT figi, ticker, class FROM instruments "
+            "WHERE figi IS NOT NULL AND class IN ('share', 'etf', 'bond')"
+        ).fetchall()
+
+        # Pull the latest bar per tradable figi once. Done in
+        # Python loop rather than a per-figi query because the
+        # GROUP BY optimisation only matters when N >> 1k, which
+        # we already have at 3.8k. SQLite is fine with the loop.
+        bars_per_figi: dict[str, str | None] = {}
+        for figi, _t, _c in tradable:
+            row = conn.execute(
+                "SELECT MAX(ts) FROM bars WHERE figi = ?", (figi,)
+            ).fetchone()
+            bars_per_figi[figi] = row[0] if row else None
+
+        fresh: list[str] = []
+        stale_1d: list[tuple[str, str, str]] = []
+        stale_2d: list[tuple[str, str, str]] = []
+        no_bars: list[tuple[str, str, str]] = []
+        for figi, ticker, cls in tradable:
+            ts = bars_per_figi.get(figi)
+            if ts is None or ts == "":
+                no_bars.append((figi, ticker, cls))
+                continue
+            try:
+                d = date.fromisoformat(ts[:10])
+            except (TypeError, ValueError):
+                no_bars.append((figi, ticker, cls))
+                continue
+            if d >= yesterday:
+                # ``days_since_last_bar in {0, -1}``: today or
+                # yesterday. The operator considers these fresh
+                # ('<=1 day old'); no action needed.
+                fresh.append(figi)
+            elif d >= two_days_ago:
+                # ``days_since_last_bar == 1``: bars are from the
+                # day before yesterday. Operator wants to see this
+                # as "stale >1 day" because the target baseline is
+                # yesterday.
+                stale_1d.append((figi, ticker, cls))
+            else:
+                # ``days_since_last_bar >= 2``: persistent stale;
+                # worker has run at least twice without progress.
+                stale_2d.append((figi, ticker, cls))
+
+        # Pipeline ages for non-bars phases. Read the most-recent
+        # ``finished_at`` value per phase name from ``pipeline_log``.
+        age_hours: dict[str, float | None] = {}
+        for phase in ("corporate_actions", "dividends"):
+            row = conn.execute(
+                "SELECT MAX(finished_at) FROM pipeline_log "
+                "WHERE phase = ? AND result = 'ok'",
+                (phase,),
+            ).fetchone()
+            iso = row[0] if row else None
+            if iso is None:
+                age_hours[phase] = None
+                continue
+            try:
+                finished = datetime.fromisoformat(iso)
+                age_hours[phase] = round(
+                    (datetime.now() - finished).total_seconds() / 3600, 1
+                )
+            except (TypeError, ValueError):
+                age_hours[phase] = None
+
+        return {
+            "as_of": today.isoformat(),
+            "yesterday": yesterday.isoformat(),
+            "bars": {
+                "fresh_or_today": len(fresh),
+                "stale_more_than_1_day": len(stale_1d),
+                "stale_more_than_2_days": len(stale_2d),
+                "no_bars_ever": len(no_bars),
+                "tradable_total": len(tradable),
+                # Cap the sample to keep the payload small — the
+                # DataTab renders at most the first 10 of each class.
+                "samples_stale_1d": stale_1d[:10],
+                "samples_stale_2d": stale_2d[:10],
+                "samples_no_bars": no_bars[:10],
+            },
+            "pipeline_age_hours": age_hours,
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/data-stale-breakdown")
+async def data_stale_breakdown() -> dict:
+    """Multi-level stale breakdown for the DataTab.
+
+    See ``_stale_breakdown`` for the model. Read-only; safe to poll.
+    """
+    db_path = _get_sqlite_path()
+    return _stale_breakdown(db_path)
+
+
 @router.get("/fetch/status")
 async def fetch_status() -> dict:
     """Quick health probe: is the broker token set in DB?
