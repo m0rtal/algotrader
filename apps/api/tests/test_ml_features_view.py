@@ -30,6 +30,14 @@ def db(tmp_path):
                                amount_per_share_rub REAL NOT NULL,
                                PRIMARY KEY (figi, ex_date));
         INSERT INTO dividends VALUES ('F1','2026-04-15',5.0);
+        -- Out-of-window trailing-12m row: 2025-12-10 is more than 12
+        -- months before 2026-09-23, so it MUST be excluded from the
+        -- dividend_paid_ttm_rub sum. Without this row, a buggy
+        -- implementation that sums ALL dividends would still pass
+        -- the dividend test (it would coincidentally return 5.0 in
+        -- both the buggy and correct paths). This row guards the
+        -- window condition.
+        INSERT INTO dividends VALUES ('F1','2025-12-10',3.0);
     """)
     con.commit(); con.close(); yield p
 
@@ -98,3 +106,24 @@ def test_no_dividend_returns_null_not_zero(db):
         "WHERE figi='F2' AND ts='2026-09-23'"
     ).fetchone()[0]
     assert v is None
+
+
+def test_columns_present(db):
+    """The view must expose BOTH the raw bars columns AND the
+    ML-derived ones (cumulative_split_factor, adj_close,
+    dividend_paid_ttm_rub, is_tradeable). Models that train on the
+    raw series need open/high/low/close/volume/source as well as the
+    adjusted close; guard the superset contract via PRAGMA table_info.
+    """
+    con = sqlite3.connect(db)
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info(ml_features)")}
+    finally:
+        con.close()
+    required = {
+        "figi", "ts", "open", "high", "low", "close", "volume", "source",
+        "cumulative_split_factor", "adj_close",
+        "dividend_paid_ttm_rub", "is_tradeable",
+    }
+    missing = required - cols
+    assert not missing, f"ml_features is missing columns: {sorted(missing)}"
