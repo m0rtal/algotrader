@@ -6,7 +6,6 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 from .config import get_settings
 from .db import sqlite as sqlitedb
@@ -14,15 +13,10 @@ from .db.migrations import MIGRATIONS_DIR
 from .observability.correlation import CorrelationMiddleware
 from .observability.logging import get_logger, setup_logging
 from .observability.middleware import LatencyMiddleware
-from .observability.tracing import setup_tracing, shutdown_tracing
 from .routes import admin, bars, data_quality as data_quality_route, data_reads, health, pipeline as pipeline_route, settings as settings_route, signals as signals_route
 from .seed import seed_bars_sqlite, should_seed_synth
 
 logger = get_logger("algotrader_api.main")
-
-
-def _parse_resource_attributes(s: str) -> dict[str, str]:
-    return dict(item.split("=", 1) for item in s.split(",") if "=" in item)
 
 
 def _flag_orphan_ok_rows(sqlite_path: str) -> int:
@@ -85,11 +79,16 @@ def create_app() -> FastAPI:
         log_format="json",
         health_sample_rate=settings.log_sample_health,
     )
-    setup_tracing(
-        service_name=settings.otel_service_name,
-        otlp_endpoint=settings.otel_endpoint,
-        resource_attributes=_parse_resource_attributes(settings.otel_resource_attributes),
-    )
+    # PR #126 (2026-09-24): removed ``setup_tracing(...)`` call.
+    # OpenTelemetry exporter was disabled anyway (no collector on
+    # localhost:4317) but the BatchSpanProcessor thread + the
+    # OTLPSpanExporter init still ran on every uvicorn start and
+    # risked blocking lifespan shutdown — see PR #125 root cause.
+    # The structlog request middleware already records duration_ms for
+    # every HTTP request, which gives us 80% of what tracing would,
+    # so we drop the rest. ``observability.tracing.get_tracer()`` is
+    # still imported by routes/settings.py; opentelemetry-api becomes
+    # a no-op tracer when no SDK provider is set.
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -142,7 +141,6 @@ def create_app() -> FastAPI:
         yield
         logger.info("service.stop")
         sqlitedb.close_all()
-        shutdown_tracing()
 
     app = FastAPI(
         title="algotrader-api",
@@ -175,9 +173,6 @@ def create_app() -> FastAPI:
     from .routes.backfill import router as backfill_router
     app.include_router(backfill_router)
     app.include_router(data_quality_route.router)
-
-    # OpenTelemetry FastAPI instrumentation
-    FastAPIInstrumentor.instrument_app(app)
 
     return app
 
