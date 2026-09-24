@@ -672,4 +672,45 @@ describe('DataTab', () => {
     const corp = await screen.findByTestId('pipeline-age-corp-actions');
     expect(corp.textContent).toBe('—');
   });
+
+  // ─── ml-data-readiness PR-1: ML readiness row ──────────────────
+
+  it('renders ML readiness row with row count + date range', async () => {
+    server.resetHandlers();
+    server.use(
+      http.get('/api/admin/backfill/status', () =>
+        HttpResponse.json(defaultStatus),
+      ),
+      http.get('/api/admin/backfill/pending', () =>
+        HttpResponse.json(defaultPending),
+      ),
+      http.get('/api/tickers', () => HttpResponse.json(sampleTickers)),
+      http.get('/api/admin/data-stale-breakdown', () =>
+        HttpResponse.json(defaultStaleBreakdown),
+      ),
+      http.get('/api/admin/ml-readiness', () =>
+        HttpResponse.json({
+          rows: 3620725,
+          min_ts: '2013-03-25',
+          max_ts: '2026-09-23',
+          forward_adjusted_rows: 0,
+        }),
+      ),
+    );
+
+    render(
+      <Wrap>
+        <DataTab />
+      </Wrap>,
+    );
+
+    const el = await screen.findByTestId('ml-readiness-rows');
+    // ``rows.toLocaleString('ru-RU')`` emits thin-space thousands
+    // separators ('3 620 725'), not '3620725'. The PR #130 sibling
+    // test on total_bars uses the same regex dodge:
+    //   /3[\u00a0 ]620[\u00a0 ]725/
+    // (NBSP-class char \u00a0 OR plain space) so the assertion holds
+    // across JS locale implementations.
+    expect(el).toHaveTextContent(/3[\u00a0 ]620[\u00a0 ]725/);
+  });
 });

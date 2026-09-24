@@ -110,3 +110,25 @@ export function useForceReset() {
     },
   });
 }
+
+// ml-data-readiness PR-1 (2026-09-24): ML readiness summary on the
+// operator screen. One row with rows / min_ts / max_ts /
+// forward_adjusted_rows so operators do not have to grep the
+// database for coverage and lag.
+//
+// ``forward_adjusted_rows`` will be 0 until PR-3 ships ``bars_adjusted``
+// population; the UI shows the value as-is (no special-casing).
+export type MlReadiness = {
+  rows: number;
+  min_ts: string | null;
+  max_ts: string | null;
+  forward_adjusted_rows: number;
+};
+
+export function useMlReadiness(refetchInterval = 60_000) {
+  return useQuery<MlReadiness>({
+    queryKey: ['admin-ml-readiness'],
+    queryFn: () => api<MlReadiness>('/admin/ml-readiness'),
+    refetchInterval,
+  });
+}

@@ -9,6 +9,7 @@ import {
   useStopBackfill,
   useForceReset,
   useStaleBreakdown,
+  useMlReadiness,
 } from '@features/backfill/hooks';
 
 // PR #130 (2026-09-24): format pipeline-age hours into a friendly
@@ -49,6 +50,9 @@ export function DataTab() {
   // this bucket specifically after the single "stale" count of 4
   // hid ~1000 figis that lag yesterday.
   const { data: staleBreakdown } = useStaleBreakdown();
+  // ml-data-readiness PR-1 (2026-09-24): ML readiness summary.
+  // Reads the /api/admin/ml-readiness endpoint, polled every 60s.
+  const { data: mlReadiness } = useMlReadiness();
   const start = useStartBackfill();
   const stop = useStopBackfill();
   const reset = useForceReset();
@@ -400,7 +404,58 @@ export function DataTab() {
         </div>
       </section>
 
-      {/* Section 3 — Ticker inventory */}
+      {/* Section 3 — ML data readiness (ml-data-readiness PR-1) */}
+      <section
+        data-testid="data-ml-readiness"
+        className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4 space-y-3"
+      >
+        <h3 className="text-sm font-medium">Готовность данных для ML</h3>
+        {mlReadiness ? (
+          <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+            <div>
+              <p className="text-[var(--muted-foreground)] uppercase tracking-wide">
+                Записей (tradeable)
+              </p>
+              <p
+                className="font-mono text-base mt-1"
+                data-testid="ml-readiness-rows"
+              >
+                {mlReadiness.rows.toLocaleString('ru-RU')}
+              </p>
+            </div>
+            <div>
+              <p className="text-[var(--muted-foreground)] uppercase tracking-wide">
+                Период с
+              </p>
+              <p className="font-mono text-base mt-1">
+                {mlReadiness.min_ts ?? '—'}
+              </p>
+            </div>
+            <div>
+              <p className="text-[var(--muted-foreground)] uppercase tracking-wide">
+                Период по
+              </p>
+              <p className="font-mono text-base mt-1">
+                {mlReadiness.max_ts ?? '—'}
+              </p>
+            </div>
+            <div>
+              <p className="text-[var(--muted-foreground)] uppercase tracking-wide">
+                Forward-adjusted
+              </p>
+              <p className="font-mono text-base mt-1">
+                {mlReadiness.forward_adjusted_rows.toLocaleString('ru-RU')}
+              </p>
+            </div>
+          </div>
+        ) : (
+          <p className="text-sm text-[var(--muted-foreground)]">
+            Backend не отвечает — данные ML ещё не материализованы.
+          </p>
+        )}
+      </section>
+
+      {/* Section 4 — Ticker inventory */}
       <section
         data-testid="data-tickers"
         className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4"
