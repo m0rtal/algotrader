@@ -179,9 +179,16 @@ def fetch_and_persist(
     client: _Client | None = None,
     figis: list[str] | None = None,
     from_year: int | None = None,
-) -> int:
+) -> tuple[int, int]:
     """Fetch and persist dividends for tradeable figis.
-    Returns the number of rows written.
+
+    Returns ``(written, queued)``:
+      - ``written``: number of dividend rows merged into the
+        ``dividends`` table this call.
+      - ``queued``: number of figis that hit a Tinkoff
+        ``RESOURCE_EXHAUSTED`` rate-limit error during this call
+        and were queued in ``dividends_throttle_pending`` for the
+        next cycle.
 
     Ordering: any figis already in `dividends_throttle_pending`
     are attempted first (oldest `last_failed_at` first), then the
@@ -208,7 +215,7 @@ def fetch_and_persist(
             seen.add(f)
 
     if not final_figis:
-        return 0
+        return 0, 0
 
     from_year = from_year or date.today().year - 2
     from_ = date(from_year, 1, 1)
@@ -221,9 +228,10 @@ def fetch_and_persist(
     from algotrader_api.ingestion import rate_limit as rl
     limiter = rl._GLOBAL
 
-    async def _run() -> int:
+    async def _run() -> tuple[int, int]:
         assert client is not None
         written_total = 0
+        queued_total = 0
         async with client:
             for figi in final_figis:
                 await limiter.acquire(_DIVIDENDS_METHOD)
@@ -238,6 +246,7 @@ def fetch_and_persist(
                         except Exception:
                             pass
                         _queue_throttled_figi(db_path, figi)
+                        queued_total += 1
                         _LOG.warning(
                             "dividends.tinkoff.throttled",
                             figi=figi, error=str(e),
@@ -256,7 +265,7 @@ def fetch_and_persist(
                 # On success (rows OR empty), the figi is no longer
                 # throttled — clear any stale queue row.
                 _dequeue_figi(db_path, figi)
-        return written_total
+        return written_total, queued_total
 
     return asyncio.run(_run())
 
@@ -278,8 +287,8 @@ def main() -> int:  # pragma: no cover
         print("ERROR: no broker_token in secrets", file=sys.stderr)
         return 2
     client = real_client.RealTinkoffClient(token=row[0])
-    n = fetch_and_persist(args.db_path, client=client)
-    print(f"Wrote {n} dividend rows")
+    written, _queued = fetch_and_persist(args.db_path, client=client)
+    print(f"Wrote {written} dividend rows")
     return 0
 
 

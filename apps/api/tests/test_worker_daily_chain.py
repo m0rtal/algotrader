@@ -478,7 +478,7 @@ def test_step_dividends_ok_with_writes(tmp_path):
     conn.close()
 
     fake_script = MagicMock()
-    fake_script.fetch_and_persist.return_value = 5
+    fake_script.fetch_and_persist.return_value = (5, 0)
     fake_fresh = MagicMock()
     fake_client_mod = MagicMock()
     fake_client_mod.make_client.return_value = MagicMock()
@@ -491,6 +491,7 @@ def test_step_dividends_ok_with_writes(tmp_path):
             ok, detail = worker._step_dividends(db)
     assert ok is True
     assert "tinkoff=5" in detail
+    assert "queued=0" in detail
     fake_fresh.dividends_freshness_check.assert_not_called()
 
 
@@ -503,7 +504,7 @@ def test_step_dividends_zero_rows_calls_freshness(tmp_path):
     conn.close()
 
     fake_script = MagicMock()
-    fake_script.fetch_and_persist.return_value = 0
+    fake_script.fetch_and_persist.return_value = (0, 0)
     fake_fresh = MagicMock()
     fake_client_mod = MagicMock()
     fake_client_mod.make_client.return_value = MagicMock()
@@ -515,14 +516,60 @@ def test_step_dividends_zero_rows_calls_freshness(tmp_path):
         with patch.object(worker, "client_mod", fake_client_mod):
             ok, detail = worker._step_dividends(db)
     assert ok is True
+    assert "tinkoff=0" in detail
+    assert "queued=0" in detail
     fake_fresh.dividends_freshness_check.assert_called_once()
+
+
+def test_step_dividends_throttled_cycle_reports_queued(tmp_path):
+    """End-to-end pin for the spec scenario 'Phase reports queue size
+    in its result message'.
+
+    A throttled cycle must surface the queued=N count in ``detail``
+    so operators can see at a glance that the cycle hit Tinkoff
+    rate-limit pressure. The healthy-cycle and zero-row-cycle tests
+    above cover the ``queued=0`` case; this one covers the
+    informative case where the cycle ran but had to queue figis for
+    the next run.
+    """
+    worker = _import_worker()
+    db = str(tmp_path / "x.db")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE dividends (figi TEXT, retrieved_at TEXT)")
+    conn.commit()
+    conn.close()
+
+    fake_script = MagicMock()
+    # 7 figs were attempted; 2 succeeded and were persisted, 3 hit
+    # RESOURCE_EXHAUSTED and were queued for the next cycle, and 2
+    # failed for other (non-rate-limit) reasons. Spec scenario only
+    # cares that queued=N is reported — exact counts for the other
+    # two categories are out of scope.
+    fake_script.fetch_and_persist.return_value = (2, 3)
+    fake_fresh = MagicMock()
+    fake_client_mod = MagicMock()
+    fake_client_mod.make_client.return_value = MagicMock()
+
+    with patch.dict(sys.modules, {
+        "algotrader_api.scripts_import.import_dividends_tinkoff": fake_script,
+        "algotrader_api.dividends.freshness": fake_fresh,
+    }):
+        with patch.object(worker, "client_mod", fake_client_mod):
+            ok, detail = worker._step_dividends(db)
+    assert ok is True
+    assert "tinkoff=2" in detail
+    assert "queued=3" in detail
+    # And the detail matches the spec wording exactly.
+    assert detail == "dividends: tinkoff=2 queued=3"
+    # written != 0 → freshness check should NOT fire.
+    fake_fresh.dividends_freshness_check.assert_not_called()
 
 
 def test_step_dividends_stale_aborts(tmp_path):
     worker = _import_worker()
     db = str(tmp_path / "x.db")
     fake_script = MagicMock()
-    fake_script.fetch_and_persist.return_value = 0
+    fake_script.fetch_and_persist.return_value = (0, 0)
     fake_fresh = MagicMock()
     fake_fresh.dividends_freshness_check.side_effect = AssertionError(
         "dividends stale"
