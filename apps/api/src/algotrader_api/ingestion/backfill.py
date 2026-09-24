@@ -315,6 +315,137 @@ def compute_missing_dates(
     return expected - existing
 
 
+# PR #129 (2026-09-24): Tinkoff fallback circuit breaker.
+#
+# Helpers below store breaker state in ``instrument_metadata`` so the
+# decision survives worker restarts. ``_tinkoff_breaker_is_open`` is
+# the hot read (called once per figi per cycle); ``record_failure``
+# increments the failure counter and opens the breaker at threshold;
+# ``record_success`` resets both. All three do a single short SQLite
+# transaction.
+
+
+def _tinkoff_breaker_is_open(db_path: str, figi: str) -> bool:
+    """Return True if the breaker is open for this figi right now.
+
+    An "open" breaker means we should skip the Tinkoff fallback call
+    entirely (it would time out or return empty anyway). Auto-resets
+    if ``tinkoff_breaker_open_until`` is in the past.
+    """
+    con = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        try:
+            row = con.execute(
+                "SELECT tinkoff_breaker_open, tinkoff_breaker_open_until "
+                "FROM instrument_metadata WHERE figi = ?",
+                (figi,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Schema hasn't been migrated yet (e.g. an in-process test
+            # built a stripped-down instrument_metadata table). Treat as
+            # closed so the breaker doesn't block real work.
+            return False
+    finally:
+        con.close()
+    if row is None:
+        # No metadata row yet (fresh figi from universe_sync). Allow
+        # the call — record_failure will create the row on first hit.
+        return False
+    is_open, until = row
+    if not is_open:
+        return False
+    if until is None:
+        # Opened but no expiry — defensive default: treat as open
+        # until record_failure/record_success clears it.
+        return True
+    try:
+        until_dt = datetime.fromisoformat(until)
+    except (TypeError, ValueError):
+        return True
+    return datetime.now() < until_dt
+
+
+def _tinkoff_breaker_record_failure(
+    db_path: str, figi: str, threshold: int,
+) -> None:
+    """Increment the consecutive-failure counter for figi; open the
+    breaker when it reaches ``threshold``.
+    """
+    con = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        # INSERT ... ON CONFLICT DO NOTHING is idempotent under
+        # concurrent writers: the first one creates the row, the rest
+        # skip the INSERT and proceed to the UPDATE. SQLite ≥ 3.24
+        # supports this syntax; the codebase already targets ≥ 3.11.
+        now_iso = datetime.now().isoformat()
+        con.execute(
+            "INSERT OR IGNORE INTO instrument_metadata(figi) VALUES (?)",
+            (figi,),
+        )
+        con.execute(
+            "UPDATE instrument_metadata SET "
+            "tinkoff_consecutive_failures = COALESCE(tinkoff_consecutive_failures, 0) + 1, "
+            "tinkoff_last_failure_ts = ? "
+            "WHERE figi = ?",
+            (now_iso, figi),
+        )
+        # Read back the new counter; if it crossed the threshold,
+        # open the breaker. Doing it via a separate statement (instead
+        # of combining with the UPDATE) keeps the SQL portable and the
+        # race window minimal: at worst two threads cross the
+        # threshold and we open the breaker twice — both succeed,
+        # neither is wrong.
+        row = con.execute(
+            "SELECT tinkoff_consecutive_failures FROM instrument_metadata "
+            "WHERE figi = ?",
+            (figi,),
+        ).fetchone()
+        new_failures = row[0] if row else 0
+        if new_failures >= threshold:
+            open_until = (
+                datetime.now()
+                + timedelta(hours=_TINKOFF_BREAKER_OPEN_HOURS_GLOBAL)
+            ).isoformat()
+            con.execute(
+                "UPDATE instrument_metadata SET "
+                "tinkoff_breaker_open = 1, "
+                "tinkoff_breaker_open_until = ? "
+                "WHERE figi = ?",
+                (open_until, figi),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _tinkoff_breaker_record_success(db_path: str, figi: str) -> None:
+    """Reset the failure counter and close the breaker.
+
+    Called whenever Tinkoff returns at least one candle. Cheap to
+    invoke on every successful fetch — it's a single UPDATE.
+    """
+    con = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        con.execute(
+            "UPDATE instrument_metadata SET "
+            "tinkoff_consecutive_failures = 0, "
+            "tinkoff_breaker_open = 0, "
+            "tinkoff_breaker_open_until = NULL "
+            "WHERE figi = ?",
+            (figi,),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+# Default expiry window used by ``_tinkoff_breaker_record_failure``.
+# Mirrors the per-call value in ``backfill_from_moex`` so the breaker
+# auto-resets whether we opened it via the in-process closure above
+# or via this module-level helper (when called from tests).
+_TINKOFF_BREAKER_OPEN_HOURS_GLOBAL = 24
+
+
 def _fetch_year_moex(
     market: str,
     board: str,
@@ -936,6 +1067,19 @@ class BackfillRunner:
         # fallback so a single hung ticker can't stall the chain.
         _figi_timeout_s = 45
 
+        # PR #129 (2026-09-24): Tinkoff fallback circuit breaker.
+        # Empty figis (no MOEX board, no bars ever written) trigger a
+        # 45s Tinkoff timeout on every cycle. With ~700 such figis the
+        # backfill_moex phase ran for ~9 hours per cycle waiting on
+        # refused Tinkoff responses, so downstream phases
+        # (corporate_actions, dividends) never ran. After
+        # ``_TINKOFF_BREAKER_THRESHOLD`` consecutive empty responses,
+        # we mark the figi with ``tinkoff_breaker_open=1`` and skip it
+        # for ``_TINKOFF_BREAKER_OPEN_HOURS`` hours. The breaker is
+        # stored in ``instrument_metadata`` so it survives restarts.
+        _TINKOFF_BREAKER_THRESHOLD = 3
+        _TINKOFF_BREAKER_OPEN_HOURS = 24
+
         async def _process_moex_year(inst: dict, meta: dict, year: int) -> list[dict]:
             year_bars = self._fetch_year_moex(
                 meta["market"], meta["board"], inst["ticker"], year,
@@ -956,6 +1100,19 @@ class BackfillRunner:
             # figis in the no-MOEX-board fallback, the cycle never
             # converged. Use ``compute_missing_dates`` to get the actual
             # gap set and ask Tinkoff for only ``[min(missing), yesterday]``.
+            # PR #129 (2026-09-24): circuit breaker. If the breaker is
+            # open for this figi, short-circuit with one log line and
+            # return. Check before doing any other work — even
+            # ``compute_missing_dates`` is wasted work when we know
+            # Tinkoff has refused this figi 3+ times in a row.
+            if await asyncio.to_thread(
+                _tinkoff_breaker_is_open, self.db_path, figi,
+            ):
+                await self._log(
+                    "info", figi=figi,
+                    message=f"Tinkoff fallback skipped (circuit breaker open) for {ticker}",
+                )
+                return 0
             try:
                 listed_from_iso = (inst.get("listed_from") or "2014-01-01")[:10]
                 listed_from_d = date.fromisoformat(listed_from_iso)
@@ -992,6 +1149,10 @@ class BackfillRunner:
                     message=f"Tinkoff fallback timeout after {_figi_timeout_s}s for {ticker} "
                             f"window={from_d}..{yesterday}; skipping",
                 )
+                await asyncio.to_thread(
+                    _tinkoff_breaker_record_failure,
+                    self.db_path, figi, _TINKOFF_BREAKER_THRESHOLD,
+                )
                 return 0
             if not candles:
                 await self._log(
@@ -999,7 +1160,14 @@ class BackfillRunner:
                     message=f"Tinkoff fallback: no data for {ticker} "
                             f"window={from_d}..{yesterday}",
                 )
+                await asyncio.to_thread(
+                    _tinkoff_breaker_record_failure,
+                    self.db_path, figi, _TINKOFF_BREAKER_THRESHOLD,
+                )
                 return 0
+            await asyncio.to_thread(
+                _tinkoff_breaker_record_success, self.db_path, figi,
+            )
             return replace_bars_for_figi(self.db_path, figi, candles, replace=False)
 
         async def _process_one(inst: dict) -> int:
