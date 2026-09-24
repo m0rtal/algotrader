@@ -41,7 +41,9 @@ from algotrader_api.ingestion import (  # noqa: E402
     pipeline as pipeline_mod,
 )
 from algotrader_api.observability.logging import get_logger, setup_logging  # noqa: E402
-from algotrader_api.observability.tracing import setup_tracing, shutdown_tracing  # noqa: E402
+# PR #128 (2026-09-24): setup_tracing/shutdown_tracing removed; see
+# comments at the call sites. The otel collector was never deployed
+# and the SDK was causing shutdown hangs (PR #125).
 from algotrader_api.pipeline.assertions import (
     assert_bars_increased,
     snapshot_bars_count,
@@ -71,11 +73,10 @@ async def run_worker(mode: str) -> int:
     sqlitedb.run_migrations(settings.sqlite_path, MIGRATIONS_DIR)
 
     setup_logging(level=settings.log_level, health_sample_rate=1.0)  # no sampling in worker
-    setup_tracing(
-        service_name="algotrader-worker",
-        otlp_endpoint=settings.otel_endpoint,
-        resource_attributes={"mode": mode, "component": "data-fetch"},
-    )
+    # PR #128 (2026-09-24): removed ``setup_tracing(...)``. OTel SDK
+    # was disabled anyway (no collector on localhost:4317) but the
+    # BatchSpanProcessor thread + OTLPSpanExporter init still ran on
+    # every worker start. Dropped alongside main.py in PR #126.
 
     logger.info("worker.start", mode=mode, sqlite=settings.sqlite_path)
 
@@ -130,7 +131,7 @@ async def run_worker(mode: str) -> int:
             await client.aclose()
         except Exception:
             pass
-        shutdown_tracing()
+        # PR #128 (2026-09-24): shutdown_tracing() removed — no-op stub
         logger.info("worker.stop", exit_code=rc)
 
     return rc
@@ -254,18 +255,15 @@ def run_guardian() -> int:
     sqlitedb.run_migrations(settings.sqlite_path, MIGRATIONS_DIR)
 
     setup_logging(level=settings.log_level, health_sample_rate=1.0)
-    setup_tracing(
-        service_name="algotrader-worker",
-        otlp_endpoint=settings.otel_endpoint,
-        resource_attributes={"mode": "guardian", "component": "data-quality"},
-    )
+    # PR #128 (2026-09-24): removed ``setup_tracing(...)``. See above.
 
     logger.info("worker.guardian.start", sqlite=settings.sqlite_path)
 
     try:
         rc = asyncio.run(_drive_guardian(settings.sqlite_path))
     finally:
-        shutdown_tracing()
+        # PR #128 (2026-09-24): shutdown_tracing() removed — no-op stub
+        pass
     return rc
 
 
@@ -754,11 +752,7 @@ def run_daily_chain() -> int:
     db_path = settings.sqlite_path
 
     setup_logging(level=settings.log_level, health_sample_rate=1.0)
-    setup_tracing(
-        service_name="algotrader-worker",
-        otlp_endpoint=settings.otel_endpoint,
-        resource_attributes={"mode": "daily", "component": "refresh-chain"},
-    )
+    # PR #128 (2026-09-24): removed ``setup_tracing(...)``. See above.
 
     logger.info("worker.daily.start", sqlite=db_path)
 
@@ -806,7 +800,8 @@ def run_daily_chain() -> int:
                     detail=detail,
                 )
     finally:
-        shutdown_tracing()
+        # PR #128 (2026-09-24): shutdown_tracing() removed — no-op stub
+        pass
 
     # Non-zero if any best-effort phase failed even though we continued.
     # Systemd uses this to flag the chain as degraded.
