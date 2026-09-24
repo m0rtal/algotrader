@@ -742,7 +742,9 @@ def _step_dividends(db_path: str) -> tuple[bool, str]:
 
     Aborts the chain when 0 rows land AND the table is empty or
     stale. Returns (True, detail) when 0 new rows land but recent
-    data is present.
+    data is present. ``detail`` always carries ``tinkoff=<written>
+    queued=<queued>`` so operators can see at a glance whether the
+    cycle hit Tinkoff rate-limit pressure.
     """
     try:
         from algotrader_api.scripts_import.import_dividends_tinkoff import (
@@ -752,10 +754,10 @@ def _step_dividends(db_path: str) -> tuple[bool, str]:
             dividends_freshness_check,
         )
         client = client_mod.make_client(sqlite_path=db_path)
-        written = fetch_and_persist(db_path, client=client)
+        written, queued = fetch_and_persist(db_path, client=client)
         if written == 0:
             dividends_freshness_check(db_path, stale_threshold_days=7)
-        return True, f"dividends: tinkoff={written} (no new)"
+        return True, f"dividends: tinkoff={written} queued={queued}"
     except AssertionError as exc:
         return False, f"dividends stale: {exc}"
     except Exception as exc:

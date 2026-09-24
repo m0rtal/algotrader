@@ -208,12 +208,13 @@ def test_fetch_and_persist_writes_rows_for_every_figi(tmp_path):
         "BBG0002": [_div_dict("0002", amount=20.0)],
     })
 
-    written = fetcher.fetch_and_persist(
+    written, queued = fetcher.fetch_and_persist(
         db_path,
         client=client,
         from_year=date.today().year,
     )
     assert written == 2
+    assert queued == 0
 
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
