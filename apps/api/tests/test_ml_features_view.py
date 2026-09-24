@@ -1,4 +1,10 @@
 import sqlite3, pytest
+from pathlib import Path
+from algotrader_api.db.migrations import MIGRATIONS_DIR
+
+ML_FEATURES_VIEW_SQL = (
+    Path(MIGRATIONS_DIR) / "021_ml_features_view.sql"
+).read_text(encoding="utf-8")
 
 @pytest.fixture
 def db(tmp_path):
@@ -30,15 +36,26 @@ def db(tmp_path):
                                amount_per_share_rub REAL NOT NULL,
                                PRIMARY KEY (figi, ex_date));
         INSERT INTO dividends VALUES ('F1','2026-04-15',5.0);
-        -- Out-of-window trailing-12m row: 2025-12-10 is more than 12
-        -- months before 2026-09-23, so it MUST be excluded from the
+        -- Out-of-window trailing-12m row: 2024-12-10 is ~21 months
+        -- before 2026-09-23, so it MUST be excluded from the
         -- dividend_paid_ttm_rub sum. Without this row, a buggy
-        -- implementation that sums ALL dividends would still pass
+        -- implementation that summed all dividends would still pass
         -- the dividend test (it would coincidentally return 5.0 in
         -- both the buggy and correct paths). This row guards the
         -- window condition.
-        INSERT INTO dividends VALUES ('F1','2025-12-10',3.0);
+        --
+        -- Note: we deliberately avoid 2025-12-10 here because SQLite's
+        -- `date('2026-09-23', '-12 months')` returns '2025-09-23', so
+        -- 2025-12-10 falls INSIDE the trailing-12m window (~9.5
+        -- months before). 2024-12-10 is unambiguously outside.
+        INSERT INTO dividends VALUES ('F1','2024-12-10',3.0);
     """)
+    # The ml_features view is a SQLite view, not a table, so each
+    # test that touches it must create it against the freshly-seeded
+    # schema. The migration file is the single source of truth — we
+    # execute its raw SQL after the inline CREATE statements. The
+    # view's DROP IF EXISTS makes this safe across re-runs.
+    con.executescript(ML_FEATURES_VIEW_SQL)
     con.commit(); con.close(); yield p
 
 
