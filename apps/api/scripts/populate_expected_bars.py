@@ -48,9 +48,20 @@ def main() -> int:
                   "Apply migration 023 first.", file=sys.stderr)
             return 3
 
+        # Listing date = MIN(bars.ts) for figis with bars (most reliable
+        # source); falls back to instruments.source_updated_at for figis
+        # without bars. ADAPT-10 (live smoke 2026-09-25): the original
+        # implementation used source_updated_at only, which is the LAST
+        # UPDATE timestamp (when Tinkoff ISS last touched the row), not
+        # the listing date. For most figis source_updated_at > yesterday,
+        # so expected_bars was 0 for the entire population.
         rows = con.execute(
-            "SELECT figi, source_updated_at FROM instruments "
-            "WHERE source_updated_at IS NOT NULL"
+            """SELECT i.figi,
+                      COALESCE(MIN(b.ts), i.source_updated_at) AS listing_ts
+               FROM instruments i
+               LEFT JOIN bars b ON b.figi = i.figi
+               WHERE i.class IN ('share', 'etf', 'bond')
+               GROUP BY i.figi"""
         ).fetchall()
         yesterday = date.today() - timedelta(days=1)
         updated = 0
