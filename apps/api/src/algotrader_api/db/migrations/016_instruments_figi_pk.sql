@@ -49,8 +49,12 @@ SELECT CASE
   ELSE 'noop'
 END;
 
--- Drop dependent views before any rename. Migration 021 will
--- re-create `ml_features` on the same migration pass.
+-- Drop dependent views before any rename. Migration 021 (which uses
+-- DROP VIEW IF EXISTS + CREATE VIEW) handles view recreation; we
+-- drop here only so the rebuild branch's RENAME does not collide
+-- with a view referencing the old table name. The ml_features view
+-- is recreated unconditionally by 021 on first apply; on subsequent
+-- applies (hash-match skip) it stays alive.
 DROP VIEW IF EXISTS ml_features;
 
 -- Branch 1: cleanup — instruments missing, instruments_new present.
