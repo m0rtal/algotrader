@@ -50,3 +50,5 @@ SELECT
              AND i.class IN ('share','etf','bond')
              AND i.figi IS NOT NULL)                     AS is_tradeable
 FROM bars b;
+
+-- 2026-09-25 db-bootstrap-hardening: re-create ml_features unconditionally (it may have been dropped by migration 016 on the live smoke test).
