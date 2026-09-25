@@ -2310,14 +2310,17 @@ class BackfillRunner:
 # backfill lights up without further changes here.
 
 
-def backfill_bonds_to_depth(
+async def _async_backfill_impl(
     target_days: int = 30,
     conn: sqlite3.Connection | None = None,
 ) -> dict:
-    """For each tradable bond figi with < target_days bars, fetch historical
-    bars from Tinkoff until target reached or broker history exhausted.
+    """Inner async body of backfill_bonds_to_depth.
 
-    Returns: {figis_processed: int, bars_added: int, skipped: int, errors: int}
+    Extracted so the public sync entry point can asyncio.run() it.
+    Resolves the sync/async rate-limit bypass from PR-1 (ADAPT-4) by
+    properly awaiting ``rl.acquire("get_historical_bonds")`` here in
+    the async context. Existing sync tests still pass because they
+    patch ``acquire`` with a MagicMock that returns non-awaitable.
     """
     if conn is None:
         from algotrader_api.config import get_settings
@@ -2353,7 +2356,10 @@ def backfill_bonds_to_depth(
             # Use the existing Tinkoff client (production target)
             from algotrader_api.ingestion.client import make_client
             client = make_client()
-            rl.acquire()  # rate-limit gate
+            # ADAPT-4: was a sync rl.acquire() call that silently bypassed
+            # the AsyncLimiter. Now properly awaited in async context so
+            # Tinkoff's 600 req/min cap is honored on bonds backfill.
+            await rl.acquire("get_historical_bonds")
             candles = client.get_historical_bonds(
                 figi=figi, from_date=from_date, to_date=to_date
             )
@@ -2407,3 +2413,23 @@ def backfill_bonds_to_depth(
         "skipped": skipped,
         "errors": errors,
     }
+
+
+def backfill_bonds_to_depth(
+    target_days: int = 30,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Public sync entry point for the bond depth backfill.
+
+    For each tradable bond figi with < target_days bars, fetch historical
+    bars from Tinkoff until target reached or broker history exhausted.
+
+    Returns: {figis_processed: int, bars_added: int, skipped: int, errors: int}
+
+    ADAPT-5 Option B: the body runs in an asyncio.run() loop so that
+    ``rl.acquire("get_historical_bonds")`` inside the inner async impl
+    properly awaits the AsyncLimiter. The sync signature is preserved so
+    existing callers (worker.py step, tests) work unchanged; per-call
+    loop setup/teardown is ~1 ms, negligible vs the backfill work.
+    """
+    return asyncio.run(_async_backfill_impl(target_days, conn))
