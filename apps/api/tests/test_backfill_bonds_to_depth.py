@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -91,7 +91,7 @@ def test_sparse_bond_is_brought_to_target_depth(db_with_bonds):
         mock_client = MagicMock()
         mock_client.get_historical_bonds = MagicMock(return_value=new_candles)
         mock_client_factory.return_value = mock_client
-        mock_rl.return_value.acquire = MagicMock()
+        mock_rl.return_value.acquire = AsyncMock()
 
         result = backfill_bonds_to_depth(target_days=30, conn=db_with_bonds)
 
@@ -112,7 +112,7 @@ def test_full_bond_is_skipped(db_with_bonds):
         mock_client = MagicMock()
         mock_client.get_historical_bonds = MagicMock(return_value=[])
         mock_client_factory.return_value = mock_client
-        mock_rl.return_value.acquire = MagicMock()
+        mock_rl.return_value.acquire = AsyncMock()
 
         result = backfill_bonds_to_depth(target_days=30, conn=db_with_bonds)
 
@@ -138,7 +138,7 @@ def test_zero_bar_bond_is_fully_backfilled(db_with_bonds):
         mock_client = MagicMock()
         mock_client.get_historical_bonds = MagicMock(return_value=new_candles)
         mock_client_factory.return_value = mock_client
-        mock_rl.return_value.acquire = MagicMock()
+        mock_rl.return_value.acquire = AsyncMock()
 
         result = backfill_bonds_to_depth(target_days=30, conn=db_with_bonds)
 
@@ -159,7 +159,7 @@ def test_duplicate_bars_are_skipped(db_with_bonds):
         mock_client = MagicMock()
         mock_client.get_historical_bonds = MagicMock(return_value=new_candles)
         mock_client_factory.return_value = mock_client
-        mock_rl.return_value.acquire = MagicMock()
+        mock_rl.return_value.acquire = AsyncMock()
 
         backfill_bonds_to_depth(target_days=30, conn=db_with_bonds)
         count_after_first = db_with_bonds.execute(

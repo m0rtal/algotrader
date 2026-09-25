@@ -485,6 +485,40 @@ def _step_backfill_moex(db_path: str) -> tuple[bool, str]:
         return False, f"backfill_moex failed: {exc}"
 
 
+def _step_bonds_depth(db_path: str) -> tuple[bool, str]:
+    """For each tradable bond figi with < 30 days of bars, fetch history
+    from Tinkoff until the target is reached.
+
+    Wired after ``_step_backfill_moex`` so the equity backfill's rate-
+    limit budget is exhausted first; bonds pull from the broker after
+    that. Returns ``(ok, detail)`` matching the daily-chain convention.
+
+    PR-2 in coverage-and-quality plan; refs
+    openspec/changes/coverage-and-quality/. ADAPT-5: queue parity for
+    bonds is deferred to the priority-queue-redesign sub-project; this
+    step is the daily-chain integration of the depth backfill from
+    PR-1 (which already rate-limits via asyncio.run inside the body).
+    """
+    try:
+        from algotrader_api.db.sqlite import get_connection
+        from algotrader_api.ingestion.backfill import backfill_bonds_to_depth
+
+        conn = get_connection(db_path)
+        try:
+            result = backfill_bonds_to_depth(target_days=30, conn=conn)
+        finally:
+            conn.close()
+        detail = (
+            f"bonds_depth: figis_processed={result['figis_processed']} "
+            f"bars_added={result['bars_added']} "
+            f"skipped={result['skipped']} "
+            f"errors={result['errors']}"
+        )
+        return True, detail
+    except Exception as exc:  # noqa: BLE001 — daily-chain step pattern
+        return False, f"bonds_depth failed: {exc}"
+
+
 def _load_holiday_dates(
     con: sqlite3.Connection, start: date, end: date,
 ) -> set[date]:
@@ -801,6 +835,7 @@ _STEP_FUNCS = {
     "migrations": _step_migrations,
     "universe_sync": _step_universe_sync,
     "backfill_moex": _step_backfill_moex,
+    "bonds_depth": _step_bonds_depth,
     "gap_recovery": _step_gap_recovery,
     "corporate_actions": _step_corporate_actions,
     "dividends": _step_dividends,
