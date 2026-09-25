@@ -76,45 +76,10 @@ def execute_returning_id(
 
 
 def run_migrations(path: str, migrations_dir: str) -> None:
-    """Apply SQL migration files in lexical order. Idempotent.
+    """Apply SQL migration files. Delegates to migrations_runner."""
+    from .migrations_runner import run_migrations as _runner_run_migrations
 
-    Individual statements use `CREATE TABLE IF NOT EXISTS` /
-    `CREATE INDEX IF NOT EXISTS` so they no-op on re-run. `ALTER TABLE
-    ADD COLUMN` is the one statement that isn't idempotent — we
-    skip "duplicate column" errors so the operator can safely rerun
-    the migration suite on an already-initialised database.
-
-    Note: we bypass the OTel-instrumented `execute()` helper here on
-    purpose — `execute()` uses `executescript` which aborts on the
-    first error and we need per-statement fault tolerance.
-    """
-    migrations_path = Path(migrations_dir)
-    if not migrations_path.exists():
-        return
-    files = sorted(migrations_path.glob("*.sql"))
-    conn = get_connection(path)
-    for f in files:
-        sql = f.read_text(encoding="utf-8")
-        for stmt in _split_statements(sql):
-            try:
-                conn.executescript(stmt)
-            except sqlite3.OperationalError as e:
-                msg = str(e).lower()
-                # Idempotent no-ops:
-                # - "duplicate column" for ALTER TABLE ADD COLUMN on re-run
-                # - "already exists" for CREATE TABLE/INDEX on re-run
-                # - "use DROP TABLE" / "use DROP VIEW" when DROP statement
-                #   target type (VIEW vs TABLE) is wrong — the subsequent
-                #   DROP statement of the correct type handles it.
-                if ("duplicate column" in msg
-                    or "already exists" in msg
-                    or "use drop table" in msg
-                    or "use drop view" in msg):
-                    continue
-                raise
-    conn.commit()
-
-    _seed_moex_holidays_if_missing(conn, path)
+    return _runner_run_migrations(path, migrations_dir)
 
 
 def _seed_moex_holidays_if_missing(conn: sqlite3.Connection, db_path: str) -> None:
@@ -142,28 +107,4 @@ def _seed_moex_holidays_if_missing(conn: sqlite3.Connection, db_path: str) -> No
     import_moex_holidays(db_path)
 
 
-def _split_statements(sql: str) -> list[str]:
-    """Split a multi-statement migration file into individual statements.
 
-    Strips pure-comment statements so they don't trigger execution.
-    """
-    out: list[str] = []
-    buf: list[str] = []
-    for line in sql.splitlines():
-        buf.append(line)
-        stripped = line.strip()
-        if stripped.endswith(";"):
-            chunk = "\n".join(buf).strip()
-            buf.clear()
-            # Skip pure-comment statements.
-            lines = [l for l in chunk.splitlines() if l.strip()]
-            if lines and all(l.strip().startswith("--") for l in lines):
-                continue
-            if chunk:
-                out.append(chunk)
-    tail = "\n".join(buf).strip()
-    if tail:
-        lines = [l for l in tail.splitlines() if l.strip()]
-        if not (lines and all(l.strip().startswith("--") for l in lines)):
-            out.append(tail)
-    return out
