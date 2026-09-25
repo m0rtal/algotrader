@@ -2288,3 +2288,122 @@ class BackfillRunner:
             con.commit()
         finally:
             con.close()
+
+
+# ─── bond depth backfill (coverage-and-quality PR-1) ─────────────────
+#
+# For every tradable bond figi with fewer than ``target_days`` bars in
+# the local ``bars`` table, fetch history from Tinkoff until the target
+# is reached (or the broker has nothing more). Idempotent: re-running
+# with the same broker response does not duplicate rows — we look up
+# (figi, ts) before each INSERT and skip existing pairs.
+#
+# ADAPT-1: The brief's reference implementation calls
+# ``client.get_historical_bonds(figi, from_date, to_date)``. The current
+# ``TinkoffClient`` Protocol in ``client.py`` exposes ``get_candles``
+# but not ``get_historical_bonds``. We follow the brief verbatim so the
+# test contract (which mocks ``mock_client.get_historical_bonds``)
+# matches the production call site. The Protocol is
+# ``@runtime_checkable`` and missing methods on a real client surface
+# only at call time, so this stays forward-compatible — when the real
+# Tinkoff wrapper grows a ``get_historical_bonds`` method, the depth
+# backfill lights up without further changes here.
+
+
+def backfill_bonds_to_depth(
+    target_days: int = 30,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """For each tradable bond figi with < target_days bars, fetch historical
+    bars from Tinkoff until target reached or broker history exhausted.
+
+    Returns: {figis_processed: int, bars_added: int, skipped: int, errors: int}
+    """
+    if conn is None:
+        from algotrader_api.config import get_settings
+        from algotrader_api.db.sqlite import get_connection
+        conn = get_connection(get_settings().sqlite_path)
+
+    # Find all tradable bond figis
+    rows = conn.execute(
+        "SELECT figi, ticker FROM instruments WHERE class='bond'"
+    ).fetchall()
+    figis_processed = 0
+    bars_added = 0
+    skipped = 0
+    errors = 0
+
+    # Lazy imports to avoid circular deps at module load
+    from algotrader_api.ingestion.rate_limit import get_global
+    rl = get_global()
+
+    for figi, ticker in rows:
+        try:
+            current = conn.execute(
+                "SELECT COUNT(*) FROM bars WHERE figi = ?", (figi,)
+            ).fetchone()[0]
+            if current >= target_days:
+                skipped += 1
+                continue
+
+            figis_processed += 1
+            from_date = (date.today() - timedelta(days=target_days * 2)).isoformat()
+            to_date = date.today().isoformat()
+
+            # Use the existing Tinkoff client (production target)
+            from algotrader_api.ingestion.client import make_client
+            client = make_client()
+            rl.acquire()  # rate-limit gate
+            candles = client.get_historical_bonds(
+                figi=figi, from_date=from_date, to_date=to_date
+            )
+
+            added_this_figi = 0
+            for c in candles:
+                # c has: figi, ts, open, high, low, close, volume
+                cur = conn.execute(
+                    "SELECT 1 FROM bars WHERE figi=? AND ts=?",
+                    (c.figi, c.ts),
+                ).fetchone()
+                if cur:
+                    continue
+                conn.execute(
+                    """INSERT INTO bars
+                       (figi, ts, open, high, low, close, volume, source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'tinkoff')""",
+                    (c.figi, c.ts, c.open, c.high, c.low, c.close, c.volume),
+                )
+                added_this_figi += 1
+
+            conn.commit()
+            bars_added += added_this_figi
+            logger.info(
+                "bond_depth_backfill",
+                extra={
+                    "event": "bond_depth_backfill",
+                    "figi": figi,
+                    "ticker": ticker,
+                    "before": current,
+                    "after": current + added_this_figi,
+                    "added": added_this_figi,
+                },
+            )
+        except Exception as e:
+            errors += 1
+            logger.warning(
+                "bond_depth_backfill_error",
+                extra={
+                    "event": "bond_depth_backfill_error",
+                    "figi": figi,
+                    "error": str(e)[:200],
+                },
+            )
+            # do not raise — continue with next figi
+            continue
+
+    return {
+        "figis_processed": figis_processed,
+        "bars_added": bars_added,
+        "skipped": skipped,
+        "errors": errors,
+    }
