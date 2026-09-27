@@ -2359,17 +2359,40 @@ async def _async_backfill_impl(
             # ADAPT-4: was a sync rl.acquire() call that silently bypassed
             # the AsyncLimiter. Now properly awaited in async context so
             # Tinkoff's 600 req/min cap is honored on bonds backfill.
-            await rl.acquire("get_historical_bonds")
-            candles = client.get_historical_bonds(
-                figi=figi, from_date=from_date, to_date=to_date
+            #
+            # autonomous-data-pipeline Task B.1: call get_candles (the
+            # method that exists on RealTinkoffClient) — not the
+            # non-existent get_historical_bonds. The previous call site
+            # was unreachable in production because RealTinkoffClient has
+            # only get_candles (see coverage-and-quality ADAPT-1).
+            await rl.acquire("get_candles")
+            candles = await client.get_candles(
+                figi=figi, date_from=from_date, date_to=to_date
             )
 
             added_this_figi = 0
             for c in candles:
-                # c has: figi, ts, open, high, low, close, volume
+                # RealTinkoffClient.get_candles returns list[dict] via
+                # _candle_to_dict; access via keys, not attributes.
+                if isinstance(c, dict):
+                    c_figi = c["figi"]
+                    c_ts = c["ts"]
+                    c_open = c["open"]
+                    c_high = c["high"]
+                    c_low = c["low"]
+                    c_close = c["close"]
+                    c_volume = c["volume"]
+                else:
+                    c_figi = c.figi
+                    c_ts = c.ts
+                    c_open = c.open
+                    c_high = c.high
+                    c_low = c.low
+                    c_close = c.close
+                    c_volume = c.volume
                 cur = conn.execute(
                     "SELECT 1 FROM bars WHERE figi=? AND ts=?",
-                    (c.figi, c.ts),
+                    (c_figi, c_ts),
                 ).fetchone()
                 if cur:
                     continue
@@ -2377,7 +2400,7 @@ async def _async_backfill_impl(
                     """INSERT INTO bars
                        (figi, ts, open, high, low, close, volume, source)
                        VALUES (?, ?, ?, ?, ?, ?, ?, 'tinkoff')""",
-                    (c.figi, c.ts, c.open, c.high, c.low, c.close, c.volume),
+                    (c_figi, c_ts, c_open, c_high, c_low, c_close, c_volume),
                 )
                 added_this_figi += 1
 
