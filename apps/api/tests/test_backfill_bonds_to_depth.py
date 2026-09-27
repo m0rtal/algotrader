@@ -89,7 +89,7 @@ def test_sparse_bond_is_brought_to_target_depth(db_with_bonds):
     with patch('algotrader_api.ingestion.client.make_client') as mock_client_factory, \
          patch('algotrader_api.ingestion.rate_limit.get_global') as mock_rl:
         mock_client = MagicMock()
-        mock_client.get_historical_bonds = MagicMock(return_value=new_candles)
+        mock_client.get_candles = AsyncMock(return_value=new_candles)
         mock_client_factory.return_value = mock_client
         mock_rl.return_value.acquire = AsyncMock()
 
@@ -120,9 +120,9 @@ def test_full_bond_is_skipped(db_with_bonds):
     # incompatible with the shared fixture — BOND15 (15 bars) and BOND00
     # (0 bars) MUST trigger a fetch in the same test run. We assert the
     # documented intent instead: BOND30 (the full bond) was never passed
-    # to get_historical_bonds. Calls for BOND15/BOND00 are expected.
+    # to get_candles. Calls for BOND15/BOND00 are expected.
     called_figis = {
-        call.kwargs.get("figi") for call in mock_client.get_historical_bonds.call_args_list
+        call.kwargs.get("figi") for call in mock_client.get_candles.call_args_list
     }
     assert "BBG000BOND30" not in called_figis
     assert result["skipped"] >= 1
@@ -136,7 +136,7 @@ def test_zero_bar_bond_is_fully_backfilled(db_with_bonds):
     with patch('algotrader_api.ingestion.client.make_client') as mock_client_factory, \
          patch('algotrader_api.ingestion.rate_limit.get_global') as mock_rl:
         mock_client = MagicMock()
-        mock_client.get_historical_bonds = MagicMock(return_value=new_candles)
+        mock_client.get_candles = AsyncMock(return_value=new_candles)
         mock_client_factory.return_value = mock_client
         mock_rl.return_value.acquire = AsyncMock()
 
@@ -157,7 +157,7 @@ def test_duplicate_bars_are_skipped(db_with_bonds):
     with patch('algotrader_api.ingestion.client.make_client') as mock_client_factory, \
          patch('algotrader_api.ingestion.rate_limit.get_global') as mock_rl:
         mock_client = MagicMock()
-        mock_client.get_historical_bonds = MagicMock(return_value=new_candles)
+        mock_client.get_candles = AsyncMock(return_value=new_candles)
         mock_client_factory.return_value = mock_client
         mock_rl.return_value.acquire = AsyncMock()
 
