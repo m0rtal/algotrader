@@ -14,6 +14,13 @@
 set -u
 NAME="${1:?service name required}"
 shift
+# The command to run is everything between NAME and the optional trailing
+# directory hint. IMPORTANT: pass the command as separate args (one per
+# word). Quoting the whole command as a single string causes "$@" to
+# treat it as one executable path, which fails with "no such file or
+# directory" (the spaces in the path get in the way).
+#   ✗   bash supervisor.sh foo "python3 worker.py daily" /path/to/cwd
+#   ✓   bash supervisor.sh foo python3 worker.py daily /path/to/cwd
 SUP_CWD="${@: -1}"  # last positional argument if it looks like a directory
 LOG="/home/hermes/.hermes/logs/${NAME}.log"
 mkdir -p "$(dirname "$LOG")"
