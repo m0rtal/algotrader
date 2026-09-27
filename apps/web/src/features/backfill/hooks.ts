@@ -1,13 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@lib/api';
 
-type BackfillStatus = {
+// Field added on 2026-09-27 for the autonomous-data-pipeline banner
+// (Requirement #4). Backend returns
+// `now - max(pipeline_runs.finished_at)` as an integer (seconds); null
+// when no cycle has ever finished (fresh deploy, no runs yet). The UI
+// hides the banner when null and when the value is < 4h (14400s).
+export type BackfillStatus = {
   state: string;
   run_id: number | null;
   tickers_done: number;
   tickers_total: number;
   total_bars: number;
   last_run: { id: number; ts: string; level: string; message: string } | null;
+  last_cycle_age_seconds: number | null;
 };
 
 export function useBackfillStatus() {
