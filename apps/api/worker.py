@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 from contextlib import closing
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 # Ensure src/ is on sys.path when run directly: python worker.py
@@ -217,14 +217,16 @@ def main() -> int:
         "mode",
         nargs="?",
         default="daily",
-        choices=["scheduled", "manual", "backfill", "guardian", "daily"],
+        choices=["scheduled", "manual", "backfill", "guardian", "daily", "live"],
         help=(
             "Invocation mode. 'scheduled'/'manual' are one-shot fetch flows; "
             "'backfill' runs the persistent universe + historical backfill "
             "lifecycle (systemd-timer driven); 'guardian' runs the daily "
             "data-quality sweep; 'daily' runs the refresh chain "
             "(see also: optional subset positional below) — the "
-            "recommended cron mode."
+            "recommended cron mode; 'live' runs `daily` chain in a loop "
+            "with heartbeat; replaces the cron `daily` invocation. Use "
+            "this for the @reboot supervisor."
         ),
     )
     # ml-data-readiness PR-2: optional subset selector for ``daily`` mode.
@@ -248,6 +250,8 @@ def main() -> int:
         return run_backfill()
     if args.mode == "guardian":
         return run_guardian()
+    if args.mode == "live":
+        return run_live_mode()
     if args.mode == "daily":
         return run_daily_chain()
     return asyncio.run(run_worker(args.mode))
@@ -863,6 +867,258 @@ _STEP_FUNCS = {
     "freshness_check": _step_freshness_check,
     "guardian": _step_guardian,
 }
+
+
+# --------------------------------------------------------------------------- #
+# Live mode — autonomous continuous pipeline loop (replaces cron 'daily')
+# --------------------------------------------------------------------------- #
+
+# Default interval between successful cycles in `live` mode. Operator-
+# overridable via the LIVE_INTERVAL_SECONDS env var so the @reboot
+# supervisor slot can be tuned without editing code.
+LIVE_INTERVAL_SECONDS = int(os.environ.get("LIVE_INTERVAL_SECONDS", "1800"))
+
+# Default heartbeat tick for the live-mode heartbeat thread. Overridable
+# via HEARTBEAT_INTERVAL_SECONDS so tests can drop it to ~0.1s.
+LIVE_HEARTBEAT_INTERVAL_SECONDS = int(
+    os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "30")
+)
+
+
+def _write_pipeline_run(
+    db_path: str,
+    started_iso: str,
+    finished_iso: str,
+    rc: int,
+    stale_2d: int,
+) -> None:
+    """Best-effort write to pipeline_runs. If the table does not yet
+    exist (Task 2 migration), this is a no-op. Once Task 2 lands, the
+    INSERT succeeds and the row is observable via
+    ``GET /api/admin/backfill/status``.
+
+    Failures other than the missing-table case are logged but never
+    raised: the live loop must keep ticking regardless.
+    """
+    try:
+        # sqlitedb.get_connection() is a singleton — DO NOT use
+        # closing() (would close the shared connection).
+        con = sqlitedb.get_connection(db_path)
+        con.execute(
+            "INSERT INTO pipeline_runs "
+            "(started_at, finished_at, rc, stale_2d_count) "
+            "VALUES (?, ?, ?, ?)",
+            (started_iso, finished_iso, int(rc), int(stale_2d)),
+        )
+        con.commit()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            # Task 2 hasn't landed yet; that's fine — degrade gracefully.
+            return
+        logger.warning(
+            "worker.live.pipeline_run_write_failed",
+            error=str(exc)[:200],
+        )
+    except Exception as exc:  # noqa: BLE001 — live-mode must never crash on bookkeeping
+        logger.warning(
+            "worker.live.pipeline_run_write_crashed",
+            error=str(exc)[:200],
+        )
+
+
+def _heartbeat_loop(
+    db_path: str,
+    stop_event: threading.Event,
+    interval_seconds: float = LIVE_HEARTBEAT_INTERVAL_SECONDS,
+) -> None:
+    """Daemon-friendly heartbeat for `live` mode.
+
+    Writes one row per tick to ``pipeline_heartbeat`` with worker_pid,
+    phase, last_bar_ts (MAX(ts) from bars), updated_at. If the table
+    does not yet exist (pre-Task-2 schema), the write is silently
+    skipped so the thread stays benign during roll-out.
+
+    Stops cleanly when ``stop_event`` is set; otherwise runs forever in
+    the daemon thread spawned by run_live_mode(). Never raises — every
+    failure is logged and swallowed.
+    """
+    while not stop_event.is_set():
+        try:
+            # sqlitedb.get_connection() returns a process-shared singleton
+            # — do NOT wrap in `closing()` (would close the shared connection
+            # on first iteration and break every subsequent writer).
+            con = sqlitedb.get_connection(db_path)
+            last_bar = con.execute(
+                "SELECT MAX(ts) FROM bars"
+            ).fetchone()[0]
+            con.execute(
+                "INSERT OR REPLACE INTO pipeline_heartbeat "
+                "(worker_pid, phase, last_bar_ts, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    os.getpid(),
+                    "live_loop",
+                    last_bar,
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+            con.commit()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                # Pre-Task-2 schema — keep ticking, the row will land
+                # once the migration runs.
+                pass
+            else:
+                logger.warning(
+                    "worker.live.heartbeat_write_failed",
+                    error=str(exc)[:200],
+                )
+        except Exception as exc:  # noqa: BLE001 — daemon thread must never raise
+            logger.warning(
+                "worker.live.heartbeat_crashed",
+                error=str(exc)[:200],
+            )
+        # Cancellable sleep — wakes immediately on stop_event.set().
+        stop_event.wait(timeout=interval_seconds)
+
+
+def _compute_stale_2d_count(db_path: str) -> int:
+    """Return the number of figis whose latest bar is older than 2 days.
+
+    Reads from the production schema (``bars`` table). If the table is
+    missing (e.g. fresh test DB), returns 0 — the live loop must never
+    abort because of bookkeeping queries.
+    """
+    try:
+        # sqlitedb.get_connection() is a singleton — DO NOT use
+        # closing() (would close the shared connection).
+        con = sqlitedb.get_connection(db_path)
+        row = con.execute(
+            "SELECT COUNT(*) FROM ("
+            " SELECT figi FROM bars GROUP BY figi "
+            " HAVING MAX(ts) < date('now','-2 days')"
+            ")"
+        ).fetchone()
+        return int(row[0]) if row else 0
+    except sqlite3.OperationalError:
+        # bars table missing — nothing to report yet.
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "worker.live.stale_2d_query_failed",
+            error=str(exc)[:200],
+        )
+        return 0
+
+
+def run_live_mode() -> int:
+    """Always-on pipeline: drive run_daily_chain() in a loop.
+
+    Replaces the cron ``0 20 * * * python worker.py daily`` entry with
+    a supervisor-managed process. The supervisor restarts the worker
+    on any non-zero exit within 30 seconds; the bounded-retry backoff
+    below keeps transient broker / network failures from flapping the
+    restart loop.
+
+    On each cycle we:
+      * run run_daily_chain() (the existing 8-phase refresh)
+      * compute stale_2d_count via a SQL aggregate
+      * INSERT a row into pipeline_runs (Task 2 schema; no-op until then)
+      * sleep LIVE_INTERVAL_SECONDS on success, or exponential backoff
+        (60 * 3**(n-1), capped at 1800s) on failure
+      * spawn a daemon heartbeat thread that writes pipeline_heartbeat
+        every HEARTBEAT_INTERVAL_SECONDS (default 30s) for the @reboot
+        supervisor's liveness check.
+
+    Spec: openspec/.../specs/data-quality/spec.md — Requirement:
+    Autonomous Pipeline Liveness.
+    """
+    settings = get_settings()
+    db_path = settings.sqlite_path
+
+    # Run migrations on entry (mirrors run_daily_chain). Safe to call
+    # on every restart; run_migrations is idempotent.
+    try:
+        sqlitedb.run_migrations(db_path, MIGRATIONS_DIR)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "worker.live.migrations_failed",
+            error=str(exc)[:200],
+        )
+        return 2
+
+    setup_logging(level=settings.log_level, health_sample_rate=1.0)
+
+    # Read interval fresh on each (re)start so a supervisor-restart loop
+    # picks up env changes without code edits.
+    interval = int(os.environ.get("LIVE_INTERVAL_SECONDS", str(LIVE_INTERVAL_SECONDS)))
+    logger.info(
+        "worker.live.start",
+        sqlite=db_path,
+        live_interval_s=interval,
+        heartbeat_interval_s=LIVE_HEARTBEAT_INTERVAL_SECONDS,
+        pid=os.getpid(),
+    )
+
+    # Daemon heartbeat thread — dies with the worker process.
+    stop_event = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(db_path, stop_event, float(LIVE_HEARTBEAT_INTERVAL_SECONDS)),
+        daemon=True,
+        name="worker-live-heartbeat",
+    )
+    heartbeat_thread.start()
+
+    failures_in_a_row = 0
+    try:
+        while True:
+            started_iso = datetime.utcnow().isoformat()
+            try:
+                rc = run_daily_chain()
+            except SystemExit as exc:
+                # Allow tests / operators to short-circuit the loop
+                # via SystemExit. Re-raise so the loop terminates
+                # cleanly (rather than re-running forever).
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "worker.live.cycle.crashed",
+                    error=str(exc)[:200],
+                )
+                rc = 1
+            finished_iso = datetime.utcnow().isoformat()
+
+            stale_2d = _compute_stale_2d_count(db_path)
+            _write_pipeline_run(
+                db_path, started_iso, finished_iso, rc, stale_2d,
+            )
+
+            if rc != 0:
+                failures_in_a_row += 1
+                backoff = min(60 * (3 ** (failures_in_a_row - 1)), 1800)
+                logger.warning(
+                    "worker.live.cycle.failed",
+                    rc=rc,
+                    retry_in_s=backoff,
+                    failures_in_a_row=failures_in_a_row,
+                )
+                time.sleep(backoff)
+            else:
+                failures_in_a_row = 0
+                logger.info(
+                    "worker.live.cycle.complete",
+                    rc=rc,
+                    stale_2d=stale_2d,
+                    slept_for_s=interval,
+                )
+                time.sleep(interval)
+    finally:
+        # Signal the heartbeat thread to exit. It is a daemon, so it
+        # would die with us anyway, but a clean stop keeps the
+        # thread's SQLite connection from being yanked mid-write.
+        stop_event.set()
+        logger.info("worker.live.stop", pid=os.getpid())
 
 
 def run_daily_chain(subset: str | None = None) -> int:
