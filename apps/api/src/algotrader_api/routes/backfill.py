@@ -188,7 +188,13 @@ async def stop_backfill() -> dict:
 
 @router.get("/backfill/status")
 async def backfill_status() -> dict:
-    """Current state + progress + last-run summary."""
+    """Current state + progress + last-run summary.
+
+    Adds ``last_cycle_age_seconds`` (Task 3 of the autonomous-data-pipeline
+    plan) so the UI red banner can detect a stuck pipeline without polling
+    the broker. ``null`` until the first row lands in ``pipeline_runs``;
+    ``null`` if migration 024 has not run on the target DB.
+    """
     runner = _slot.runner
     sqlite_path = get_settings().sqlite_path
     state = runner.state.value if runner is not None else "idle"
@@ -204,6 +210,7 @@ async def backfill_status() -> dict:
         total_bars = _total_bars_on_disk(sqlite_path)
     # Last completed run summary from the DB.
     last_run = _last_run_summary(sqlite_path)
+    last_cycle_age_seconds = _last_cycle_age_seconds(sqlite_path)
     return {
         "state": state,
         "run_id": _slot.run_id,
@@ -211,6 +218,7 @@ async def backfill_status() -> dict:
         "tickers_total": tickers_total,
         "total_bars": total_bars,
         "last_run": last_run,
+        "last_cycle_age_seconds": last_cycle_age_seconds,
     }
 
 
@@ -288,6 +296,49 @@ def _last_run_summary(sqlite_path: str) -> dict | None:
             "message": row["message"],
         }
     except sqlite3.Error:
+        return None
+
+
+def _last_cycle_age_seconds(sqlite_path: str) -> int | None:
+    """Seconds since the most-recent ``pipeline_runs`` row.
+
+    Prefers the most recent row with ``rc = 0`` (successful cycle);
+    falls back to the most-recent row of any rc when no successful
+    cycle exists yet. Returns ``None`` when the table is absent
+    (pre-Task-2 schema) or empty.
+
+    Drives the UI red banner (Task 4) so operators can detect a stuck
+    pipeline without polling the broker.
+    """
+    if not Path(sqlite_path).exists():
+        return None
+    try:
+        row = _exec(
+            sqlite_path,
+            "SELECT finished_at FROM pipeline_runs "
+            "WHERE rc = 0 ORDER BY finished_at DESC LIMIT 1",
+            (),
+        )
+        if not row:
+            row = _exec(
+                sqlite_path,
+                "SELECT finished_at FROM pipeline_runs "
+                "ORDER BY finished_at DESC LIMIT 1",
+                (),
+            )
+        if not row:
+            return None
+        finished = datetime.fromisoformat(row[0]["finished_at"])
+        delta = datetime.now() - finished
+        return max(int(delta.total_seconds()), 0)
+    except sqlite3.OperationalError:
+        # ``pipeline_runs`` does not exist (pre-migration-024 DB) —
+        # fail soft so a remote dev deploy that pre-dates Task 2 keeps
+        # working.
+        return None
+    except (sqlite3.Error, ValueError, TypeError):
+        # Defensive: malformed row, missing DB row, or unexpected
+        # schema drift. Returning ``None`` keeps the dashboard rendering.
         return None
 
 
