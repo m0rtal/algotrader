@@ -23,14 +23,22 @@ from datetime import datetime, timedelta, timezone
 
 
 def _insert_run(db_path: str, *, finished_minutes_ago: int, rc: int) -> None:
-    """Insert one pipeline_runs row finished ``finished_minutes_ago`` ago."""
-    finished = datetime.now() - timedelta(minutes=finished_minutes_ago)
+    """Insert one pipeline_runs row finished ``finished_minutes_ago`` ago.
+
+    Production code anchors on UTC (SQLite ``datetime('now')`` is UTC;
+    the route does ``datetime.now(tz=UTC) - finished_utc``), so the
+    helper uses ``datetime.now(tz=timezone.utc) - timedelta(...)`` and
+    strips the tzinfo before storing — SQLite stores naive ISO strings.
+    """
+    finished = datetime.now(tz=timezone.utc) - timedelta(minutes=finished_minutes_ago)
     started = finished - timedelta(seconds=10)
+    finished_naive = finished.replace(tzinfo=None).isoformat()
+    started_naive = started.replace(tzinfo=None).isoformat()
     con = sqlite3.connect(db_path)
     con.execute(
         "INSERT INTO pipeline_runs (started_at, finished_at, rc, stale_2d_count) "
         "VALUES (?, ?, ?, 0)",
-        (started.isoformat(), finished.isoformat(), rc),
+        (started_naive, finished_naive, rc),
     )
     con.commit()
     con.close()
@@ -136,4 +144,53 @@ def test_status_age_does_not_drift_when_table_empty_after_clear(client, fresh_db
     assert r2.status_code == 200, r2.text
     assert r2.json().get("last_cycle_age_seconds") is None, (
         f"expected null after clearing pipeline_runs, got {r2.json()}"
+    )
+
+
+def test_status_age_uses_utc_for_sqlite_datetime_now(client, fresh_db, monkeypatch):
+    """Regression: SQLite ``datetime('now')`` returns UTC; server runs MSK.
+
+    Before the fix, the production code did ``datetime.now() - finished``
+    where ``finished`` was a naive datetime parsed from SQLite's UTC
+    ``datetime('now')``. On a server in MSK (UTC+3), ``datetime.now()``
+    returns local time, so the delta was over-counted by exactly 3 hours.
+
+    This test pins the behavior: the reported ``last_cycle_age_seconds``
+    must be within a small tolerance of the true elapsed wall-clock time,
+    regardless of the server's local timezone.
+
+    Asserts:
+        - With a row finished 5 minutes ago, age is in [240, 360] seconds.
+        - On MSK (UTC+3) server, age is NOT inflated to 3h+ (was 10805+
+          seconds before the fix).
+    """
+    import sqlite3 as _sqlite3
+
+    # Insert a row with SQLite's own UTC ``datetime('now', '-5 minutes')``.
+    # This is what the worker writes in production — we simulate it
+    # exactly to catch the TZ mismatch.
+    con = _sqlite3.connect(fresh_db)
+    con.execute(
+        "INSERT INTO pipeline_runs (started_at, finished_at, rc, stale_2d_count) "
+        "VALUES (datetime('now', '-5 minutes'), datetime('now', '-5 minutes'), 0, 0)"
+    )
+    con.commit()
+    con.close()
+
+    r = client.get("/api/admin/backfill/status")
+    assert r.status_code == 200
+    age = r.json()["last_cycle_age_seconds"]
+
+    # 5 min = 300s wall-clock. Allow ±60s for test latency. Critical:
+    # on MSK server the OLD code returned ~11000s (300 + 3h); assert
+    # age is NOT in that inflated range.
+    assert 240 <= age <= 360, (
+        f"expected ~300s (5 min) wall-clock age, got {age}. "
+        f"This indicates the TZ mismatch bug has regressed — production "
+        f"code is subtracting naive local ``datetime.now()`` from "
+        f"SQLite UTC ``datetime('now')``, inflating age by 3h on MSK."
+    )
+    assert age < 3600, (
+        f"age {age}s is suspiciously large — likely the pre-fix TZ bug "
+        f"is back (would be ~11000s on MSK)"
     )

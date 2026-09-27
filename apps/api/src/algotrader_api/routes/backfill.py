@@ -328,8 +328,14 @@ def _last_cycle_age_seconds(sqlite_path: str) -> int | None:
             )
         if not row:
             return None
+        # SQLite's ``datetime('now')`` returns UTC without a tz suffix.
+        # Anchor both sides on timezone-aware UTC so the delta matches
+        # wall-clock time regardless of the server's local TZ (server
+        # runs MSK = UTC+3 — naive subtraction would over-count by 3h).
         finished = datetime.fromisoformat(row[0]["finished_at"])
-        delta = datetime.now() - finished
+        if finished.tzinfo is None:
+            finished = finished.replace(tzinfo=timezone.utc)
+        delta = datetime.now(tz=timezone.utc) - finished
         return max(int(delta.total_seconds()), 0)
     except sqlite3.OperationalError:
         # ``pipeline_runs`` does not exist (pre-migration-024 DB) —
