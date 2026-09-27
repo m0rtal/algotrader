@@ -650,6 +650,16 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
          exchange day. When ``last_ts < today - 7 days`` the trailing
          window is routed to MOEX ISS (cheaper, no rate-limit pressure)
          instead of Tinkoff.
+
+    Both passes share the same RealTinkoffClient instance and run in
+    ONE asyncio.run() so the gRPC AsyncClient channel is bound to a
+    single event loop. ADAPT-12 (live smoke 2026-09-25): the previous
+    implementation used TWO asyncio.run() calls (one per pass); the
+    cached AsyncClient was bound to the first event loop and every
+    trailing Tinkoff fetch failed with "Event loop is closed", leaving
+    bars stale for 3 days. The single-loop pattern fixes that — the
+    inner coroutine drives both passes serially on one loop, so the
+    channel stays valid throughout.
     """
     try:
         from algotrader_api.data_quality.gap_recovery import (
@@ -661,25 +671,18 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
         runner = BackfillRunner(client=client, db_path=db_path,
                                 event_sink=_async_noop_sink)
         gaps = find_gaps(db_path)
-        if gaps:
-            result = asyncio.run(recover_gaps(db_path, runner, gaps))
-            hist_added = sum(result.values())
-        else:
-            hist_added = 0
 
-        # Trailing gap pass — fetch days strictly after each figi's last bar.
+        # Resolve tickers for the trailing set BEFORE entering the event
+        # loop (sync DB read). Done here once instead of inside the coroutine.
         today = date.today()
         trailing = _collect_trailing_gaps(db_path, today)
         trailing_added = 0
         trailing_by_source: dict[str, int] = {"moex": 0, "tinkoff": 0}
+        ticker_by_figi: dict[str, str] = {}
         if trailing:
-            # Resolve tickers once for all figis in the trailing set.
             figis = [t[0] for t in trailing]
-            ticker_by_figi: dict[str, str] = {}
             con = sqlite3.connect(db_path)
             try:
-                # Same row_factory requirement as _collect_trailing_gaps
-                # above: r["figi"]/r["ticker"] below need keyed access.
                 con.row_factory = sqlite3.Row
                 placeholders = ",".join("?" for _ in figis)
                 ticker_rows = con.execute(
@@ -698,40 +701,58 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
                        for f, f_, t_, s in trailing],
             )
 
-            async def _fill_trailing() -> dict[str, int]:
-                added_total: dict[str, int] = {}
-                for figi, from_, to_, stale in trailing:
-                    ticker = ticker_by_figi.get(figi)
-                    if ticker is None:
-                        logger.warning(
-                            "worker.gap_recovery.no_ticker",
-                            figi=figi,
-                        )
-                        continue
-                    source = "moex" if stale else "tinkoff"
-                    logger.info(
-                        "worker.gap_recovery.fill",
-                        figi=figi, ticker=ticker,
-                        from_=from_.isoformat(), to=to_.isoformat(),
-                        source=source, stale=stale,
-                    )
-                    try:
-                        n = await runner._backfill_one(
-                            figi=figi, ticker=ticker,
-                            from_=from_, to=to_, source=source,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "worker.gap_recovery.fill_failed",
-                            figi=figi, error=str(exc),
-                        )
-                        continue
-                    added_total[figi] = added_total.get(figi, 0) + int(n or 0)
-                    trailing_by_source[source] += int(n or 0)
-                return added_total
+        # Single asyncio.run() covering both passes. The inner coroutine
+        # sequences historical-gaps → trailing-gaps on one event loop,
+        # so the cached gRPC channel stays valid throughout. aclose()
+        # runs in finally to release the channel cleanly on exit.
+        async def _run_all() -> tuple[int, int, dict[str, int]]:
+            hist_total = 0
+            trailing_total = 0
+            trailing_by_source_inner: dict[str, int] = {"moex": 0, "tinkoff": 0}
+            try:
+                if gaps:
+                    result = await recover_gaps(db_path, runner, gaps)
+                    hist_total = sum(result.values())
 
-            trailing_added_total = asyncio.run(_fill_trailing())
-            trailing_added = sum(trailing_added_total.values())
+                if trailing:
+                    for figi, from_, to_, stale in trailing:
+                        ticker = ticker_by_figi.get(figi)
+                        if ticker is None:
+                            logger.warning(
+                                "worker.gap_recovery.no_ticker",
+                                figi=figi,
+                            )
+                            continue
+                        source = "moex" if stale else "tinkoff"
+                        logger.info(
+                            "worker.gap_recovery.fill",
+                            figi=figi, ticker=ticker,
+                            from_=from_.isoformat(), to=to_.isoformat(),
+                            source=source, stale=stale,
+                        )
+                        try:
+                            n = await runner._backfill_one(
+                                figi=figi, ticker=ticker,
+                                from_=from_, to=to_, source=source,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "worker.gap_recovery.fill_failed",
+                                figi=figi, error=str(exc),
+                            )
+                            continue
+                        trailing_total += int(n or 0)
+                        trailing_by_source_inner[source] += int(n or 0)
+                return hist_total, trailing_total, trailing_by_source_inner
+            finally:
+                # Release the cached gRPC channel so the next subprocess
+                # invocation (or the next asyncio.run in the same process)
+                # rebuilds it on a fresh loop. Without aclose() the
+                # AsyncClient is bound to the dead event loop → every
+                # trailing fetch fails with "Event loop is closed".
+                await client.aclose()
+
+        hist_added, trailing_added, trailing_by_source = asyncio.run(_run_all())
 
         total_added = hist_added + trailing_added
         if not gaps and not trailing:
