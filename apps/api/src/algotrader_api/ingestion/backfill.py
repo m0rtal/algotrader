@@ -654,6 +654,22 @@ async def _fetch_tinkoff_fallback_impl(
                     message="Tinkoff rate-limited; aborting fallback (will retry next cron)",
                 )
                 return out  # bail out immediately; don't even start the next chunk
+            # "Channel is closed" (gRPC INTERNAL_STREAM_CLOSED): the
+            # SDK's cached AsyncClient handle is dead but the retry
+            # decorator's non_rate_error path raises immediately, so
+            # the chunk loop was hammering the dead channel at ~1kHz
+            # before this check. Bail out so the supervisor can
+            # SIGKILL and relaunch the worker — that triggers
+            # ``RealTinkoffClient.__init__`` to build a fresh channel.
+            # Observed 2026-09-27 18:15 MSK: 59 chunk.failed in 5 min
+            # vs. 0 bars added.
+            if "Channel is closed" in err_str or "channel" in err_str.lower():
+                logger.warn(
+                    "backfill.tinkoff.channel_dead",
+                    figi=figi, ticker=ticker,
+                    message="Tinkoff channel closed mid-run; aborting figi (will rebuild next cycle)",
+                )
+                return out
         cur = chunk_end + timedelta(days=1)
     return out
 
@@ -1863,6 +1879,23 @@ class BackfillRunner:
                         "warn",
                         figi=figi,
                         message=f"Tinkoff rate-limited on chunk {cur}..{chunk_end}; aborting fallback (will retry next cron)",
+                    )
+                    break  # skip remaining chunks
+                # "Channel is closed" (gRPC INTERNAL_STREAM_CLOSED): the
+                # cached AsyncClient handle is dead but the retry
+                # decorator's non_rate_error path raises immediately,
+                # so the chunk loop would otherwise hammer the dead
+                # channel at ~1kHz (observed 2026-09-27 18:15 MSK).
+                # Bail out so the worker cycle can return and the
+                # supervisor SIGKILL+relaunch triggers a fresh channel
+                # in ``RealTinkoffClient.__init__``.
+                if "Channel is closed" in err_str or "channel" in err_str.lower():
+                    chunks_failed += 1
+                    last_chunk_error = err_str
+                    await self._log(
+                        "warn",
+                        figi=figi,
+                        message=f"Tinkoff channel closed on chunk {cur}..{chunk_end}; aborting figi (will rebuild next cycle)",
                     )
                     break  # skip remaining chunks
                 chunks_failed += 1
