@@ -19,7 +19,7 @@ import sys
 from contextlib import closing
 from datetime import date
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -378,6 +378,7 @@ def test_step_gap_recovery_routes_fresh_figi_to_tinkoff(tmp_path):
     fake_br.BackfillRunner.return_value = runner
     fake_client_mod = MagicMock()
     fake_client_mod.make_client.return_value = MagicMock()
+    fake_client_mod.make_client.return_value.aclose = AsyncMock()
 
     with patch("algotrader_api.ingestion.client.make_client",
                return_value=MagicMock()), \
@@ -414,6 +415,7 @@ def test_step_gap_recovery_routes_stale_figi_to_moex(tmp_path):
     fake_br.BackfillRunner.return_value = runner
     fake_client_mod = MagicMock()
     fake_client_mod.make_client.return_value = MagicMock()
+    fake_client_mod.make_client.return_value.aclose = AsyncMock()
 
     with patch("algotrader_api.ingestion.client.make_client",
                return_value=MagicMock()), \
@@ -454,6 +456,7 @@ def test_step_gap_recovery_detail_combines_historical_and_trailing(tmp_path):
     fake_br.BackfillRunner.return_value = runner
     fake_client_mod = MagicMock()
     fake_client_mod.make_client.return_value = MagicMock()
+    fake_client_mod.make_client.return_value.aclose = AsyncMock()
 
     with patch("algotrader_api.ingestion.client.make_client",
                return_value=MagicMock()), \
@@ -492,6 +495,7 @@ def test_step_gap_recovery_skips_figi_without_ticker(tmp_path):
     fake_br.BackfillRunner.return_value = runner
     fake_client_mod = MagicMock()
     fake_client_mod.make_client.return_value = MagicMock()
+    fake_client_mod.make_client.return_value.aclose = AsyncMock()
 
     with patch("algotrader_api.ingestion.client.make_client",
                return_value=MagicMock()), \

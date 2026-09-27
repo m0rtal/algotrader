@@ -12,7 +12,7 @@ import importlib
 import sqlite3
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -393,7 +393,9 @@ def test_step_gap_recovery_no_gaps(tmp_path):
     fake_gr.find_gaps.return_value = []
     fake_br = MagicMock()
     fake_br.BackfillRunner.return_value = MagicMock()
-    with patch("algotrader_api.ingestion.client.make_client", return_value=MagicMock()), \
+    fake_client = MagicMock()
+    fake_client.aclose = AsyncMock()
+    with patch("algotrader_api.ingestion.client.make_client", return_value=fake_client), \
          patch.dict(sys.modules, {
             "algotrader_api.data_quality.gap_recovery": fake_gr,
             "algotrader_api.ingestion.backfill": fake_br,
@@ -415,7 +417,9 @@ def test_step_gap_recovery_with_gaps(tmp_path):
     fake_gr.recover_gaps.side_effect = _fake_recover
     fake_br = MagicMock()
     fake_br.BackfillRunner.return_value = MagicMock()
-    with patch("algotrader_api.ingestion.client.make_client", return_value=MagicMock()), \
+    fake_client = MagicMock()
+    fake_client.aclose = AsyncMock()
+    with patch("algotrader_api.ingestion.client.make_client", return_value=fake_client), \
          patch.dict(sys.modules, {
             "algotrader_api.data_quality.gap_recovery": fake_gr,
             "algotrader_api.ingestion.backfill": fake_br,
