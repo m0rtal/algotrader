@@ -1255,24 +1255,16 @@ class BackfillRunner:
                 self.db_path, figi, all_bars, replace=False, source="moex"
             )
 
-        # Pre-populate the meta cache for all instruments in parallel via
-        # asyncio.to_thread (the sync _get_meta_moex calls MOEX ISS).
-        # After this step, _moex_meta has entries for every ticker, so
-        # _process_one_bounded can read it without blocking the loop.
+        # Prefetch metadata in parallel via asyncio.to_thread. Successful
+        # MOEX lookups and confirmed no-board results enter _moex_meta;
+        # HTTP failures can remain uncached and may be retried later.
         #
-        # Concurrency bounded via Semaphore(16): MOEX ISS docs advertise
-        # ~30 req/s, 16 in flight gives ~16 RPS peak (well under the limit)
-        # and keeps the default-executor thread count low enough that
-        # futures don't pile up in the executor's internal queue. Without
-        # this cap, asyncio.gather of 3837 tasks submits all 3837 to the
-        # default ThreadPoolExecutor (~8 workers) and the rest sit in the
-        # queue until workers free — that's the original bug.
-        #
-        # Per-figi self._log ensures a stalled prefetch is visible in
-        # the structured log as a silence-pattern (the systematic-debugging
-        # skill's "silent swallow" red flag — the 2026-09-23 symptom was
-        # zero log lines between backfill_moex phase_start and watchdog
-        # kill, 10 min later).
+        # Semaphore(16) keeps both queued and active MOEX metadata probes
+        # bounded. Keep each slot until its to_thread call actually returns:
+        # wait_for cancels the await but cannot stop its HTTP thread, so a
+        # timed-out await would release the slot while the request still runs.
+        # The underlying requests.get uses (5s connect, 30s read) timeouts.
+        # Per-figi self._log gives the structured log incremental progress.
         _prefetch_sem = asyncio.Semaphore(16)
         prefetch_done = 0
 
@@ -1287,16 +1279,7 @@ class BackfillRunner:
             try:
                 async with _prefetch_sem:
                     try:
-                        # 30s per-ticker timeout — if MOEX ISS hangs on one
-                        # ticker, we don't want to block the whole prefetch.
-                        # (30s is the upper bound; the underlying TCP read
-                        # timeout is 30s and connect is 5s.)
-                        await asyncio.wait_for(
-                            asyncio.to_thread(_get_meta, ticker),
-                            timeout=30.0,
-                        )
-                    except asyncio.TimeoutError:
-                        result = "timeout"
+                        await asyncio.to_thread(_get_meta, ticker)
                     except Exception as e:
                         result = f"err:{type(e).__name__}"
             finally:
@@ -1334,8 +1317,8 @@ class BackfillRunner:
         async def _process_one_bounded(inst: dict) -> int:
             ticker = inst.get("ticker") or ""
             meta = self._moex_meta.get(ticker) if ticker else None
-            # After prefetch, self._moex_meta contains either meta dict or
-            # None for every ticker. A second _get_meta would just hit the cache.
+            # A cached board uses the MOEX lane. Unknown/no-board results
+            # use the broker lane; a failed MOEX probe may be retried there.
             if meta is not None:
                 sem = _moex_sem
             else:
@@ -1435,8 +1418,9 @@ class BackfillRunner:
                 meta_lock=self._moex_meta_lock,
             )
 
-        # Bound queued to_thread work as well as the history-fetch pass.
-        # Timeout starts after a slot is acquired, not while waiting for one.
+        # Keep each slot until its synchronous HTTP call actually exits.
+        # wait_for(to_thread(...)) would cancel only the coroutine, leaving
+        # the HTTP thread running and silently exceeding this 16-call cap.
         probe_sem = asyncio.Semaphore(16)
 
         async def _probe(inst: dict) -> dict:
@@ -1445,10 +1429,7 @@ class BackfillRunner:
                 return inst
             async with probe_sem:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(_get_meta, ticker),
-                        timeout=30.0,
-                    )
+                    await asyncio.to_thread(_get_meta, ticker)
                 except Exception as exc:
                     await self._log(
                         "warn", figi=inst.get("figi"),
