@@ -987,16 +987,11 @@ class BackfillRunner:
         descending before fetching so rate-limit budget is spent on
         the biggest missing-history gaps first.
 
-        When `recent_tail_days > 0`, a second pass runs after the
-        historical walk and fetches only the last `recent_tail_days`
-        trading days from MOEX ISS for every figi with a primary
-        board. Insertion is still INSERT OR IGNORE so any Tinkoff
-        bars already present are preserved. This is a fallback for
-        the daily chain when Tinkoff is stuck (worker on "Connection
-        reset by peer") — MOEX ISS often has yesterday/today data
-        even when the broker SDK is unreachable. Default 0
-        preserves the historical-only behavior so existing callers
-        and tests see no change.
+        When `recent_tail_days > 0`, a first pass fetches only the
+        last `recent_tail_days` trading days from MOEX ISS for every figi
+        with a primary board. The historical walk runs afterward and
+        reuses the MOEX metadata cache. This keeps fresh bars flowing
+        even when a long historical walk or broker fallback stalls.
 
         Algorithm:
           1. List instruments via self._list_instruments().
@@ -1071,6 +1066,12 @@ class BackfillRunner:
             )
 
         written_total = 0
+        # Run the recent pass before the slow multi-year walk. It populates
+        # self._moex_meta, which the historical prefetch reuses below.
+        if recent_tail_days > 0:
+            written_total += await self.backfill_moex_recent_tail(
+                days=recent_tail_days, today=today,
+            )
         s_http = __import__("requests").Session()
 
         # Concurrency: up to 5 figis in parallel for MOEX paths (MOEX ISS
@@ -1358,18 +1359,6 @@ class BackfillRunner:
             if isinstance(res, int):
                 written_total += res
 
-        # Optional recent-tail pass: when Tinkoff is stuck (e.g. worker
-        # wedged on "Connection reset by peer"), MOEX ISS often has
-        # yesterday/today data and the historical walk above won't
-        # have filled those dates. Only runs when the caller asks
-        # (recent_tail_days > 0); default is 0 to preserve existing
-        # behavior and tests.
-        if recent_tail_days > 0:
-            tail_written = await self.backfill_moex_recent_tail(
-                days=recent_tail_days, today=today,
-            )
-            written_total += tail_written
-
         return written_total
 
     # ─── MOEX recent-tail fallback ────────────────────────────────────
@@ -1446,17 +1435,26 @@ class BackfillRunner:
                 meta_lock=self._moex_meta_lock,
             )
 
+        # Bound queued to_thread work as well as the history-fetch pass.
+        # Timeout starts after a slot is acquired, not while waiting for one.
+        probe_sem = asyncio.Semaphore(16)
+
         async def _probe(inst: dict) -> None:
             ticker = inst.get("ticker") or ""
             if not ticker:
                 return
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(_get_meta, ticker),
-                    timeout=30.0,
-                )
-            except asyncio.TimeoutError:
-                pass
+            async with probe_sem:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(_get_meta, ticker),
+                        timeout=30.0,
+                    )
+                except Exception as exc:
+                    await self._log(
+                        "warn", figi=inst.get("figi"),
+                        message=f"moex_recent_tail metadata probe failed for {ticker}: "
+                                f"{type(exc).__name__}",
+                    )
 
         # Pre-populate the meta cache so the per-figi loop can read
         # without blocking the event loop on HTTP.

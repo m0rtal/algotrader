@@ -400,6 +400,72 @@ async def test_recent_tail_skips_figis_without_primary_moex_board(
     assert n == 0
 
 
+# ─── Tail metadata prefetch stays bounded and fault-tolerant ───────────
+
+
+@pytest.mark.asyncio
+async def test_recent_tail_caps_concurrent_metadata_probes(fresh_db, monkeypatch):
+    """A full-universe tail must not queue thousands of timed-out probes."""
+    import asyncio
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    # On a larger host the default executor can run 32 probes at once.
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=32))
+    runner = BackfillRunner(client=MagicMock(), db_path=fresh_db, event_sink=_noop_sink)
+    instruments = [
+        {"figi": f"FIGI-{i}", "ticker": f"TICKER-{i}", "class": "share"}
+        for i in range(64)
+    ]
+    monkeypatch.setattr(runner, "_list_instruments", lambda limit_to=None: instruments)
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+    calls = 0
+
+    def slow_meta(*args, **kwargs):
+        nonlocal in_flight, peak, calls
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+            calls += 1
+        time.sleep(0.03)
+        with lock:
+            in_flight -= 1
+        return None
+
+    monkeypatch.setattr(runner, "_get_meta_moex", slow_meta)
+    assert await runner.backfill_moex_recent_tail(
+        days=5, today=date(2026, 9, 22)
+    ) == 0
+    assert calls == len(instruments)
+    assert 1 <= peak <= 16
+
+
+@pytest.mark.asyncio
+async def test_recent_tail_probe_failure_keeps_other_figis_eligible(fresh_db, monkeypatch):
+    """One malformed MOEX response cannot abort the full-universe tail."""
+    runner = BackfillRunner(client=MagicMock(), db_path=fresh_db, event_sink=_noop_sink)
+    monkeypatch.setattr(runner, "_list_instruments", lambda limit_to=None: [
+        {"figi": "BAD", "ticker": "BAD", "class": "share"},
+        {"figi": "GOOD", "ticker": "GOOD", "class": "bond"},
+    ])
+    seen = []
+
+    def probe(ticker, *_args, **_kwargs):
+        seen.append(ticker)
+        if ticker == "BAD":
+            raise ValueError("malformed MOEX metadata")
+        return None
+
+    monkeypatch.setattr(runner, "_get_meta_moex", probe)
+    assert await runner.backfill_moex_recent_tail(
+        days=5, today=date(2026, 9, 22)
+    ) == 0
+    assert set(seen) == {"BAD", "GOOD"}
+
+
 # ─── Wiring: backfill_from_moex(recent_tail_days=N) drives the pass ──
 
 
@@ -431,9 +497,11 @@ async def test_backfill_from_moex_with_recent_tail_days_runs_the_tail_pass(
     )
 
     hit_count = {"n": 0}
+    events = []
 
     def cb(request):
         hit_count["n"] += 1
+        events.append("history_request")
         return (200, {}, json.dumps({
             "history": {
                 "columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"],
@@ -457,9 +525,17 @@ async def test_backfill_from_moex_with_recent_tail_days_runs_the_tail_pass(
     runner = BackfillRunner(
         client=MagicMock(), db_path=fresh_db, event_sink=_noop_sink,
     )
+    original_tail = runner.backfill_moex_recent_tail
+
+    async def traced_tail(**kwargs):
+        events.append("tail_start")
+        return await original_tail(**kwargs)
+
+    monkeypatch.setattr(runner, "backfill_moex_recent_tail", traced_tail)
     written = await runner.backfill_from_moex(
         today=date(2026, 9, 22), recent_tail_days=1,
     )
+    assert events[0] == "tail_start", events[:3]
 
     # The recent-tail pass MUST have hit MOEX. With the dead-code
     # wiring (recent_tail_days=0 default), only the historical walk
@@ -473,7 +549,7 @@ async def test_backfill_from_moex_with_recent_tail_days_runs_the_tail_pass(
         f"pass is dead code (the original PR #100 bug)."
     )
 
-    # Sanity: the historical walk contributed at least one bar.
+    # Sanity: at least one bar was written by the tail or history pass.
     con = sqlite3.connect(fresh_db)
     n = con.execute("SELECT COUNT(*) FROM bars").fetchone()[0]
     con.close()
