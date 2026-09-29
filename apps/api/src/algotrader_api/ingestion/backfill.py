@@ -2135,19 +2135,21 @@ class BackfillRunner:
         name = row.get("name") or ""
         currency = row.get("currency") or ""
         lot_size = row.get("lot_size") or 0
-        # Update broker fields by figi; keep locally computed coverage and
-        # listing metadata (plus isin/sector absent from this partial row).
+        # Update supplied broker fields by figi without resetting locally
+        # computed coverage, source timestamps, or absent broker metadata.
         # Tickers are not unique: relisted figis may share one ticker.
         con = sqlite3.connect(self.db_path)
         try:
             con.execute(
                 "INSERT INTO instruments "
-                "(ticker, figi, class, name, currency, lot_size) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
+                "(ticker, figi, class, name, currency, lot_size, isin, sector) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(figi) DO UPDATE SET "
                 "ticker=excluded.ticker, class=excluded.class, "
                 "name=excluded.name, currency=excluded.currency, "
-                "lot_size=excluded.lot_size",
+                "lot_size=excluded.lot_size, "
+                "isin=COALESCE(excluded.isin, instruments.isin), "
+                "sector=COALESCE(excluded.sector, instruments.sector)",
                 (
                     ticker,
                     figi,
@@ -2155,6 +2157,8 @@ class BackfillRunner:
                     name,
                     currency,
                     lot_size,
+                    row.get("isin"),
+                    row.get("sector"),
                 ),
             )
             con.commit()
