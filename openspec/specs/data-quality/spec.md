@@ -142,7 +142,8 @@ failing figis and `attempted_recovery=True`.
 
 #### Scenario: All figis have full coverage
 
-- GIVEN all figis in the feature set have `max_ts >= yesterday`
+- GIVEN all figis in the feature set have `max_ts` on or after the last completed MOEX business day (weekends and `moex_holidays` excluded)
+- AND all have a positive `expected_bars` cache value
 - AND all have `bars_count >= 0.95 * expected_bars`
 - WHEN `build_features(figis)` is called
 - THEN it returns the feature matrix
@@ -179,6 +180,21 @@ failing figis and `attempted_recovery=True`.
 - THEN `auto_recovery` raises an exception (no second retry)
 - AND the exception propagates to the caller
 - AND the log shows `{event: insufficient_data_error, attempted_recovery: true}`
+
+#### Scenario: Last completed session falls before a weekend or holiday
+
+- GIVEN today is Monday or the day after a MOEX holiday
+- AND a figi has a bar on the last completed MOEX business day
+- AND its `expected_bars` is positive and coverage is at least 95%
+- WHEN `check_coverage(figis)` is called
+- THEN that figi is not stale solely because the exchange was closed since that bar
+
+#### Scenario: Coverage denominator is unknown
+
+- GIVEN a figi has `expected_bars` NULL or zero
+- WHEN `check_coverage(figis)` is called
+- THEN that figi fails the gate with `reason: 'unknown_expected'` when its last bar is fresh
+- AND no instrument class is silently excluded from the check
 
 ### Requirement: Expected Bars Caching
 
@@ -225,7 +241,7 @@ CURRENT_TIMESTAMP)`.
   successfully
 - WHEN the runner commits the migration pass
 - THEN a row exists in `schema_migrations` with `migration_id =
-  "016_instruments_figi_pk.sql"` and `content_hash` matching the
+"016_instruments_figi_pk.sql"` and `content_hash` matching the
   SHA-256 of the file's contents
 
 ### Requirement: Migration Runner Skip-by-Hash
