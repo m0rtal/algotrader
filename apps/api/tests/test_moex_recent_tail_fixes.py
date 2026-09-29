@@ -400,6 +400,198 @@ async def test_recent_tail_skips_figis_without_primary_moex_board(
     assert n == 0
 
 
+# ─── Tail metadata prefetch stays bounded and fault-tolerant ───────────
+
+
+@pytest.mark.asyncio
+async def test_recent_tail_writes_fast_figi_while_slow_metadata_probe_waits(
+    fresh_db, monkeypatch,
+):
+    """A single slow board lookup must not postpone every fresh bar."""
+    import asyncio
+    import threading
+
+    with sqlite3.connect(fresh_db) as con:
+        con.execute(
+            "INSERT INTO instruments (ticker,figi,class,name,currency,lot_size) "
+            "VALUES ('SLOW','SLOWFIGI','share','Slow','rub',1)"
+        )
+    import algotrader_api.ingestion.backfill as bf_mod
+    monkeypatch.setattr(
+        bf_mod, "_last_trading_day", lambda *_a, **_kw: date(2026, 9, 28),
+    )
+    runner = BackfillRunner(client=MagicMock(), db_path=fresh_db, event_sink=_noop_sink)
+    release_slow = threading.Event()
+    fast_fetched = threading.Event()
+
+    def get_meta(ticker, _today, **_kw):
+        if ticker == "SLOW":
+            assert release_slow.wait(10), "slow probe was never released"
+        meta = {"market": "shares", "board": "TQBR", "listed_till": "2099-12-31"}
+        runner._moex_meta[ticker] = meta
+        return meta
+
+    def fetch(_market, _board, ticker, *_a, **_kw):
+        if ticker == "SBER":
+            fast_fetched.set()
+        return [{"ts": "2026-09-28", "open": 1, "high": 1,
+                 "low": 1, "close": 1, "volume": 1}]
+
+    monkeypatch.setattr(runner, "_get_meta_moex", get_meta)
+    monkeypatch.setattr(runner, "_fetch_moex_range", fetch)
+    task = asyncio.create_task(
+        runner.backfill_moex_recent_tail(days=2, today=date(2026, 9, 29))
+    )
+    inserted_before_release = False
+    try:
+        streamed = await asyncio.to_thread(fast_fetched.wait, 2)
+        if streamed:
+            deadline = asyncio.get_running_loop().time() + 2
+            while asyncio.get_running_loop().time() < deadline:
+                with sqlite3.connect(fresh_db) as con:
+                    inserted_before_release = bool(con.execute(
+                        "SELECT 1 FROM bars WHERE figi=? AND ts=?",
+                        ("BBG004730N88", "2026-09-28"),
+                    ).fetchone())
+                if inserted_before_release:
+                    break
+                await asyncio.sleep(0.01)
+    finally:
+        release_slow.set()
+        written = await asyncio.wait_for(task, 10)
+    assert streamed, "fast FIGI was blocked by unrelated board metadata"
+    assert inserted_before_release, "fast bar was not committed before slow probe"
+    assert written == 2
+
+
+@pytest.mark.asyncio
+async def test_recent_tail_caps_concurrent_metadata_probes(fresh_db, monkeypatch):
+    """A full-universe tail must not queue thousands of timed-out probes."""
+    import asyncio
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    # On a larger host the default executor can run 32 probes at once.
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=32))
+    runner = BackfillRunner(client=MagicMock(), db_path=fresh_db, event_sink=_noop_sink)
+    instruments = [
+        {"figi": f"FIGI-{i}", "ticker": f"TICKER-{i}", "class": "share"}
+        for i in range(64)
+    ]
+    monkeypatch.setattr(runner, "_list_instruments", lambda limit_to=None: instruments)
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+    calls = 0
+
+    def slow_meta(*args, **kwargs):
+        nonlocal in_flight, peak, calls
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+            calls += 1
+        time.sleep(0.03)
+        with lock:
+            in_flight -= 1
+        return None
+
+    monkeypatch.setattr(runner, "_get_meta_moex", slow_meta)
+    assert await runner.backfill_moex_recent_tail(
+        days=5, today=date(2026, 9, 22)
+    ) == 0
+    assert calls == len(instruments)
+    assert 1 <= peak <= 16
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["tail", "history"])
+async def test_recent_tail_metadata_slots_remain_held_for_running_threads(
+    fresh_db, monkeypatch, path,
+):
+    """An asyncio timeout must not silently expand active HTTP probes."""
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import algotrader_api.ingestion.backfill as bf_mod
+
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=32))
+    runner = BackfillRunner(client=MagicMock(), db_path=fresh_db, event_sink=_noop_sink)
+    instruments = [
+        {"figi": f"FIGI-{i}", "ticker": f"TICKER-{i}", "class": "share"}
+        for i in range(48)
+    ]
+    monkeypatch.setattr(runner, "_list_instruments", lambda limit_to=None: instruments)
+    release = threading.Event()
+    first_wave = threading.Event()
+    lock = threading.Lock()
+    active = peak = calls = 0
+
+    def hung_probe(*_a, **_kw):
+        nonlocal active, peak, calls
+        with lock:
+            active += 1
+            calls += 1
+            peak = max(peak, active)
+            if calls >= 16:
+                first_wave.set()
+        release.wait(2)
+        with lock:
+            active -= 1
+        return None
+
+    monkeypatch.setattr(runner, "_get_meta_moex", hung_probe)
+    monkeypatch.setattr(bf_mod, "_tinkoff_breaker_is_open", lambda *_a: True)
+    real_wait_for = asyncio.wait_for
+
+    async def short_timeout(awaitable, timeout):
+        return await real_wait_for(awaitable, 0.03 if timeout == 30.0 else timeout)
+
+    monkeypatch.setattr(bf_mod.asyncio, "wait_for", short_timeout)
+    if path == "tail":
+        coro = runner.backfill_moex_recent_tail(days=5, today=date(2026, 9, 22))
+    else:
+        coro = runner.backfill_from_moex(
+            today=date(2026, 9, 22), priority=False, recent_tail_days=0,
+        )
+    task = asyncio.create_task(coro)
+    try:
+        assert await asyncio.to_thread(first_wave.wait, 1)
+        await asyncio.sleep(0.12)
+    finally:
+        release.set()
+        await task
+    if path == "tail":
+        assert calls == len(instruments)
+    else:
+        # Historical fallback may probe uncached 'no board' tickers again.
+        assert calls >= len(instruments)
+    assert peak <= 16, f"semaphore leaked slots while {peak} HTTP probes ran"
+
+
+@pytest.mark.asyncio
+async def test_recent_tail_probe_failure_keeps_other_figis_eligible(fresh_db, monkeypatch):
+    """One malformed MOEX response cannot abort the full-universe tail."""
+    runner = BackfillRunner(client=MagicMock(), db_path=fresh_db, event_sink=_noop_sink)
+    monkeypatch.setattr(runner, "_list_instruments", lambda limit_to=None: [
+        {"figi": "BAD", "ticker": "BAD", "class": "share"},
+        {"figi": "GOOD", "ticker": "GOOD", "class": "bond"},
+    ])
+    seen = []
+
+    def probe(ticker, *_args, **_kwargs):
+        seen.append(ticker)
+        if ticker == "BAD":
+            raise ValueError("malformed MOEX metadata")
+        return None
+
+    monkeypatch.setattr(runner, "_get_meta_moex", probe)
+    assert await runner.backfill_moex_recent_tail(
+        days=5, today=date(2026, 9, 22)
+    ) == 0
+    assert set(seen) == {"BAD", "GOOD"}
+
+
 # ─── Wiring: backfill_from_moex(recent_tail_days=N) drives the pass ──
 
 
@@ -431,9 +623,11 @@ async def test_backfill_from_moex_with_recent_tail_days_runs_the_tail_pass(
     )
 
     hit_count = {"n": 0}
+    events = []
 
     def cb(request):
         hit_count["n"] += 1
+        events.append("history_request")
         return (200, {}, json.dumps({
             "history": {
                 "columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"],
@@ -457,9 +651,17 @@ async def test_backfill_from_moex_with_recent_tail_days_runs_the_tail_pass(
     runner = BackfillRunner(
         client=MagicMock(), db_path=fresh_db, event_sink=_noop_sink,
     )
+    original_tail = runner.backfill_moex_recent_tail
+
+    async def traced_tail(**kwargs):
+        events.append("tail_start")
+        return await original_tail(**kwargs)
+
+    monkeypatch.setattr(runner, "backfill_moex_recent_tail", traced_tail)
     written = await runner.backfill_from_moex(
         today=date(2026, 9, 22), recent_tail_days=1,
     )
+    assert events[0] == "tail_start", events[:3]
 
     # The recent-tail pass MUST have hit MOEX. With the dead-code
     # wiring (recent_tail_days=0 default), only the historical walk
@@ -473,7 +675,7 @@ async def test_backfill_from_moex_with_recent_tail_days_runs_the_tail_pass(
         f"pass is dead code (the original PR #100 bug)."
     )
 
-    # Sanity: the historical walk contributed at least one bar.
+    # Sanity: at least one bar was written by the tail or history pass.
     con = sqlite3.connect(fresh_db)
     n = con.execute("SELECT COUNT(*) FROM bars").fetchone()[0]
     con.close()
