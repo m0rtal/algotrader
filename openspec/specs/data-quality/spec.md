@@ -240,8 +240,8 @@ CURRENT_TIMESTAMP)`.
 - GIVEN the migration runner applies migration `016_instruments_figi_pk.sql`
   successfully
 - WHEN the runner commits the migration pass
-- THEN a row exists in `schema_migrations` with `migration_id =
-"016_instruments_figi_pk.sql"` and `content_hash` matching the
+- THEN a row exists in `schema_migrations` with `migration_id` equal to
+  `016_instruments_figi_pk.sql` and `content_hash` matching the
   SHA-256 of the file's contents
 
 ### Requirement: Migration Runner Skip-by-Hash
