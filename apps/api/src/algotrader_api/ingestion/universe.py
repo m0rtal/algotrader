@@ -61,7 +61,7 @@ async def discover_universe(client: Any) -> list[dict]:
 
 
 def upsert_instruments(db_path: str, rows: list[dict]) -> int:
-    """INSERT OR REPLACE into instruments keyed by figi.
+    """Upsert broker metadata by figi without resetting local coverage fields.
 
     Filters to `TRADEABLE_CLASSES` before the upsert. This is the
     fourth line of defence — even if `discover_universe` ever
@@ -101,9 +101,14 @@ def upsert_instruments(db_path: str, rows: list[dict]) -> int:
         for r in batch:
             execute_returning_id(
                 db_path,
-                "INSERT OR REPLACE INTO instruments "
+                "INSERT INTO instruments "
                 "(ticker, figi, class, name, currency, lot_size, isin, sector) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(figi) DO UPDATE SET "
+                "ticker=excluded.ticker, class=excluded.class, "
+                "name=excluded.name, currency=excluded.currency, "
+                "lot_size=excluded.lot_size, isin=excluded.isin, "
+                "sector=excluded.sector",
                 (
                     r["ticker"],
                     r["figi"],
