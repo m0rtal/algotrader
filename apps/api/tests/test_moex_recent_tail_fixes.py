@@ -404,6 +404,54 @@ async def test_recent_tail_skips_figis_without_primary_moex_board(
 
 
 @pytest.mark.asyncio
+async def test_recent_tail_writes_fast_figi_while_slow_metadata_probe_waits(
+    fresh_db, monkeypatch,
+):
+    """A single slow board lookup must not postpone every fresh bar."""
+    import asyncio
+    import threading
+
+    with sqlite3.connect(fresh_db) as con:
+        con.execute(
+            "INSERT INTO instruments (ticker,figi,class,name,currency,lot_size) "
+            "VALUES ('SLOW','SLOWFIGI','share','Slow','rub',1)"
+        )
+    import algotrader_api.ingestion.backfill as bf_mod
+    monkeypatch.setattr(
+        bf_mod, "_last_trading_day", lambda *_a, **_kw: date(2026, 9, 28),
+    )
+    runner = BackfillRunner(client=MagicMock(), db_path=fresh_db, event_sink=_noop_sink)
+    release_slow = threading.Event()
+    fast_fetched = threading.Event()
+
+    def get_meta(ticker, _today, **_kw):
+        if ticker == "SLOW":
+            assert release_slow.wait(10), "slow probe was never released"
+        meta = {"market": "shares", "board": "TQBR", "listed_till": "2099-12-31"}
+        runner._moex_meta[ticker] = meta
+        return meta
+
+    def fetch(_market, _board, ticker, *_a, **_kw):
+        if ticker == "SBER":
+            fast_fetched.set()
+        return [{"ts": "2026-09-28", "open": 1, "high": 1,
+                 "low": 1, "close": 1, "volume": 1}]
+
+    monkeypatch.setattr(runner, "_get_meta_moex", get_meta)
+    monkeypatch.setattr(runner, "_fetch_moex_range", fetch)
+    task = asyncio.create_task(
+        runner.backfill_moex_recent_tail(days=2, today=date(2026, 9, 29))
+    )
+    try:
+        streamed = await asyncio.to_thread(fast_fetched.wait, 2)
+    finally:
+        release_slow.set()
+        written = await asyncio.wait_for(task, 10)
+    assert streamed, "fast FIGI was blocked by unrelated board metadata"
+    assert written == 2
+
+
+@pytest.mark.asyncio
 async def test_recent_tail_caps_concurrent_metadata_probes(fresh_db, monkeypatch):
     """A full-universe tail must not queue thousands of timed-out probes."""
     import asyncio
