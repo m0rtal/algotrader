@@ -660,6 +660,38 @@ def test_upsert_instrument_skips_row_without_figi(tmp_path):
     assert rows[0] == 0
 
 
+def test_backfill_upsert_preserves_coverage_and_instrument_details(tmp_path):
+    """A runner rediscovery updates metadata without resetting local fields."""
+    import sqlite3
+
+    async def noop(ev):
+        pass
+
+    db_path = str(tmp_path / "state.db")
+    runner = BackfillRunner(client=MagicMock(), db_path=db_path, event_sink=noop)
+    runner._upsert_instrument({
+        "ticker": "BOND", "figi": "F1", "class": "bond",
+        "name": "old", "currency": "RUB", "lot_size": 1,
+    })
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE instruments SET expected_bars=123, "
+            "source_updated_at='2020-01-02', isin='ISIN1', sector='finance' "
+            "WHERE figi='F1'"
+        )
+
+    runner._upsert_instrument({
+        "ticker": "BOND2", "figi": "F1", "class": "bond",
+        "name": "new", "currency": "RUB", "lot_size": 10,
+    })
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT ticker, name, lot_size, expected_bars, source_updated_at, "
+            "isin, sector FROM instruments WHERE figi='F1'"
+        ).fetchone()
+    assert row == ("BOND2", "new", 10, 123, "2020-01-02", "ISIN1", "finance")
+
+
 @pytest.mark.asyncio
 async def test_run_emits_status_with_tickers_total_after_discover(tmp_path):
     """After discover completes, a status event includes the new tickers_total."""

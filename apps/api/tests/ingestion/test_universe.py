@@ -1,6 +1,8 @@
 """Tests for universe discovery and SQLite persistence."""
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from algotrader_api.db.migrations import MIGRATIONS_DIR
@@ -84,6 +86,28 @@ def test_upsert_instruments_refreshes_metadata_for_existing_figi(tmp_path):
     assert result[0]["figi"] == "F1"
     assert result[0]["name"] == "new"
     assert result[0]["lot_size"] == 1
+
+
+def test_upsert_instruments_preserves_derived_coverage_and_listing_metadata(tmp_path):
+    """A broker metadata refresh must not erase locally computed fields."""
+    db_path = str(tmp_path / "test.db")
+    sqlitedb.run_migrations(db_path, MIGRATIONS_DIR)
+    old = {"ticker": "BOND", "figi": "F1", "class": "bond",
+           "name": "old", "currency": "RUB", "lot_size": 1}
+    universe.upsert_instruments(db_path, [old])
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE instruments SET expected_bars=123, "
+            "source_updated_at='2020-01-02' WHERE figi='F1'"
+        )
+
+    universe.upsert_instruments(db_path, [{**old, "name": "new", "lot_size": 10}])
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT name, lot_size, expected_bars, source_updated_at "
+            "FROM instruments WHERE figi='F1'"
+        ).fetchone()
+    assert row == ("new", 10, 123, "2020-01-02")
 
 
 def test_upsert_instruments_preserves_both_figis_for_duplicate_ticker(tmp_path):
