@@ -51,7 +51,8 @@ def check_coverage(
     """Return list of failing figis. Empty list = all OK.
 
     A figi fails if:
-    - max_ts < yesterday (stale), OR
+    - max_ts precedes the last completed MOEX business day (stale), OR
+    - expected_bars is missing/nonpositive (unknown_expected), OR
     - bars_count < coverage_threshold * expected_bars (incomplete)
 
     Args:
@@ -61,9 +62,16 @@ def check_coverage(
 
     Returns:
         List of {"figi", "max_ts", "bars_count", "expected", "reason"}
-        for figis failing. reason ∈ {"stale", "incomplete", "both"}.
+        for figis failing. reason ∈ {"stale", "incomplete",
+        "unknown_expected", "both"}.
     """
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    last_session = date.today() - timedelta(days=1)
+    while last_session.weekday() >= 5 or conn.execute(
+        "SELECT 1 FROM moex_holidays WHERE date = ?",
+        (last_session.isoformat(),),
+    ).fetchone():
+        last_session -= timedelta(days=1)
+    cutoff = last_session.isoformat()
     failing: list[dict[str, Any]] = []
     for figi in figis:
         row = conn.execute(
@@ -76,9 +84,11 @@ def check_coverage(
         ).fetchone()
         max_ts, bars_count, expected = row[0], row[1], row[2]
         reasons = []
-        if max_ts is None or max_ts < yesterday:
+        if max_ts is None or max_ts < cutoff:
             reasons.append("stale")
-        if expected and expected > 0 and bars_count < coverage_threshold * expected:
+        if expected is None or expected <= 0:
+            reasons.append("unknown_expected")
+        elif bars_count < coverage_threshold * expected:
             reasons.append("incomplete")
         if reasons:
             failing.append({

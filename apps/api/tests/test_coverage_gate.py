@@ -45,6 +45,7 @@ def db_with_figis(tmp_path: Path) -> sqlite3.Connection:
             source_updated_at TEXT,
             expected_bars INTEGER
         );
+        CREATE TABLE moex_holidays (date TEXT PRIMARY KEY);
         CREATE TABLE bars (
             figi TEXT, ts TEXT, open REAL, high REAL, low REAL, close REAL,
             volume INTEGER, source TEXT DEFAULT 'moex',
@@ -189,3 +190,41 @@ def test_insufficient_data_error_includes_failing_figis_list(db_with_figis):
         assert "figi" in entry
         assert "reason" in entry
         assert entry["reason"] in ("stale", "incomplete", "both")
+
+
+def _seed_last_friday_bar(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO instruments (figi, ticker, class, expected_bars) "
+        "VALUES ('WEEKEND', 'WEEKEND', 'share', 1)"
+    )
+    conn.execute(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+        "VALUES ('WEEKEND', '2026-09-25', 1, 1, 1, 1, 1)"
+    )
+
+
+def test_monday_uses_previous_friday_not_sunday(db_with_figis):
+    _seed_last_friday_bar(db_with_figis)
+    with patch("algotrader_api.ml.features.date") as clock:
+        clock.today.return_value = date(2026, 9, 28)
+        assert check_coverage(db_with_figis, ["WEEKEND"]) == []
+
+
+def test_holiday_monday_uses_previous_friday(db_with_figis):
+    _seed_last_friday_bar(db_with_figis)
+    db_with_figis.execute("INSERT INTO moex_holidays VALUES ('2026-09-28')")
+    with patch("algotrader_api.ml.features.date") as clock:
+        clock.today.return_value = date(2026, 9, 29)
+        assert check_coverage(db_with_figis, ["WEEKEND"]) == []
+
+
+@pytest.mark.parametrize("missing_expected", [None, 0])
+def test_missing_expected_bars_fails_closed(db_with_figis, missing_expected):
+    db_with_figis.execute(
+        "UPDATE instruments SET expected_bars=? WHERE figi='FULL01'",
+        (missing_expected,),
+    )
+    failing = check_coverage(db_with_figis, ["FULL01"])
+    assert len(failing) == 1
+    assert failing[0]["figi"] == "FULL01"
+    assert failing[0]["reason"] == "unknown_expected"
