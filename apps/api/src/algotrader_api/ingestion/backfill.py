@@ -1261,35 +1261,6 @@ class BackfillRunner:
                     continue
                 if isinstance(batch, list):
                     all_bars.extend(batch)
-            # Record confirmed zero-trade evidence for the figi BEFORE
-            # the bar write so the same upstream payload is used to
-            # confirm identity. Errors here are logged but never abort
-            # the bar write: a missing evidence row is "unknown", not
-            # a fail-closed block on the bars path.
-            try:
-                from .no_trade_evidence import (
-                    _extract_zero_trade_rows, record_no_trade_evidence,
-                )
-                from ..db.bars_sqlite import get_connection
-                zero_rows = _extract_zero_trade_rows(all_bars)
-                if zero_rows:
-                    inst_row = get_connection(self.db_path).execute(
-                        "SELECT isin FROM instruments WHERE figi = ?",
-                        (figi,),
-                    ).fetchone()
-                    inst_isin = inst_row["isin"] if inst_row else ""
-                    record_no_trade_evidence(
-                        get_connection(self.db_path),
-                        figi=figi,
-                        rows=zero_rows,
-                        board=meta["board"],
-                        isin=str(inst_isin or ""),
-                    )
-            except Exception as e:  # noqa: BLE001 — defensive
-                await self._log(
-                    "warn", figi=figi,
-                    message=f"backfill_from_moex no-trade evidence failed: {e!r}",
-                )
             if not all_bars:
                 return 0
             return replace_bars_for_figi(

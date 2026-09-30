@@ -40,10 +40,6 @@ def main() -> int:
         return 2
 
     con = sqlite3.connect(str(db_path), timeout=30)
-    # sqlite3.Row lets us address evidence / listing fields by name in
-    # the loops below; without this the con.execute(...).fetchall()
-    # rows are plain tuples and `row["session_date"]` raises TypeError.
-    con.row_factory = sqlite3.Row
     try:
         # Check migration 023 applied
         cols = [r[1] for r in con.execute("PRAGMA table_info(instruments)").fetchall()]
@@ -68,37 +64,10 @@ def main() -> int:
                GROUP BY i.figi"""
         ).fetchall()
         yesterday = date.today() - timedelta(days=1)
-        # Confirmed, unexpired no-trade evidence for each figi reduces
-        # the expected denominator by the count of past no-trade days
-        # in [listing_date, yesterday]. Migration 025 may not have run
-        # on older databases — guard with a try/except so this script
-        # stays backward-compatible.
-        try:
-            evidence_rows = con.execute(
-                """SELECT figi, session_date FROM moex_no_trade_evidence
-                   WHERE expires_at >= date('now')"""
-            ).fetchall()
-        except sqlite3.OperationalError:
-            evidence_rows = []
-        evidence_by_figi: dict[str, set[str]] = {}
-        for r in evidence_rows:
-            evidence_by_figi.setdefault(r["figi"], set()).add(r["session_date"])
         updated = 0
         for figi, listing in rows:
             listing_date = date.fromisoformat(listing[:10])  # "2024-01-15T10:00:00"
             expected = expected_business_days(con, listing_date, yesterday)
-            # Subtract past confirmed no-trade days in the [listing_date,
-            # yesterday] window. Future-dated evidence is irrelevant here
-            # because yesterday is the upper bound.
-            evidence_dates = evidence_by_figi.get(figi, set())
-            for ed in evidence_dates:
-                try:
-                    if listing_date <= date.fromisoformat(ed) <= yesterday:
-                        expected -= 1
-                except ValueError:
-                    continue
-            if expected < 0:
-                expected = 0
             con.execute(
                 "UPDATE instruments SET expected_bars = ? WHERE figi = ?",
                 (expected, figi),
