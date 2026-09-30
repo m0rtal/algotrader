@@ -474,6 +474,13 @@ def _fetch_year_moex(
     4-arg signature keep working unchanged — they just get
     ``last_trading_day=None`` and the function falls back to
     ``year-12-31``.
+
+    Each emitted dict carries the raw MOEX columns the no-trade
+    evidence helper needs (``SECID``, ``BOARDID``, ``NUMTRADES``,
+    ``VALUE``) so :mod:`no_trade_evidence` can confirm a zero-trade
+    row without a second HTTP round-trip. Empty OHLC values are kept
+    as ``None`` — the bars writer already drops such rows, but the
+    evidence helper relies on the explicit None shape.
     """
     import requests
     base = (
@@ -517,6 +524,11 @@ def _fetch_year_moex(
                 "close": d.get("CLOSE"),
                 "volume": int(d.get("VOLUME") or 0),
                 "source": "moex",
+                # No-trade evidence: raw upstream columns, kept verbatim.
+                "_secid": d.get("SECID"),
+                "_boardid": d.get("BOARDID"),
+                "_numtrades": d.get("NUMTRADES"),
+                "_value": d.get("VALUE"),
             })
         # history.cursor rows: [offset, total, page_size]. When
         # offset + len(rows) >= total, we've seen everything.
@@ -1478,6 +1490,37 @@ class BackfillRunner:
                 return 0
             for b in bars:
                 b["figi"] = figi
+            # Persist confirmed zero-trade evidence BEFORE the bar
+            # write so a successful tail write that follows the same
+            # HTTP response can rely on the same upstream confirmation.
+            # Errors here are logged but never abort the bar write:
+            # a missing evidence row is "unknown", not a fail-closed
+            # block on the bars path.
+            try:
+                from .no_trade_evidence import (
+                    record_no_trade_evidence,
+                    _extract_zero_trade_rows,
+                )
+                from ..db.bars_sqlite import get_connection
+                zero_rows = _extract_zero_trade_rows(bars)
+                if zero_rows:
+                    inst_row = get_connection(self.db_path).execute(
+                        "SELECT isin FROM instruments WHERE figi = ?",
+                        (figi,),
+                    ).fetchone()
+                    inst_isin = inst_row["isin"] if inst_row else ""
+                    record_no_trade_evidence(
+                        get_connection(self.db_path),
+                        figi=figi,
+                        rows=zero_rows,
+                        board=meta["board"],
+                        isin=str(inst_isin or ""),
+                    )
+            except Exception as e:  # noqa: BLE001 — defensive
+                await self._log(
+                    "warn", figi=figi,
+                    message=f"moex_recent_tail no-trade evidence failed: {e!r}",
+                )
             if not bars:
                 return 0
             # `replace_bars_for_figi` returns rows-ATTEMPTED, not

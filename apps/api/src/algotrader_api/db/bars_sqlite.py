@@ -165,6 +165,16 @@ def replace_bars_for_figi(
     except Exception:
         conn.rollback()
         raise
+    # Real bars always win over stored zero-trade evidence. Without
+    # this step a stale evidence row could mask a real candle that
+    # arrived later and let the ML coverage gate under-count. The
+    # operation runs in its own auto-commit transaction so a write
+    # failure here cannot roll back the bar insert above.
+    try:
+        from ..ingestion.no_trade_evidence import reconcile_no_trade_evidence
+        reconcile_no_trade_evidence(conn)
+    except Exception:
+        pass
     # Snapshot rebuild hook — runs after the commit so the file
     # rewrite never races with an in-flight transaction. Cost is
     # bounded by REFRESH_BUDGET_S: hot figis (every minute) only
