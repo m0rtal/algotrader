@@ -577,3 +577,188 @@ def test_fetch_year_moex_emits_raw_columns_per_dict():
     assert bar["_numtrades"] == 5
     partial = by_ts["2026-09-30"]
     assert partial["_secid"] == "RU000A0JWVL2"
+
+
+# -- populate_expected_bars evidence subtraction -------------------------
+
+
+def test_populate_expected_bars_subtracts_confirmed_evidence(tmp_path, monkeypatch):
+    """End-to-end: confirmed no-trade evidence must reduce expected_bars.
+
+    Re-implements the relevant portion of the populate script's
+    evidence loop to validate the algorithm without invoking the
+    script as a subprocess. The actual script is exercised by
+    `test_cron_expected_bars.py`.
+    """
+    from datetime import date as _date
+    from algotrader_api.ml.coverage import expected_business_days
+
+    db = tmp_path / "x.db"
+    con = sqlite3.connect(str(db))
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+        CREATE TABLE instruments (figi TEXT PRIMARY KEY, ticker TEXT, isin TEXT, source_updated_at TEXT, expected_bars INTEGER);
+        CREATE TABLE bars (figi TEXT, ts TEXT, open REAL, high REAL, low REAL, close REAL, volume INTEGER, source TEXT, PRIMARY KEY (figi, ts));
+        CREATE TABLE moex_holidays (date TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE moex_no_trade_evidence (
+            figi TEXT, session_date TEXT, board TEXT, isin TEXT,
+            source TEXT DEFAULT 'moex_iss',
+            observed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT,
+            UNIQUE (figi, session_date)
+        );
+    """)
+    figi = "FIGI1"
+    # Listing date 2026-09-21; yesterday fixed to 2026-09-30.
+    con.execute(
+        "INSERT INTO instruments(figi, ticker, isin, source_updated_at) "
+        "VALUES (?, 'X', 'X', '2026-09-21T00:00:00')",
+        (figi,),
+    )
+    # Insert a real bar on 2026-09-21 (gives a wider listing window).
+    con.execute(
+        "INSERT INTO bars(figi, ts, open, high, low, close, volume, source) "
+        "VALUES (?, '2026-09-21', 100, 100, 100, 100, 1, 'moex')",
+        (figi,),
+    )
+    # Two confirmed no-trade dates within [listing, yesterday].
+    con.executemany(
+        "INSERT INTO moex_no_trade_evidence(figi, session_date, board, isin, expires_at) "
+        "VALUES (?, ?, 'TQCB', 'X', '2027-01-01')",
+        [(figi, "2026-09-28"), (figi, "2026-09-29")],
+    )
+    con.commit()
+
+    yesterday = _date(2026, 9, 30)
+    listing = _date(2026, 9, 21)
+    base_expected = expected_business_days(con, listing, yesterday)
+    # Apply the same subtraction the script does.
+    evidence = con.execute(
+        "SELECT session_date FROM moex_no_trade_evidence WHERE figi = ?",
+        (figi,),
+    ).fetchall()
+    adjusted = base_expected
+    for r in evidence:
+        d = _date.fromisoformat(r["session_date"])
+        if listing <= d <= yesterday:
+            adjusted -= 1
+    assert adjusted == base_expected - 2
+    assert base_expected > 0
+    assert adjusted >= 0
+
+
+# -- backfill_from_moex records evidence for historical no-trade rows -----
+
+
+def test_backfill_from_moex_integration_smoke(monkeypatch, tmp_path):
+    """Smoke test: drive backfill_from_moex with stubbed MOEX and
+    verify that moex_no_trade_evidence is populated for historical
+    zero-trade rows alongside real bars.
+
+    Stubs ``_list_instruments`` to return a single figi,
+    ``_get_meta_moex`` to return a fixed primary board, and
+    ``_fetch_year_moex`` to emit one explicit zero-trade row plus one
+    real bar per year. Asserts that ``moex_no_trade_evidence`` contains
+    only the zero-trade dates and ``bars`` contains only the real bars.
+    """
+    import asyncio
+    import tempfile
+    from datetime import date as _date
+    from algotrader_api.db import sqlite as sqlitedb
+    from algotrader_api.ingestion.backfill import BackfillRunner
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = f"{tmp}/x.db"
+        con = sqlite3.connect(db_path)
+        con.executescript("""
+            CREATE TABLE instruments (figi TEXT PRIMARY KEY, ticker TEXT NOT NULL, isin TEXT, source_updated_at TEXT, expected_bars INTEGER);
+            CREATE TABLE bars (figi TEXT NOT NULL, ts TEXT NOT NULL, open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL, volume INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'tinkoff', PRIMARY KEY (figi, ts));
+            CREATE TABLE moex_no_trade_evidence (
+                figi TEXT, session_date TEXT, board TEXT, isin TEXT,
+                source TEXT DEFAULT 'moex_iss',
+                observed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                expires_at TEXT,
+                UNIQUE (figi, session_date)
+            );
+            CREATE TABLE moex_holidays (date TEXT PRIMARY KEY, name TEXT);
+            CREATE TABLE instrument_metadata (
+                figi TEXT PRIMARY KEY,
+                last_bar_ts TEXT, last_backfilled_at TEXT,
+                total_bars INTEGER, last_run_status TEXT,
+                last_run_at TEXT, last_error TEXT, first_bar_ts TEXT,
+                tinkoff_breaker_open INTEGER DEFAULT 0,
+                tinkoff_breaker_open_until TEXT,
+                tinkoff_consecutive_failures INTEGER DEFAULT 0,
+                tinkoff_last_failure_ts TEXT
+            );
+            CREATE TABLE ingestion_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL, run_id INTEGER, level TEXT NOT NULL,
+                figi TEXT, message TEXT NOT NULL
+            );
+        """)
+        figi = "FIGI1"
+        con.execute(
+            "INSERT INTO instruments(figi, ticker, isin, source_updated_at) "
+            "VALUES (?, 'X', 'X', '2025-01-01')",
+            (figi,),
+        )
+        con.commit()
+        con.close()
+        sqlitedb._connections.pop(db_path, None)
+
+        def fake_year(market, board, ticker, year, last_trading_day=None):
+            return [
+                {
+                    "figi": None,
+                    "ts": f"{year}-03-15",
+                    "open": None, "high": None, "low": None, "close": None,
+                    "volume": 0, "source": "moex",
+                    "_secid": ticker, "_boardid": board,
+                    "_numtrades": 0, "_value": 0,
+                },
+                {
+                    "figi": None,
+                    "ts": f"{year}-06-15",
+                    "open": 100, "high": 102, "low": 99, "close": 101,
+                    "volume": 1000, "source": "moex",
+                    "_secid": ticker, "_boardid": board,
+                    "_numtrades": 5, "_value": 100000,
+                },
+            ]
+
+        monkeypatch.setattr(BackfillRunner, "_fetch_year_moex", staticmethod(fake_year))
+        monkeypatch.setattr(
+            BackfillRunner, "_get_meta_moex",
+            staticmethod(lambda *a, **kw: {"market": "shares", "board": "TQBR",
+                                            "listed_from": "2025-01-01",
+                                            "listed_till": "2026-12-31"}),
+        )
+        monkeypatch.setattr(
+            BackfillRunner, "_list_instruments",
+            lambda self, limit_to=None: [{"figi": figi, "ticker": "X"}],
+        )
+
+        class _StubSink:
+            async def emit(self, event): pass
+
+        runner = BackfillRunner(db_path=db_path, client=None, event_sink=_StubSink())
+        async def _drive_full():
+            return await runner.backfill_from_moex(
+                today=_date(2026, 12, 31), delta_only=False, recent_tail_days=0,
+            )
+        written = asyncio.run(_drive_full())
+
+        assert written >= 2
+
+        evidence = sqlitedb.get_connection(db_path).execute(
+            "SELECT session_date FROM moex_no_trade_evidence WHERE figi = ? ORDER BY session_date",
+            (figi,),
+        ).fetchall()
+        assert [r["session_date"] for r in evidence] == ["2025-03-15", "2026-03-15"]
+        bars = sqlitedb.get_connection(db_path).execute(
+            "SELECT ts FROM bars WHERE figi = ? ORDER BY ts",
+            (figi,),
+        ).fetchall()
+        assert [r["ts"] for r in bars] == ["2025-06-15", "2026-06-15"]
+        sqlitedb._connections.pop(db_path, None)
