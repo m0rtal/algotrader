@@ -64,6 +64,16 @@ def check_coverage(
         List of {"figi", "max_ts", "bars_count", "expected", "reason"}
         for figis failing. reason ∈ {"stale", "incomplete",
         "unknown_expected", "both"}.
+
+    Implementation note:
+        ``expected_bars`` is denormalised; the helper recomputes it
+        from ``expected_business_days`` minus the figi's confirmed
+        zero-trade evidence (see ``moex_no_trade_evidence``) and
+        ``moex_holidays``. We do NOT overwrite the cached column —
+        the cached value is the canonical denominator for the
+        consumption-time gate. Evidence-based adjustment is applied
+        per-call so the same cache is compatible with the
+        ``populate_expected_bars`` one-shot script.
     """
     last_session = date.today() - timedelta(days=1)
     while last_session.weekday() >= 5 or conn.execute(
@@ -72,7 +82,24 @@ def check_coverage(
     ).fetchone():
         last_session -= timedelta(days=1)
     cutoff = last_session.isoformat()
+    today_iso = date.today().isoformat()
     failing: list[dict[str, Any]] = []
+    # Bulk-load unexpired evidence once so per-figi reads are O(1).
+    # We filter against the Python-side `today_iso` (not SQLite's
+    # `date('now')`) so unit tests that patch `date.today()` see the
+    # correct expiry semantics.
+    try:
+        no_trade_rows = conn.execute(
+            "SELECT figi, session_date, expires_at FROM moex_no_trade_evidence"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Table not yet migrated -> treat as "no evidence".
+        no_trade_rows = []
+    no_trade_by_figi: dict[str, set[str]] = {}
+    for row in no_trade_rows:
+        if row["expires_at"] < today_iso:
+            continue
+        no_trade_by_figi.setdefault(row["figi"], set()).add(row["session_date"])
     for figi in figis:
         row = conn.execute(
             """SELECT
@@ -86,6 +113,36 @@ def check_coverage(
         reasons = []
         if max_ts is None or max_ts < cutoff:
             reasons.append("stale")
+        # Staleness override: if the figi has a real bar on the last
+        # completed session OR a continuous chain of confirmed zero-trade
+        # evidence that reaches the last completed session, do not flag
+        # it as stale. Otherwise older bars followed by a long stretch of
+        # silence would block ML on instruments whose market was closed.
+        if "stale" in reasons:
+            evidence_dates = no_trade_by_figi.get(figi, set())
+            if evidence_dates:
+                last_chain = last_session
+                cur = last_session
+                covered = False
+                while cur.weekday() >= 5 or conn.execute(
+                    "SELECT 1 FROM moex_holidays WHERE date = ?",
+                    (cur.isoformat(),),
+                ).fetchone():
+                    cur -= timedelta(days=1)
+                while cur.isoformat() >= cutoff:
+                    if cur.isoformat() == max_ts:
+                        covered = True
+                        break
+                    if cur.isoformat() not in evidence_dates:
+                        break
+                    cur -= timedelta(days=1)
+                else:
+                    # Reached cutoff without a break: every day in
+                    # [cutoff, last_session] is either a real bar or
+                    # a confirmed no-trade row.
+                    covered = True
+                if covered:
+                    reasons.remove("stale")
         if expected is None or expected <= 0:
             reasons.append("unknown_expected")
         elif bars_count < coverage_threshold * expected:
