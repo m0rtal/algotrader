@@ -1,0 +1,172 @@
+#!/usr/bin/env python
+"""Catch-up fetcher for broker-only instruments (no MOEX board).
+
+Why this exists
+---------------
+The daily worker's Tinkoff fallback phase runs after a long MOEX walk
+on a single long-lived gRPC channel. Observed repeatedly on 2026-10-01:
+every fallback fetch timed out (2003 `tinkoff_rpc_timeout` entries) —
+the channel does not survive the idle stretch + concurrent load, and
+in-process channel resets did not recover it. The same fetches from a
+FRESH process run at ~0.5 s per instrument (40/40 verified).
+
+This script is that fresh process: it fetches recent bars for stale
+instruments that have NO MOEX primary board (the Tinkoff-only set),
+using the same helpers as the daily worker (identity, windows, writer,
+and the half-open date_to correction). Run it from cron every 30
+minutes; it is idempotent (INSERT OR IGNORE) and keeps its own window
+bounded (<= 90 days trailing).
+
+Usage:
+    python apps/api/scripts/backfill_foreign_bars.py --dry-run --limit 20
+    python apps/api/scripts/backfill_foreign_bars.py                 # full run
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sqlite3
+import sys
+import threading
+import time
+from datetime import date, timedelta
+from pathlib import Path
+
+API_SRC = Path(__file__).resolve().parent.parent / "src"
+sys.path.insert(0, str(API_SRC))
+
+from algotrader_api.db.bars_sqlite import replace_bars_for_figi, get_connection  # noqa: E402
+from algotrader_api.ingestion import retry as retry_mod  # noqa: E402
+from algotrader_api.ingestion.backfill import (  # noqa: E402
+    _fetch_tinkoff_fallback_impl,
+    _get_meta_moex,
+    _last_trading_day,
+)
+from algotrader_api.ingestion.client import make_client  # noqa: E402
+
+DEFAULT_DB = "/home/hermes/algotrader/apps/api/data/state.db"
+TRAILING_DAYS = 90
+
+
+async def run(db_path: str, limit: int, dry_run: bool, sleep_s: float,
+              reopen_every: int) -> int:
+    last_session = _last_trading_day(date.today(), db_path)
+    floor = last_session - timedelta(days=TRAILING_DAYS)
+
+    con = sqlite3.connect(db_path, timeout=30)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        """SELECT i.figi, i.ticker,
+                  (SELECT MAX(ts) FROM bars WHERE figi = i.figi) AS max_ts
+           FROM instruments i
+           WHERE i.class IN ('share', 'etf', 'bond')"""
+    ).fetchall()
+    todo = [r for r in rows
+            if r["max_ts"] and r["max_ts"] < last_session.isoformat()]
+    if limit:
+        todo = todo[:limit]
+    print(f"stale candidates: {len(todo)} (last_session={last_session})")
+
+    meta_cache: dict = {}
+    meta_lock = threading.Lock()
+
+    # Pre-filter: only instruments without a MOEX primary board go
+    # through the Tinkoff path here. Those WITH a board are the daily
+    # worker's MOEX walk.
+    tinkoff_only = []
+    for r in todo:
+        ticker = r["ticker"] or ""
+        if not ticker:
+            continue
+        meta = _get_meta_moex(ticker, last_session,
+                              meta_cache=meta_cache, meta_lock=meta_lock)
+        if meta is None:
+            tinkoff_only.append(r)
+    print(f"broker-only (no MOEX board): {len(tinkoff_only)}")
+
+    fetched = written = errors = reopened = 0
+    client = make_client(sqlite_path=db_path)
+    per_client = 0
+    try:
+        for i, r in enumerate(tinkoff_only, 1):
+            if per_client >= reopen_every:
+                # Reopen periodically: bounds any channel degradation
+                # that accumulates over a long run.
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+                client = make_client(sqlite_path=db_path)
+                per_client = 0
+                reopened += 1
+            per_client += 1
+            figi, ticker = r["figi"], r["ticker"]
+            lo = max(floor, date.fromisoformat(r["max_ts"]) + timedelta(days=1))
+            if lo > last_session:
+                continue
+            try:
+                bars = await asyncio.wait_for(
+                    _fetch_tinkoff_fallback_impl(
+                        client, retry_mod, figi, ticker, lo, last_session,
+                    ),
+                    timeout=45,
+                )
+            except asyncio.TimeoutError:
+                errors += 1
+                print(f"  [{i}/{len(tinkoff_only)}] {ticker}: timeout 45s; "
+                      f"reopening client")
+                # A stuck fetch may indicate a poisoned channel; rebuild.
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+                client = make_client(sqlite_path=db_path)
+                per_client = 0
+                reopened += 1
+                continue
+            except Exception as e:  # noqa: BLE001 — keep walking
+                errors += 1
+                print(f"  [{i}/{len(tinkoff_only)}] {ticker}: {type(e).__name__} {e!s:.80}")
+                continue
+            if not bars:
+                continue
+            fetched += 1
+            if dry_run:
+                print(f"  [dry] {ticker}: {len(bars)} bars "
+                      f"({bars[0]['ts']}..{bars[-1]['ts']})")
+                written += len(bars)
+                continue
+            replace_bars_for_figi(db_path, figi, bars, replace=False)
+            written += len(bars)
+            if sleep_s:
+                time.sleep(sleep_s)
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        con.close()
+
+    print(f"done: fetched={fetched} rows={written} errors={errors} "
+          f"client_reopens={reopened}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--sleep", type=float, default=0.0)
+    ap.add_argument("--reopen-every", type=int, default=200,
+                    help="rebuild the broker client every N fetched instruments")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    if not Path(args.db).exists():
+        print(f"ERROR: {args.db} does not exist", file=sys.stderr)
+        return 2
+    return asyncio.run(run(args.db, args.limit, args.dry_run,
+                           args.sleep, args.reopen_every))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
