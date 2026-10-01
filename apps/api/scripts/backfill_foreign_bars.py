@@ -10,16 +10,23 @@ the channel does not survive the idle stretch + concurrent load, and
 in-process channel resets did not recover it. The same fetches from a
 FRESH process run at ~0.5 s per instrument (40/40 verified).
 
-This script is that fresh process: it fetches recent bars for stale
-instruments that have NO MOEX primary board (the Tinkoff-only set),
-using the same helpers as the daily worker (identity, windows, writer,
-and the half-open date_to correction). Run it from cron every 30
-minutes; it is idempotent (INSERT OR IGNORE) and keeps its own window
-bounded (<= 90 days trailing).
+This script is that fresh process: it fetches bars for two cohorts of
+broker-only instruments (no MOEX primary board):
+
+* stale — last bar before the last completed session, and
+* incomplete — fresh tail but bars < 95% of the cached expected_bars
+  (early-history or mid-history gaps).
+
+It uses the same helpers as the daily worker (identity, windows, writer,
+and the half-open date_to correction). `--days` controls the trailing
+window depth (90 for the 30-min freshness cron; use a large value like
+4000 for an occasional full-history sweep). It is idempotent
+(INSERT OR IGNORE).
 
 Usage:
     python apps/api/scripts/backfill_foreign_bars.py --dry-run --limit 20
-    python apps/api/scripts/backfill_foreign_bars.py                 # full run
+    python apps/api/scripts/backfill_foreign_bars.py                 # freshness pass
+    python apps/api/scripts/backfill_foreign_bars.py --days 4000     # history sweep
 """
 from __future__ import annotations
 
@@ -45,27 +52,41 @@ from algotrader_api.ingestion.backfill import (  # noqa: E402
 from algotrader_api.ingestion.client import make_client  # noqa: E402
 
 DEFAULT_DB = "/home/hermes/algotrader/apps/api/data/state.db"
-TRAILING_DAYS = 90
+DEFAULT_DAYS = 90
+COVERAGE_THRESHOLD = 0.95
 
 
 async def run(db_path: str, limit: int, dry_run: bool, sleep_s: float,
-              reopen_every: int) -> int:
+              reopen_every: int, days: int) -> int:
     last_session = _last_trading_day(date.today(), db_path)
-    floor = last_session - timedelta(days=TRAILING_DAYS)
+    floor = last_session - timedelta(days=days)
 
     con = sqlite3.connect(db_path, timeout=30)
     con.row_factory = sqlite3.Row
     rows = con.execute(
-        """SELECT i.figi, i.ticker,
-                  (SELECT MAX(ts) FROM bars WHERE figi = i.figi) AS max_ts
+        """SELECT i.figi, i.ticker, i.expected_bars,
+                  (SELECT MAX(ts) FROM bars WHERE figi = i.figi) AS max_ts,
+                  (SELECT COUNT(*) FROM bars WHERE figi = i.figi) AS bars_count
            FROM instruments i
            WHERE i.class IN ('share', 'etf', 'bond')"""
     ).fetchall()
-    todo = [r for r in rows
-            if r["max_ts"] and r["max_ts"] < last_session.isoformat()]
+    # Two cohorts need help:
+    #  1. stale: last bar before the last completed session;
+    #  2. incomplete: fresh tail but bars < 95% of expected (mid-history
+    #     or early-history gaps, e.g. an ETF with only its last year).
+    todo = []
+    for r in rows:
+        if not r["max_ts"]:
+            continue
+        stale = r["max_ts"] < last_session.isoformat()
+        exp = r["expected_bars"] or 0
+        incomplete = exp > 0 and r["bars_count"] < COVERAGE_THRESHOLD * exp
+        if stale or incomplete:
+            todo.append(r)
     if limit:
         todo = todo[:limit]
-    print(f"stale candidates: {len(todo)} (last_session={last_session})")
+    print(f"candidates (stale+incomplete): {len(todo)} "
+          f"(last_session={last_session}, window_days={days})")
 
     meta_cache: dict = {}
     meta_lock = threading.Lock()
@@ -101,7 +122,14 @@ async def run(db_path: str, limit: int, dry_run: bool, sleep_s: float,
                 reopened += 1
             per_client += 1
             figi, ticker = r["figi"], r["ticker"]
-            lo = max(floor, date.fromisoformat(r["max_ts"]) + timedelta(days=1))
+            # Window: cut at the last bar only when the tail is stale;
+            # for a fresh-but-incomplete figi the gap is elsewhere in
+            # history, so fetch the whole trailing window (duplicate
+            # inserts are ignored cheaply).
+            if r["max_ts"] >= last_session.isoformat():
+                lo = floor
+            else:
+                lo = max(floor, date.fromisoformat(r["max_ts"]) + timedelta(days=1))
             if lo > last_session:
                 continue
             try:
@@ -159,13 +187,16 @@ def main() -> int:
     ap.add_argument("--sleep", type=float, default=0.0)
     ap.add_argument("--reopen-every", type=int, default=200,
                     help="rebuild the broker client every N fetched instruments")
+    ap.add_argument("--days", type=int, default=DEFAULT_DAYS,
+                    help="trailing window depth in calendar days "
+                         "(default %(default)s; use e.g. 4000 for a full-history sweep)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     if not Path(args.db).exists():
         print(f"ERROR: {args.db} does not exist", file=sys.stderr)
         return 2
     return asyncio.run(run(args.db, args.limit, args.dry_run,
-                           args.sleep, args.reopen_every))
+                           args.sleep, args.reopen_every, args.days))
 
 
 if __name__ == "__main__":
