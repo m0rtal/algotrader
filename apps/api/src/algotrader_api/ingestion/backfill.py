@@ -1164,7 +1164,27 @@ class BackfillRunner:
                 # Returning here avoids the Tinkoff round-trip that
                 # would have walked 12 years of history anyway.
                 return 0
-            from_d = min(missing)
+            # Bound the fetch. `missing` can contain multi-year holes:
+            # an instrument whose bars start in 2021 but whose listing
+            # floor defaults to 2014, or a foreign security with no
+            # local bars at all. Using min(missing) as from_d chunked
+            # 12 years of 7-day windows — hundreds of requests, a 45 s
+            # timeout, then the circuit breaker, every cycle (observed
+            # 2026-10-01: ~1870 foreign instruments stuck stale).
+            # Policy: fetch the full gap when it fits the per-figi
+            # budget (~60 chunks); otherwise trail only the recent
+            # window. Old holes beyond the trailing window are left to
+            # a dedicated historical pass, not the daily cycle.
+            _TINKOFF_FULL_FETCH_MAX_DAYS = 420  # ~60 seven-day chunks
+            _TINKOFF_TRAILING_DAYS = 90
+            first_missing = min(missing)
+            if (yesterday - first_missing).days > _TINKOFF_FULL_FETCH_MAX_DAYS:
+                trailing_cutoff = yesterday - timedelta(days=_TINKOFF_TRAILING_DAYS)
+                recent_missing = [d for d in missing if d >= trailing_cutoff]
+                if not recent_missing:
+                    return 0
+                first_missing = min(recent_missing)
+            from_d = first_missing
             try:
                 candles = await asyncio.wait_for(
                     self._fetch_tinkoff_fallback(

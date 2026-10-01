@@ -343,3 +343,99 @@ async def test_tinkoff_fallback_bounded_when_listed_from_empty():
                 f"compute_missing_dates() to bound the window — "
                 f"not 2014-01-01."
             )
+
+
+@pytest.mark.asyncio
+async def test_tinkoff_fallback_trails_recent_gap_over_historical_holes():
+    """Foreign securities (no MOEX board) have bars that start years
+    after their ``listed_from`` floor. ``compute_missing_dates`` from
+    the floor returns multi-year holes, and ``min(missing)`` picks the
+    oldest hole — the fallback then chunks 12 years of 7-day windows,
+    times out, and trips the circuit breaker every cycle (observed
+    2026-10-01: ~1870 instruments stuck stale).
+
+    The fix limits the fetch to gaps inside the trailing 90-day
+    window; this test asserts the fetch starts at the first missing
+    day *after the most recent bar*, not at the historical hole.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        db_path = str(Path(td) / "test.db")
+        # Seed a small schema (same shape as _seed_db).
+        con = sqlite3.connect(db_path)
+        con.executescript(
+            """
+            CREATE TABLE instruments (
+                figi TEXT PRIMARY KEY, ticker TEXT NOT NULL,
+                class TEXT NOT NULL, listed_from TEXT NOT NULL,
+                listed_till TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+                currency TEXT NOT NULL DEFAULT 'RUB',
+                lot_size INTEGER NOT NULL DEFAULT 1,
+                name_lat TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE bars (
+                figi TEXT NOT NULL, ts TEXT NOT NULL,
+                open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+                source TEXT, PRIMARY KEY (figi, ts)
+            );
+            CREATE TABLE moex_holidays (date TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE ingestion_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+                run_id INTEGER NOT NULL, level TEXT NOT NULL,
+                figi TEXT, message TEXT NOT NULL
+            );
+            CREATE TABLE pipeline (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phase VARCHAR NOT NULL,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP, rows_processed INTEGER DEFAULT 0,
+                status VARCHAR NOT NULL DEFAULT 'ok', detail TEXT
+            );
+            """
+        )
+        figi, ticker = "BBG0FOREIGN1", "RGEN"
+        con.execute(
+            "INSERT INTO instruments(figi, ticker, class, listed_from, listed_till) "
+            "VALUES (?, ?, 'share', '2014-01-01', '2099-12-31')",
+            (figi, ticker),
+        )
+        yesterday = date.today() - timedelta(days=1)
+        # Bars start ~3 years ago (foreign listing reality) and end 5
+        # trading days before yesterday — the recent gap the daily
+        # cycle must chase.
+        bars_start = yesterday - timedelta(days=365 * 3)
+        last_bar = yesterday
+        for _ in range(5):
+            last_bar -= timedelta(days=1)
+            while last_bar.weekday() >= 5:
+                last_bar -= timedelta(days=1)
+        cur = bars_start
+        while cur <= last_bar:
+            if cur.weekday() < 5:
+                con.execute(
+                    "INSERT INTO bars(figi, ts, open, high, low, close, volume, source) "
+                    "VALUES (?, ?, 100, 101, 99, 100, 1000, 'tinkoff')",
+                    (figi, cur.isoformat()),
+                )
+            cur += timedelta(days=1)
+        con.commit()
+        con.close()
+
+        # Expected: from_d is the first missing trading day AFTER the
+        # last bar (the recent gap), NOT the 2014 hole.
+        expected_first = last_bar + timedelta(days=1)
+        while expected_first.weekday() >= 5:
+            expected_first += timedelta(days=1)
+
+        recorder = _CallRecorder()
+        await _drive_backfill_from_moex(db_path, recorder)
+
+        assert len(recorder.calls) >= 1, (
+            f"fallback not called; calls={recorder.calls}"
+        )
+        _, _, from_d, to_d = recorder.calls[0]
+        assert from_d == expected_first, (
+            f"from_d={from_d}: expected {expected_first} (first missing "
+            f"day after the last bar at {last_bar}). If this is "
+            f"2014-01-01 the multi-year hole is being fetched again."
+        )
+        assert to_d == yesterday
