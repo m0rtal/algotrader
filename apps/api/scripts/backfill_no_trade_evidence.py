@@ -168,6 +168,14 @@ def main() -> int:
                     # unknown, do not guess.
                     figis_nometa += 1
                     continue
+                if r["max_ts"] and r["max_ts"] > lt_iso:
+                    # Local bars exist AFTER the last MOEX board day:
+                    # the instrument trades through the broker (foreign
+                    # securities with closed MOEX boards — TSLA, BABA).
+                    # Its MOEX listed_till is not a delisting for our
+                    # pipeline; do not record it.
+                    figis_nometa += 1
+                    continue
                 market = "bonds" if board in _BONDS_BOARDS else "shares"
                 win_hi = lt
                 figis_delisted += 1

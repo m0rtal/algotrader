@@ -817,3 +817,71 @@ def test_populate_script_bounds_by_listed_till_and_subtracts_evidence(tmp_path):
         f"expected_bars={value}; want {base - 2} "
         f"(bounded by listed_till, minus 2 evidence days)"
     )
+
+
+def test_populate_script_ignores_listed_till_before_listing(tmp_path):
+    """A listed_till BEFORE the listing window is a MOEX board artefact
+    for foreign securities traded via the broker (TSLA: MOEX boards
+    closed 2020-09, bars through today). The guard must ignore it so
+    expected_bars is not zeroed.
+    """
+    import os
+    import subprocess
+    from datetime import date as _date
+
+    db = tmp_path / "y.db"
+    con = sqlite3.connect(str(db))
+    con.executescript("""
+        CREATE TABLE instruments (
+            figi TEXT PRIMARY KEY, ticker TEXT NOT NULL, class TEXT NOT NULL,
+            isin TEXT, source_updated_at TEXT, expected_bars INTEGER,
+            listed_till TEXT
+        );
+        CREATE TABLE bars (
+            figi TEXT NOT NULL, ts TEXT NOT NULL,
+            open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+            source TEXT, PRIMARY KEY (figi, ts)
+        );
+        CREATE TABLE moex_holidays (date TEXT PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE moex_no_trade_evidence (
+            figi TEXT NOT NULL, session_date TEXT NOT NULL,
+            board TEXT NOT NULL, isin TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'moex_iss',
+            observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT NOT NULL,
+            UNIQUE (figi, session_date)
+        );
+    """)
+    # TSLA-like: first bar 2025-08-18, MOEX listed_till 2020-09-07.
+    con.execute(
+        "INSERT INTO instruments(figi, ticker, class, source_updated_at, listed_till) "
+        "VALUES ('FIGI1', 'TSLA', 'share', '2025-08-18', '2020-09-07')"
+    )
+    con.execute(
+        "INSERT INTO bars(figi, ts, open, high, low, close, volume, source) "
+        "VALUES ('FIGI1', '2025-08-18', 1, 1, 1, 1, 1, 'tinkoff')"
+    )
+    con.commit()
+    con.close()
+
+    env = dict(os.environ); env.pop("PYTHONPATH", None)
+    r = subprocess.run(
+        ["/home/hermes/algotrader/apps/api/.venv/bin/python",
+         "/home/hermes/algotrader/apps/api/scripts/populate_expected_bars.py",
+         "--db", str(db)],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    assert r.returncode == 0, f"{r.stdout} {r.stderr}"
+
+    import sys as _sys
+    _sys.path.insert(0, "/home/hermes/algotrader/apps/api/src")
+    from algotrader_api.ml.coverage import expected_business_days
+    from datetime import timedelta as _td
+    con2 = sqlite3.connect(str(db))
+    value = con2.execute("SELECT expected_bars FROM instruments WHERE figi='FIGI1'").fetchone()[0]
+    con2.close()
+    want = expected_business_days(
+        sqlite3.connect(str(db)), _date(2025, 8, 18),
+        _date.today() - _td(days=1),
+    )
+    assert value == want, f"expected_bars={value}, want {want} (guard must ignore 2020 listed_till)"
