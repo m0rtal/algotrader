@@ -106,10 +106,15 @@ def main() -> int:
             listing = r["listing_ts"]
             listing_date = date.fromisoformat(listing[:10])  # "2024-01-15T10:00:00"
             # Delisted instruments stop expecting sessions at listed_till.
+            # Guard: a listed_till BEFORE the listing window is a MOEX
+            # board artefact (foreign securities whose MOEX boards closed
+            # years before the broker's data — e.g. TSLA listed_till
+            # 2020-09-07 with bars through today). Applying it would
+            # zero the denominator. Ignore nonsensical bounds.
             end_date = yesterday
             if has_listed_till and r["listed_till"]:
                 lt = date.fromisoformat(str(r["listed_till"])[:10])
-                if lt < end_date:
+                if listing_date < lt < end_date:
                     end_date = lt
             expected = expected_business_days(con, listing_date, end_date)
             # Subtract confirmed no-trade sessions inside the window.

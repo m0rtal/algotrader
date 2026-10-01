@@ -54,6 +54,7 @@ from algotrader_api.ingestion.client import make_client  # noqa: E402
 DEFAULT_DB = "/home/hermes/algotrader/apps/api/data/state.db"
 DEFAULT_DAYS = 90
 COVERAGE_THRESHOLD = 0.95
+FETCH_TIMEOUT_S = 900
 
 
 async def run(db_path: str, limit: int, dry_run: bool, sleep_s: float,
@@ -137,12 +138,17 @@ async def run(db_path: str, limit: int, dry_run: bool, sleep_s: float,
                     _fetch_tinkoff_fallback_impl(
                         client, retry_mod, figi, ticker, lo, last_session,
                     ),
-                    timeout=45,
+                    # Generous per-figi budget: a 4000-day window is up
+                    # to ~570 chunks x ~0.15 s ≈ 85 s of legitimate work.
+                    # 45 s killed such figis mid-fetch and discarded all
+                    # in-memory rows (observed: KBWB lost its 2015-2021
+                    # downloads to the old 45-s cap).
+                    timeout=FETCH_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
                 errors += 1
-                print(f"  [{i}/{len(tinkoff_only)}] {ticker}: timeout 45s; "
-                      f"reopening client")
+                print(f"  [{i}/{len(tinkoff_only)}] {ticker}: timeout "
+                      f"{FETCH_TIMEOUT_S}s; reopening client")
                 # A stuck fetch may indicate a poisoned channel; rebuild.
                 try:
                     await client.aclose()
