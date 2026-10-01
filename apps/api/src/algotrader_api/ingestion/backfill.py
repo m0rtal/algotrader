@@ -625,10 +625,17 @@ async def _fetch_tinkoff_fallback_impl(
     while cur <= to_d:
         chunk_end = min(cur + timedelta(days=6), to_d)
         chunk_start_t = _time.time()
+        # The broker's date_to is EXCLUSIVE: a [09-25..09-30] request
+        # returns rows through 09-29 only. Ask for one extra day or the
+        # final day of every window is never fetched (observed
+        # 2026-10-01: RGEN max_ts stuck at the session before the last
+        # one). Slightly over-fetching into an unfinished session is
+        # harmless — the broker returns only closed candles.
+        fetch_end = chunk_end + timedelta(days=1)
         try:
             chunk = await chunk_retry.run(
-                lambda cur=cur, chunk_end=chunk_end: client.get_candles(
-                    figi=figi, date_from=cur, date_to=chunk_end,
+                lambda cur=cur, fetch_end=fetch_end: client.get_candles(
+                    figi=figi, date_from=cur, date_to=fetch_end,
                     interval="CANDLE_INTERVAL_DAY",
                 )
             )

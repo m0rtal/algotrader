@@ -439,3 +439,39 @@ async def test_tinkoff_fallback_trails_recent_gap_over_historical_holes():
             f"2014-01-01 the multi-year hole is being fetched again."
         )
         assert to_d == yesterday
+
+
+@pytest.mark.asyncio
+async def test_tinkoff_fallback_covers_final_day_of_window():
+    """Tinkoff's ``date_to`` is EXCLUSIVE: a [09-25..09-30] request
+    returns rows through 09-29 only, so the last day of the window was
+    never fetched (observed 2026-10-01: foreign instruments stuck at
+    max_ts = second-to-last session). The fetch must ask for one extra
+    day past the chunk end.
+    """
+    from algotrader_api.ingestion import retry as retry_mod
+    from algotrader_api.ingestion.backfill import _fetch_tinkoff_fallback_impl
+
+    calls = []
+
+    class _Client:
+        async def get_candles(self, *, figi, date_from, date_to, interval):
+            calls.append((date_from, date_to))
+            return [{
+                "ts": date_from, "open": 1.0, "high": 1.0,
+                "low": 1.0, "close": 1.0, "volume": 1,
+            }]
+
+    out = await _fetch_tinkoff_fallback_impl(
+        _Client(), retry_mod, "F", "T",
+        date(2026, 9, 25), date(2026, 9, 30),
+    )
+    assert out, "expected at least one row returned by the stub"
+    assert calls, "get_candles was never called"
+    last_from, last_to = calls[-1]
+    assert last_from == date(2026, 9, 25)
+    assert last_to == date(2026, 9, 30) + timedelta(days=1), (
+        f"last chunk must request date_to=2026-10-01 (exclusive), got "
+        f"{last_to}. With the old code the final day 2026-09-30 was "
+        f"never fetched."
+    )
