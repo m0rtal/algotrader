@@ -1,12 +1,27 @@
 #!/usr/bin/env bash
-# cron_liveness_check.sh — backstop for the algotrader-live worker.
+# cron_liveness_check.sh — backstop for the algotrader worker(s).
 #
 # Why: the algotrader-supervisor.sh in-process watchdog only restarts
-# on rc≠0 exit. When the worker dies silently (OOM kill, segfault,
+# on rc!=0 exit. When the worker dies silently (OOM kill, segfault,
 # hang) without exit, nothing restarts it. This 2-minute cron reads
-# the most recent pipeline_heartbeat.updated_at from the prod DB; if
-# it's older than 5 minutes (300s), the worker is stuck/dead and we
-# SIGKILL it so the supervisor's restart loop takes over.
+# the most recent worker heartbeat from the prod DB; if it's older
+# than the stale threshold, the worker is stuck/dead and we SIGKILL it
+# so the supervisor's restart loop takes over.
+#
+# 2026-10-01 fix: the daily worker (`worker.py daily first`) writes
+# its heartbeat to the `pipeline` table (phase='worker.heartbeat'),
+# NOT to `pipeline_heartbeat` (that table is written by the live-loop
+# worker only). The original query read `pipeline_heartbeat` alone —
+# when the live loop was not running, that row was days old, the cron
+# declared the heartbeat stale, and SIGKILLed the *daily* worker every
+# 2 minutes. The daily chain never survived past its first minutes and
+# bars stopped accumulating (observed 2026-10-01: kill -9 at 08:00,
+# 08:02, 08:04, 08:08, 08:10, 08:12 MSK).
+#
+# The query now takes the freshest heartbeat across BOTH stores, and
+# the stale threshold is 10 minutes (600s) — the daily worker emits a
+# `pipeline` heartbeat every ~5 minutes, so 300s was racing the
+# emission interval.
 #
 # Catches the failure modes the in-process watchdog misses:
 #   - Supervisor itself dies (so its watchdog dies with it)
@@ -24,14 +39,14 @@ set -u
 WORKER_NAME="${ALGOTRADER_LIVE_WORKER:-algotrader-moex-backfill}"
 DB="${ALGOTRADER_STATE_DB:-/home/hermes/algotrader/apps/api/data/state.db}"
 LOG="/home/hermes/.hermes/logs/algotrader-liveness-cron.log"
-STALE_THRESHOLD_SECONDS="${LIVENESS_STALE_THRESHOLD:-300}"
+STALE_THRESHOLD_SECONDS="${LIVENESS_STALE_THRESHOLD:-600}"
 
 mkdir -p "$(dirname "$LOG")"
 TS="$(date -Iseconds)"
 
-# Read most recent heartbeat.updated_at and return its age in seconds.
-# Returns empty string if the table doesn't exist (pre-Task-2 schema)
-# or has no rows.
+# Read the freshest heartbeat across both stores and return its age in
+# seconds. Returns empty string if neither table exists or both are
+# empty.
 HEARTBEAT_AGE_S="$(
 DB="$DB" python3 <<'PYEOF' 2>/dev/null
 import os, sqlite3, sys
@@ -39,42 +54,51 @@ from datetime import datetime, timezone
 db = os.environ.get('DB', '')
 if not db or not os.path.exists(db):
     sys.exit(0)
+
+def _parse(iso):
+    iso = iso.replace('T', ' ')
+    for candidate in (iso, iso.split('.')[0].split('+')[0]):
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+    return None
+
 try:
     con = sqlite3.connect(db, timeout=5)
-    row = con.execute(
-        "SELECT updated_at FROM pipeline_heartbeat "
-        "ORDER BY updated_at DESC LIMIT 1"
-    ).fetchone()
-    if not row:
-        sys.exit(0)
-    iso = row[0]
-    # Tolerate both "YYYY-MM-DDTHH:MM:SS" (worker.py writes) and
-    # "YYYY-MM-DD HH:MM:SS" (julianday() default). The T→space swap is
-    # intentional and only fires if the timestamp lacks a 'T' or ' '.
-    iso_clean = iso.replace('T', ' ')
-    if 'T' not in iso and ' ' not in iso:
-        iso_clean = iso
+    candidates = []
     try:
-        ts = datetime.fromisoformat(iso_clean)
-    except ValueError:
-        # Last-resort: strip microseconds + timezone suffix.
-        iso_clean = iso.split('.')[0].split('+')[0].replace('T', ' ')
-        ts = datetime.fromisoformat(iso_clean)
+        row = con.execute(
+            "SELECT updated_at FROM pipeline_heartbeat "
+            "ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        if row and row[0]:
+            candidates.append(row[0])
+    except sqlite3.OperationalError:
+        pass
+    try:
+        row = con.execute(
+            "SELECT MAX(finished_at) FROM pipeline "
+            "WHERE phase='worker.heartbeat'"
+        ).fetchone()
+        if row and row[0]:
+            candidates.append(row[0])
+    except sqlite3.OperationalError:
+        pass
+    parsed = [p for p in (_parse(c) for c in candidates) if p is not None]
+    if not parsed:
+        sys.exit(0)
+    ts = max(parsed)
     age_s = int((datetime.now(timezone.utc).replace(tzinfo=None) - ts).total_seconds())
     print(age_s)
 except sqlite3.OperationalError:
-    # Table missing → empty result so the bash fallback fires.
+    # Tables missing -> empty result so the bash fallback fires.
     sys.exit(0)
 PYEOF
 )"
 
-# If the heartbeat table doesn't exist (live mode never started) OR no
-# rows, fall back to checking worker process presence. Two reasons:
-#   1. Pre-Task-2 deployments don't have the table yet; we still want
-#      the cron to be useful (process-presence is a weaker but real
-#      liveness signal).
-#   2. A fresh boot where the worker hasn't yet written its first
-#      heartbeat — pgrep is the next-best check.
+# If neither heartbeat store has rows, fall back to checking worker
+# process presence (weaker but real liveness signal).
 if [ -z "$HEARTBEAT_AGE_S" ]; then
     if pgrep -f 'worker.py daily first' >/dev/null 2>&1; then
         echo "[$TS] no heartbeat row but worker process alive; ok." >> "$LOG"
