@@ -740,3 +740,80 @@ def test_check_coverage_without_listed_till_column_still_works():
     # (2026-09-30); bar on 09-10 is stale.
     reasons = {f["figi"]: f["reason"] for f in failing}
     assert "stale" in reasons["FIGI1"]
+
+
+def test_populate_script_bounds_by_listed_till_and_subtracts_evidence(tmp_path):
+    """End-to-end: run the REAL populate script on a temp DB.
+
+    expected_bars must be bounded by listed_till (delisted instrument)
+    and reduced by confirmed no-trade evidence days inside the window.
+    """
+    import os
+    import subprocess
+    from pathlib import Path
+    from datetime import date as _date
+
+    db = tmp_path / "x.db"
+    con = sqlite3.connect(str(db))
+    con.executescript("""
+        CREATE TABLE instruments (
+            figi TEXT PRIMARY KEY, ticker TEXT NOT NULL, class TEXT NOT NULL,
+            isin TEXT, source_updated_at TEXT, expected_bars INTEGER,
+            listed_till TEXT
+        );
+        CREATE TABLE bars (
+            figi TEXT NOT NULL, ts TEXT NOT NULL,
+            open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+            source TEXT, PRIMARY KEY (figi, ts)
+        );
+        CREATE TABLE moex_holidays (date TEXT PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE moex_no_trade_evidence (
+            figi TEXT NOT NULL, session_date TEXT NOT NULL,
+            board TEXT NOT NULL, isin TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'moex_iss',
+            observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT NOT NULL,
+            UNIQUE (figi, session_date)
+        );
+    """)
+    # Delisted fixture: listing 2025-01-01, delisted 2026-09-10.
+    con.execute(
+        "INSERT INTO instruments(figi, ticker, class, source_updated_at, listed_till) "
+        "VALUES ('FIGI1', 'X', 'bond', '2025-01-01', '2026-09-10')"
+    )
+    # Evidence: two confirmed no-trade weekdays inside the window.
+    con.executemany(
+        "INSERT INTO moex_no_trade_evidence(figi, session_date, board, isin, expires_at) "
+        "VALUES ('FIGI1', ?, 'TQCB', 'X', '2027-01-01')",
+        [("2026-09-09",), ("2026-09-10",)],
+    )
+    con.commit()
+    con.close()
+
+    # Compute the raw business-day count the script would use WITHOUT
+    # the two adjustments (same helper the script uses).
+    import sys as _sys
+    _sys.path.insert(0, "/home/hermes/algotrader/apps/api/src")
+    from algotrader_api.ml.coverage import expected_business_days
+    con2 = sqlite3.connect(str(db))
+    base = expected_business_days(con2, _date(2025, 1, 1), _date(2026, 9, 10))
+    con2.close()
+    assert base > 2
+
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    r = subprocess.run(
+        ["/home/hermes/algotrader/apps/api/.venv/bin/python",
+         "/home/hermes/algotrader/apps/api/scripts/populate_expected_bars.py",
+         "--db", str(db)],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    assert r.returncode == 0, f"script failed: {r.stdout} {r.stderr}"
+
+    con3 = sqlite3.connect(str(db))
+    value = con3.execute("SELECT expected_bars FROM instruments WHERE figi='FIGI1'").fetchone()[0]
+    con3.close()
+    assert value == base - 2, (
+        f"expected_bars={value}; want {base - 2} "
+        f"(bounded by listed_till, minus 2 evidence days)"
+    )
