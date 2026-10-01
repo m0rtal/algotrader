@@ -622,6 +622,7 @@ async def _fetch_tinkoff_fallback_impl(
     )
     out = []
     cur = from_d
+    consecutive_failures = 0
     while cur <= to_d:
         chunk_end = min(cur + timedelta(days=6), to_d)
         chunk_start_t = _time.time()
@@ -689,6 +690,24 @@ async def _fetch_tinkoff_fallback_impl(
                     message="Tinkoff channel closed mid-run; aborting figi (will rebuild next cycle)",
                 )
                 return out
+            # De-listed / frozen instruments fail EVERY chunk (the
+            # broker has no data and each call burns its retry budget).
+            # Continuing through 13 chunks per figi wasted ~45 s each
+            # and tripped the per-figi timeout, which counted as a
+            # circuit-breaker failure — ~1649 instruments accumulated
+            # fake breakers this way on 2026-10-01. Two consecutive
+            # chunk failures is enough evidence: bail out and let the
+            # breaker accounting decide the figi's fate cheaply.
+            consecutive_failures += 1
+            if consecutive_failures >= 2:
+                logger.warn(
+                    "backfill.tinkoff.chunk_fail_bail",
+                    figi=figi, ticker=ticker,
+                    message="2 consecutive chunk failures; aborting figi early",
+                )
+                return out
+        else:
+            consecutive_failures = 0
         cur = chunk_end + timedelta(days=1)
     return out
 

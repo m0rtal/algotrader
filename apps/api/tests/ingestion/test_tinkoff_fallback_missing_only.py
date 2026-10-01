@@ -475,3 +475,34 @@ async def test_tinkoff_fallback_covers_final_day_of_window():
         f"{last_to}. With the old code the final day 2026-09-30 was "
         f"never fetched."
     )
+
+
+@pytest.mark.asyncio
+async def test_tinkoff_fallback_bails_after_two_consecutive_chunk_failures():
+    """De-listed / frozen instruments fail every chunk. The fallback
+    must bail out after 2 consecutive chunk failures instead of walking
+    all chunks (each burning its retry budget) and tripping the 45 s
+    per-figi timeout — which accumulated ~1649 fake circuit breakers
+    on 2026-10-01.
+    """
+    from algotrader_api.ingestion import retry as retry_mod
+    from algotrader_api.ingestion.backfill import _fetch_tinkoff_fallback_impl
+
+    calls = []
+
+    class _FailingClient:
+        async def get_candles(self, *, figi, date_from, date_to, interval):
+            calls.append((date_from, date_to))
+            raise RuntimeError("delisted instrument: no data")
+
+    out = await _fetch_tinkoff_fallback_impl(
+        _FailingClient(), retry_mod, "F", "DEAD",
+        date(2026, 7, 1), date(2026, 9, 30),   # 13 chunks if not bailing
+    )
+    assert out == []
+    # 2 chunks x 2 retry attempts = 4 calls max; anything more means
+    # the loop kept walking after two consecutive failures.
+    assert len(calls) <= 4, (
+        f"expected the fetch to bail after 2 consecutive chunk failures "
+        f"(<=4 get_candles calls), got {len(calls)} calls"
+    )
