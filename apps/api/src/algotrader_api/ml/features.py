@@ -100,49 +100,70 @@ def check_coverage(
         if row["expires_at"] < today_iso:
             continue
         no_trade_by_figi.setdefault(row["figi"], set()).add(row["session_date"])
+    # `listed_till` (migration 026) marks delisted instruments; older
+    # databases may not have the column yet.
+    has_listed_till = any(
+        r[1] == "listed_till"
+        for r in conn.execute("PRAGMA table_info(instruments)").fetchall()
+    )
     for figi in figis:
-        row = conn.execute(
-            """SELECT
-                (SELECT MAX(ts) FROM bars WHERE figi = ?) AS max_ts,
-                (SELECT COUNT(*) FROM bars WHERE figi = ?) AS bars_count,
-                (SELECT expected_bars FROM instruments WHERE figi = ?) AS expected
-            """,
-            (figi, figi, figi),
-        ).fetchone()
+        if has_listed_till:
+            row = conn.execute(
+                """SELECT
+                    (SELECT MAX(ts) FROM bars WHERE figi = ?) AS max_ts,
+                    (SELECT COUNT(*) FROM bars WHERE figi = ?) AS bars_count,
+                    (SELECT expected_bars FROM instruments WHERE figi = ?) AS expected,
+                    (SELECT listed_till FROM instruments WHERE figi = ?) AS listed_till
+                """,
+                (figi, figi, figi, figi),
+            ).fetchone()
+            listed_till = row[3]
+        else:
+            row = conn.execute(
+                """SELECT
+                    (SELECT MAX(ts) FROM bars WHERE figi = ?) AS max_ts,
+                    (SELECT COUNT(*) FROM bars WHERE figi = ?) AS bars_count,
+                    (SELECT expected_bars FROM instruments WHERE figi = ?) AS expected
+                """,
+                (figi, figi, figi),
+            ).fetchone()
+            listed_till = None
         max_ts, bars_count, expected = row[0], row[1], row[2]
+        # Effective end of expected sessions: a delisted instrument
+        # stops expecting bars at its listed_till, so it must not be
+        # flagged stale for sessions after the delisting.
+        eff_end = cutoff
+        if listed_till:
+            lt = str(listed_till)[:10]
+            if lt < cutoff:
+                eff_end = lt
         reasons = []
-        if max_ts is None or max_ts < cutoff:
+        if max_ts is None or max_ts < eff_end:
             reasons.append("stale")
-        # Staleness override: if the figi has a real bar on the last
-        # completed session OR a continuous chain of confirmed zero-trade
-        # evidence that reaches the last completed session, do not flag
-        # it as stale. Otherwise older bars followed by a long stretch of
-        # silence would block ML on instruments whose market was closed.
+        # Staleness override: if the figi has a real bar on the effective
+        # last session OR a continuous chain of confirmed zero-trade
+        # evidence that reaches it, do not flag it as stale. Otherwise
+        # older bars followed by a long stretch of silence would block
+        # ML on instruments whose market was closed or that delisted.
         if "stale" in reasons:
             evidence_dates = no_trade_by_figi.get(figi, set())
-            if evidence_dates:
-                last_chain = last_session
-                cur = last_session
-                covered = False
-                while cur.weekday() >= 5 or conn.execute(
+            cur = date.fromisoformat(eff_end)
+            covered = False
+            while cur.isoformat() >= (max_ts or "0000-00-00"):
+                if cur.weekday() >= 5 or conn.execute(
                     "SELECT 1 FROM moex_holidays WHERE date = ?",
                     (cur.isoformat(),),
                 ).fetchone():
                     cur -= timedelta(days=1)
-                while cur.isoformat() >= cutoff:
-                    if cur.isoformat() == max_ts:
-                        covered = True
-                        break
-                    if cur.isoformat() not in evidence_dates:
-                        break
-                    cur -= timedelta(days=1)
-                else:
-                    # Reached cutoff without a break: every day in
-                    # [cutoff, last_session] is either a real bar or
-                    # a confirmed no-trade row.
+                    continue
+                if cur.isoformat() == max_ts:
                     covered = True
-                if covered:
-                    reasons.remove("stale")
+                    break
+                if cur.isoformat() not in evidence_dates:
+                    break
+                cur -= timedelta(days=1)
+            if covered:
+                reasons.remove("stale")
         if expected is None or expected <= 0:
             reasons.append("unknown_expected")
         elif bars_count < coverage_threshold * expected:

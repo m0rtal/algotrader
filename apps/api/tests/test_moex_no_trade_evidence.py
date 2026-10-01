@@ -36,7 +36,8 @@ def _make_conn():
             ticker TEXT NOT NULL,
             isin TEXT,
             source_updated_at TEXT,
-            expected_bars INTEGER
+            expected_bars INTEGER,
+            listed_till TEXT
         );
         CREATE TABLE bars (
             figi TEXT NOT NULL,
@@ -577,3 +578,165 @@ def test_fetch_year_moex_emits_raw_columns_per_dict():
     assert bar["_numtrades"] == 5
     partial = by_ts["2026-09-30"]
     assert partial["_secid"] == "RU000A0JWVL2"
+
+
+# -- delisted instruments (listed_till, migration 026) ---------------------
+
+
+def test_check_coverage_delisted_with_evidence_chain_not_stale():
+    """A delisted figi whose last bar + evidence chain reach listed_till
+    is complete and must not be flagged stale."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_no_trade_evidence,
+    )
+    from algotrader_api.ml.features import check_coverage
+
+    con = _make_conn()
+    # Delisted 2026-09-10; last bar 2026-09-08; no-trade on 09-09 and 09-10.
+    con.execute(
+        "INSERT INTO instruments(figi, ticker, isin, source_updated_at, expected_bars, listed_till) "
+        "VALUES ('FIGI1', 'X', 'X', '2025-01-01', 1, '2026-09-10')"
+    )
+    _insert_bar(con, "FIGI1", "2026-09-08")
+    record_no_trade_evidence(
+        con, figi="FIGI1",
+        rows=[{"ts": "2026-09-09"}, {"ts": "2026-09-10"}],
+        board="TQCB", isin="X",
+    )
+    # today far after the delisting
+    import datetime as _dt
+    today = date(2026, 10, 1)
+    real_today = _dt.date
+
+    class _FakeDate(real_today):
+        @classmethod
+        def today(cls):
+            return today
+
+    import algotrader_api.ml.features as features_mod
+    features_mod.date = _FakeDate
+    try:
+        failing = check_coverage(con, ["FIGI1"])
+    finally:
+        features_mod.date = real_today
+    assert failing == [], f"expected no failure, got {failing}"
+
+
+def test_check_coverage_delisted_without_evidence_is_stale():
+    """A delisted figi with a gap between last bar and listed_till stays
+    stale (no evidence, no bar)."""
+    from algotrader_api.ml.features import check_coverage
+
+    con = _make_conn()
+    con.execute(
+        "INSERT INTO instruments(figi, ticker, isin, source_updated_at, expected_bars, listed_till) "
+        "VALUES ('FIGI1', 'X', 'X', '2025-01-01', 1, '2026-09-10')"
+    )
+    _insert_bar(con, "FIGI1", "2026-09-01")  # gap 09-02..09-10, no evidence
+    import datetime as _dt
+    today = date(2026, 10, 1)
+    real_today = _dt.date
+
+    class _FakeDate(real_today):
+        @classmethod
+        def today(cls):
+            return today
+
+    import algotrader_api.ml.features as features_mod
+    features_mod.date = _FakeDate
+    try:
+        failing = check_coverage(con, ["FIGI1"])
+    finally:
+        features_mod.date = real_today
+    reasons = {f["figi"]: f["reason"] for f in failing}
+    assert "FIGI1" in reasons
+    assert "stale" in reasons["FIGI1"]
+
+
+def test_check_coverage_delisted_last_bar_on_listed_till_passes():
+    """A delisted figi whose last bar IS the listed_till date passes with
+    no evidence needed."""
+    from algotrader_api.ml.features import check_coverage
+
+    con = _make_conn()
+    con.execute(
+        "INSERT INTO instruments(figi, ticker, isin, source_updated_at, expected_bars, listed_till) "
+        "VALUES ('FIGI1', 'X', 'X', '2025-01-01', 1, '2026-09-10')"
+    )
+    _insert_bar(con, "FIGI1", "2026-09-10")
+    import datetime as _dt
+    today = date(2026, 10, 1)
+    real_today = _dt.date
+
+    class _FakeDate(real_today):
+        @classmethod
+        def today(cls):
+            return today
+
+    import algotrader_api.ml.features as features_mod
+    features_mod.date = _FakeDate
+    try:
+        failing = check_coverage(con, ["FIGI1"])
+    finally:
+        features_mod.date = real_today
+    assert failing == [], f"expected no failure, got {failing}"
+
+
+def test_check_coverage_without_listed_till_column_still_works():
+    """Old databases without migration 026 keep the previous behaviour."""
+    from algotrader_api.ml.features import check_coverage
+
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+        CREATE TABLE instruments (
+            figi TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            isin TEXT,
+            source_updated_at TEXT,
+            expected_bars INTEGER
+        );
+        CREATE TABLE bars (
+            figi TEXT NOT NULL, ts TEXT NOT NULL,
+            open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
+            close REAL NOT NULL, volume INTEGER NOT NULL,
+            source TEXT NOT NULL DEFAULT 'tinkoff',
+            PRIMARY KEY (figi, ts)
+        );
+        CREATE TABLE moex_no_trade_evidence (
+            figi TEXT NOT NULL, session_date TEXT NOT NULL,
+            board TEXT NOT NULL, isin TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'moex_iss',
+            observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT NOT NULL,
+            UNIQUE (figi, session_date)
+        );
+        CREATE TABLE moex_holidays (date TEXT PRIMARY KEY, name TEXT NOT NULL);
+    """)
+    con.execute(
+        "INSERT INTO instruments(figi, ticker, isin, source_updated_at, expected_bars) "
+        "VALUES ('FIGI1', 'X', 'X', '2025-01-01', 1)"
+    )
+    con.execute(
+        "INSERT INTO bars(figi, ts, open, high, low, close, volume, source) "
+        "VALUES ('FIGI1', '2026-09-10', 1, 1, 1, 1, 1, 'tinkoff')"
+    )
+    import datetime as _dt
+    today = date(2026, 10, 1)
+    real_today = _dt.date
+
+    class _FakeDate(real_today):
+        @classmethod
+        def today(cls):
+            return today
+
+    import algotrader_api.ml.features as features_mod
+    features_mod.date = _FakeDate
+    try:
+        failing = check_coverage(con, ["FIGI1"])
+    finally:
+        features_mod.date = real_today
+    # No listed_till column -> cut-off is the plain last session
+    # (2026-09-30); bar on 09-10 is stale.
+    reasons = {f["figi"]: f["reason"] for f in failing}
+    assert "stale" in reasons["FIGI1"]
