@@ -164,7 +164,24 @@ async def run(db_path: str, limit: int, dry_run: bool, sleep_s: float,
                       f"({bars[0]['ts']}..{bars[-1]['ts']})")
                 written += len(bars)
                 continue
-            replace_bars_for_figi(db_path, figi, bars, replace=False)
+            # The nightly worker writes concurrently; a write collision
+            # ("database is locked" past the busy_timeout) must not kill
+            # the whole sweep. Retry with backoff, then skip the figi —
+            # the next run picks it up.
+            last_err = None
+            for attempt in range(6):
+                try:
+                    replace_bars_for_figi(db_path, figi, bars, replace=False)
+                    last_err = None
+                    break
+                except sqlite3.OperationalError as e:
+                    last_err = e
+                    time.sleep(5 * (attempt + 1))
+            if last_err is not None:
+                errors += 1
+                print(f"  [{i}/{len(tinkoff_only)}] {ticker}: DB write failed "
+                      f"after retries: {last_err!s:.80}")
+                continue
             written += len(bars)
             if sleep_s:
                 time.sleep(sleep_s)
