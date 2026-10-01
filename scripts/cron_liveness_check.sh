@@ -124,7 +124,18 @@ if [ -n "$WORKER_PID" ]; then
     kill -9 "$WORKER_PID" 2>&1 >> "$LOG"
     echo "[$TS] kill -9 sent to pid=$WORKER_PID rc=$?" >> "$LOG"
 else
-    echo "[$TS] WARN: no worker pid found via pgrep, but heartbeat is stale. Worker likely already dead; supervisor will relaunch on its own schedule." >> "$LOG"
+    # No worker process. If the supervisor is alive it will respawn the
+    # worker on its own restart loop. If NEITHER is alive (supervisor
+    # died silently too), nothing else would ever relaunch the chain —
+    # dispatch the clean supervisor wrapper now.
+    if pgrep -f 'algotrader-moex-backfill' >/dev/null 2>&1; then
+        echo "[$TS] supervisor alive without worker; its restart loop will respawn." >> "$LOG"
+    else
+        echo "[$TS] no worker AND no supervisor; relaunching via algotrader-moex-supervisor-clean.sh." >> "$LOG"
+        setsid bash /home/hermes/algotrader/scripts/algotrader-moex-supervisor-clean.sh \
+            >> /home/hermes/.hermes/logs/algotrader-moex-backfill.log 2>&1 < /dev/null &
+        echo "[$TS] relaunch dispatched pid=$!" >> "$LOG"
+    fi
 fi
 
 exit 0
