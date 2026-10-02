@@ -64,8 +64,8 @@ def fresh_db(tmp_path):
     sqlitedb.close_all()
     con = sqlite3.connect(db_path)
     con.execute(
-        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
-        "VALUES ('SBER', 'BBG004730N88', 'share', 'Sber', 'rub', 10)"
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin) "
+        "VALUES ('SBER', 'BBG004730N88', 'share', 'Sber', 'rub', 10, 'RU0009029540')"
     )
     con.commit()
     con.close()
@@ -230,7 +230,7 @@ async def test_recent_tail_reports_rows_actually_inserted_not_attempted(
                                     0, 1, 1, 0,
                                     "2014-01-01", "2099-12-31",
                                     "2014-01-01", "2099-12-31",
-                                    1, "SUR", "%"]]}},
+                                    1, "SUR", "%"]]}, "description": {"data": [['ISIN', 'ISIN', 'RU0009029540']]}},
     )
 
     # Window: [2026-09-11 .. 2026-09-21] (yesterday=2026-09-21 for days=5).
@@ -239,10 +239,10 @@ async def test_recent_tail_reports_rows_actually_inserted_not_attempted(
     def sber_history_cb(request):
         return (200, {}, json.dumps({
             "history": {
-                "columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"],
+                "columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "SECID", "BOARDID"],
                 "data": [
-                    ["2026-09-18", 100.0, 101.0, 99.0, 100.5, 1000],
-                    ["2026-09-21", 101.0, 102.0, 100.0, 101.5, 1100],
+                    ["2026-09-18", 100.0, 101.0, 99.0, 100.5, 1000, "SBER", "TQBR"],
+                    ["2026-09-21", 101.0, 102.0, 100.0, 101.5, 1100, "SBER", "TQBR"],
                 ],
             },
             "history.cursor": {"data": [[0, 2, 500]]},
@@ -317,18 +317,18 @@ async def test_recent_tail_writes_only_new_bars_and_counts_them(
                                     0, 1, 1, 0,
                                     "2014-01-01", "2099-12-31",
                                     "2014-01-01", "2099-12-31",
-                                    1, "SUR", "%"]]}},
+                                    1, "SUR", "%"]]}, "description": {"data": [['ISIN', 'ISIN', 'RU0009029540']]}},
     )
 
     # 3 bars in the recent-tail window, none in DB yet.
     def cb(request):
         return (200, {}, json.dumps({
             "history": {
-                "columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"],
+                "columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "SECID", "BOARDID"],
                 "data": [
-                    ["2026-09-15", 100.0, 101.0, 99.0, 100.5, 1000],
-                    ["2026-09-18", 101.0, 102.0, 100.0, 101.5, 1100],
-                    ["2026-09-21", 102.0, 103.0, 101.0, 102.5, 1200],
+                    ["2026-09-15", 100.0, 101.0, 99.0, 100.5, 1000, "SBER", "TQBR"],
+                    ["2026-09-18", 101.0, 102.0, 100.0, 101.5, 1100, "SBER", "TQBR"],
+                    ["2026-09-21", 102.0, 103.0, 101.0, 102.5, 1200, "SBER", "TQBR"],
                 ],
             },
             "history.cursor": {"data": [[0, 3, 500]]},
@@ -413,8 +413,8 @@ async def test_recent_tail_writes_fast_figi_while_slow_metadata_probe_waits(
 
     with sqlite3.connect(fresh_db) as con:
         con.execute(
-            "INSERT INTO instruments (ticker,figi,class,name,currency,lot_size) "
-            "VALUES ('SLOW','SLOWFIGI','share','Slow','rub',1)"
+            "INSERT INTO instruments (ticker,figi,class,name,currency,lot_size,isin) "
+            "VALUES ('SLOW','SLOWFIGI','share','Slow','rub',1,'TEST_SLOW_ISIN')"
         )
     import algotrader_api.ingestion.backfill as bf_mod
     monkeypatch.setattr(
@@ -427,7 +427,13 @@ async def test_recent_tail_writes_fast_figi_while_slow_metadata_probe_waits(
     def get_meta(ticker, _today, **_kw):
         if ticker == "SLOW":
             assert release_slow.wait(10), "slow probe was never released"
-        meta = {"market": "shares", "board": "TQBR", "listed_till": "2099-12-31"}
+        meta = {
+            "market": "shares", "board": "TQBR",
+            "listed_till": "2099-12-31",
+            # Identity gate (PR #176 follow-up): stub the MOEX ISIN
+            # so each stubbed figi matches its seeded instruments row.
+            "isin": "TEST_SLOW_ISIN" if ticker == "SLOW" else "RU0009029540",
+        }
         runner._moex_meta[ticker] = meta
         return meta
 
@@ -435,7 +441,8 @@ async def test_recent_tail_writes_fast_figi_while_slow_metadata_probe_waits(
         if ticker == "SBER":
             fast_fetched.set()
         return [{"ts": "2026-09-28", "open": 1, "high": 1,
-                 "low": 1, "close": 1, "volume": 1}]
+                 "low": 1, "close": 1, "volume": 1,
+                 "_secid": ticker, "_boardid": "TQBR"}]
 
     monkeypatch.setattr(runner, "_get_meta_moex", get_meta)
     monkeypatch.setattr(runner, "_fetch_moex_range", fetch)
@@ -619,7 +626,7 @@ async def test_backfill_from_moex_with_recent_tail_days_runs_the_tail_pass(
                                     0, 1, 1, 0,
                                     "2014-01-01", "2099-12-31",
                                     "2014-01-01", "2099-12-31",
-                                    1, "SUR", "%"]]}},
+                                    1, "SUR", "%"]]}, "description": {"data": [['ISIN', 'ISIN', 'RU0009029540']]}},
     )
 
     hit_count = {"n": 0}
@@ -630,8 +637,8 @@ async def test_backfill_from_moex_with_recent_tail_days_runs_the_tail_pass(
         events.append("history_request")
         return (200, {}, json.dumps({
             "history": {
-                "columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"],
-                "data": [["2026-09-21", 100.0, 101.0, 99.0, 100.5, 1000]],
+                "columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "SECID", "BOARDID"],
+                "data": [["2026-09-21", 100.0, 101.0, 99.0, 100.5, 1000, "SBER", "TQBR"]],
             },
             "history.cursor": {"data": [[0, 1, 500]]},
         }))

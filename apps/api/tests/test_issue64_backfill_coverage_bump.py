@@ -41,12 +41,12 @@ def fresh_db(tmp_path):
     sqlitedb.close_all()
     con = sqlite3.connect(db_path)
     con.executescript("""
-        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size)
-        VALUES ('SBER', 'BBG004730N88', 'share', 'Sber', 'rub', 10);
-        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size)
-        VALUES ('GAZP', 'BBG004730RP0', 'share', 'Gazprom', 'rub', 10);
-        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size)
-        VALUES ('SU46020RMFS2', 'FIGI-BOND', 'bond', 'OFZ', 'rub', 1);
+        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin)
+        VALUES ('SBER', 'BBG004730N88', 'share', 'Sber', 'rub', 10, 'RU0009029540');
+        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin)
+        VALUES ('GAZP', 'BBG004730RP0', 'share', 'Gazprom', 'rub', 10, 'RU0007661625');
+        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin)
+        VALUES ('SU46020RMFS2', 'FIGI-BOND', 'bond', 'OFZ', 'rub', 1, 'RU000A0JSML3');
     """)
     con.commit()
     con.close()
@@ -75,7 +75,8 @@ async def test_pagination_short_page_no_cursor_is_last(fresh_db):
         # listed_from = listed_till = 2024 only → fetcher visits one year
         json={"boards": {"data": [["SBER", "TQBR", "x", 0, 0, "shares", 0, 1, 1, 0,
                                      "2024-01-01", "2024-12-31", "2024-01-01", "2024-12-31",
-                                     1, "SUR", "%"]]}},
+                                     1, "SUR", "%"]]},
+              "description": {"data": [["ISIN", "ISIN", "RU0009029540"]]}},
     )
 
     def short_page_cb(request):
@@ -85,14 +86,14 @@ async def test_pagination_short_page_no_cursor_is_last(fresh_db):
         base = date(2024, 1, 1)
         for i in range(50):
             rows.append([(base + timedelta(days=i)).isoformat(), 100.0 + i, 101.0 + i,
-                         99.0 + i, 100.5 + i, 1000 + i])
+                         99.0 + i, 100.5 + i, 1000 + i, "SBER", "TQBR"])
         # Note: no "history.cursor" key in the response — the fetcher
         # must fall back to "short page = last".
         return (
             200,
             {},
             json.dumps({"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW",
-                                                  "CLOSE", "VOLUME"], "data": rows}}),
+                                                  "CLOSE", "VOLUME", "SECID", "BOARDID"], "data": rows}}),
         )
 
     responses.add_callback(
@@ -162,7 +163,7 @@ async def test_malformed_listed_dates_in_moex_path_is_skipped(fresh_db):
         "https://iss.moex.com/iss/securities/SBER.json",
         json={"boards": {"data": [["SBER", "TQBR", "x", 0, 0, "shares", 0, 1, 1, 0,
                                      "not-a-date", "also-bad", "2014-01-01", "2026-09-15",
-                                     1, "SUR", "%"]]}},
+                                     1, "SUR", "%"]]}, "description": {"data": [['ISIN', 'ISIN', 'RU0009029540']]}},
     )
     # Other tickers → empty boards → Tinkoff fallback (returns empty)
     for ticker in ["GAZP", "SU46020RMFS2"]:
@@ -207,7 +208,7 @@ async def test_delta_only_skips_figi_with_existing_bars_covering_listed_window(f
         "https://iss.moex.com/iss/securities/SBER.json",
         json={"boards": {"data": [["SBER", "TQBR", "x", 0, 0, "shares", 0, 1, 1, 0,
                                      "2014-01-01", "2026-09-14", "2014-01-01", "2026-09-15",
-                                     1, "SUR", "%"]]}},
+                                     1, "SUR", "%"]]}, "description": {"data": [['ISIN', 'ISIN', 'RU0009029540']]}},
     )
     for ticker in ["GAZP", "SU46020RMFS2"]:
         responses.add(

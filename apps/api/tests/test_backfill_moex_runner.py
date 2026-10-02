@@ -24,12 +24,12 @@ def fresh_db(tmp_path):
     sqlitedb.close_all()
     con = sqlite3.connect(db_path)
     con.executescript("""
-        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size)
-        VALUES ('SBER', 'BBG004730N88', 'share', 'Sber', 'rub', 10);
-        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size)
-        VALUES ('GAZP', 'BBG004730RP0', 'share', 'Gazprom', 'rub', 10);
-        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size)
-        VALUES ('SU46020RMFS2', 'FIGI-BOND', 'bond', 'OFZ', 'rub', 1);
+        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin)
+        VALUES ('SBER', 'BBG004730N88', 'share', 'Sber', 'rub', 10, 'RU0009029540');
+        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin)
+        VALUES ('GAZP', 'BBG004730RP0', 'share', 'Gazprom', 'rub', 10, 'RU0007661625');
+        INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin)
+        VALUES ('SU46020RMFS2', 'FIGI-BOND', 'bond', 'OFZ', 'rub', 1, 'RU000A0JSML3');
     """)
     con.commit()
     con.close()
@@ -53,8 +53,8 @@ def sber_only_db(tmp_path):
     sqlitedb.close_all()
     con = sqlite3.connect(db_path)
     con.execute(
-        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
-        "VALUES ('SBER', 'BBG004730N88', 'share', 'Sber', 'rub', 10)"
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin) "
+        "VALUES ('SBER', 'BBG004730N88', 'share', 'Sber', 'rub', 10, 'RU0009029540')"
     )
     con.commit()
     con.close()
@@ -133,15 +133,15 @@ async def test_backfill_from_moex_writes_bars_with_dynamic_dates(fresh_db):
         "https://iss.moex.com/iss/securities/SBER.json",
         json={"boards": {"data": [["SBER", "TQBR", "x", 0, 0, "shares", 0, 1, 1, 0,
                                      "2013-03-25", "2026-09-14", "2013-03-25", "2026-09-15",
-                                     1, "SUR", "%"]]}},
+                                     1, "SUR", "%"]]}, "description": {"data": [['ISIN', 'ISIN', 'RU0009029540']]}},
     )
 
     def sber_history_cb(request):
         qs = parse_qs(urlparse(request.url).query)
         year_from = (qs.get("from") or [""])[0][:4]
         if year_from == "2013":
-            return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"], "data": [["2013-03-25", 100.0, 101.0, 99.0, 100.5, 1000000]]}, "history.cursor": {"data": [[0, 1, 500]]}}')
-        return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"], "data": []}, "history.cursor": {"data": [[0, 0, 500]]}}')
+            return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "SECID", "BOARDID"], "data": [["2013-03-25", 100.0, 101.0, 99.0, 100.5, 1000000, "SBER", "TQBR"]]}, "history.cursor": {"data": [[0, 1, 500]]}}')
+        return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "SECID", "BOARDID"], "data": []}, "history.cursor": {"data": [[0, 0, 500]]}}')
 
     responses.add_callback(
         responses.GET,
@@ -155,15 +155,15 @@ async def test_backfill_from_moex_writes_bars_with_dynamic_dates(fresh_db):
         "https://iss.moex.com/iss/securities/GAZP.json",
         json={"boards": {"data": [["GAZP", "TQBR", "x", 0, 0, "shares", 0, 1, 1, 0,
                                      "2014-06-09", "2026-09-14", "2014-06-09", "2026-09-15",
-                                     1, "SUR", "%"]]}},
+                                     1, "SUR", "%"]]}, "description": {"data": [['ISIN', 'ISIN', 'RU0007661625']]}},
     )
 
     def gazp_history_cb(request):
         qs = parse_qs(urlparse(request.url).query)
         year_from = (qs.get("from") or [""])[0][:4]
         if year_from == "2014":
-            return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"], "data": [["2014-06-09", 150.0, 151.0, 149.0, 150.5, 500000]]}, "history.cursor": {"data": [[0, 1, 500]]}}')
-        return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"], "data": []}, "history.cursor": {"data": [[0, 0, 500]]}}')
+            return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "SECID", "BOARDID"], "data": [["2014-06-09", 150.0, 151.0, 149.0, 150.5, 500000, "GAZP", "TQBR"]]}, "history.cursor": {"data": [[0, 1, 500]]}}')
+        return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "SECID", "BOARDID"], "data": []}, "history.cursor": {"data": [[0, 0, 500]]}}')
 
     responses.add_callback(
         responses.GET,
@@ -177,15 +177,15 @@ async def test_backfill_from_moex_writes_bars_with_dynamic_dates(fresh_db):
         "https://iss.moex.com/iss/securities/SU46020RMFS2.json",
         json={"boards": {"data": [["SU46020RMFS2", "TQOB", "x", 0, 0, "bonds", 0, 1, 1, 0,
                                      "2013-03-25", "2026-09-14", "2013-03-25", "2026-09-15",
-                                     1, "RUB", "%"]]}},
+                                     1, "RUB", "%"]]}, "description": {"data": [['ISIN', 'ISIN', 'RU000A0JSML3']]}},
     )
 
     def bond_history_cb(request):
         qs = parse_qs(urlparse(request.url).query)
         year_from = (qs.get("from") or [""])[0][:4]
         if year_from == "2013":
-            return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"], "data": [["2013-03-25", 105.0, 105.5, 104.5, 105.2, 100000]]}, "history.cursor": {"data": [[0, 1, 500]]}}')
-        return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"], "data": []}, "history.cursor": {"data": [[0, 0, 500]]}}')
+            return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "SECID", "BOARDID"], "data": [["2013-03-25", 105.0, 105.5, 104.5, 105.2, 100000, "SU46020RMFS2", "TQOB"]]}, "history.cursor": {"data": [[0, 1, 500]]}}')
+        return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "SECID", "BOARDID"], "data": []}, "history.cursor": {"data": [[0, 0, 500]]}}')
 
     responses.add_callback(
         responses.GET,
@@ -228,7 +228,7 @@ async def test_backfill_from_moex_paginates_pages_in_year(sber_only_db):
         "https://iss.moex.com/iss/securities/SBER.json",
         json={"boards": {"data": [["SBER", "TQBR", "x", 0, 0, "shares", 0, 1, 1, 0,
                                      "2014-01-01", "2026-09-14", "2014-01-01", "2026-09-15",
-                                     1, "SUR", "%"]]}},
+                                     1, "SUR", "%"]]}, "description": {"data": [['ISIN', 'ISIN', 'RU0009029540']]}},
     )
 
     page_size = 100
@@ -246,7 +246,7 @@ async def test_backfill_from_moex_paginates_pages_in_year(sber_only_db):
         rows = []
         for i in range(chunk_len):
             ts = (base_date + timedelta(days=cursor + i)).isoformat()
-            rows.append([ts, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i, 1000 + i])
+            rows.append([ts, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i, 1000 + i, "SBER", "TQBR"])
         rows_by_offset[cursor] = rows
         cursor += page_size
 
@@ -254,7 +254,7 @@ async def test_backfill_from_moex_paginates_pages_in_year(sber_only_db):
         qs = parse_qs(urlparse(request.url).query)
         year_from = (qs.get("from") or [""])[0][:4]
         if year_from != "2014":
-            return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"], "data": []}, "history.cursor": {"data": [[0, 0, 500]]}}')
+            return (200, {}, '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "SECID", "BOARDID"], "data": []}, "history.cursor": {"data": [[0, 0, 500]]}}')
         try:
             start = int((qs.get("start") or ["0"])[0])
         except ValueError:
@@ -270,7 +270,7 @@ async def test_backfill_from_moex_paginates_pages_in_year(sber_only_db):
         return (
             200,
             {},
-            '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"], '
+            '{"history": {"columns": ["TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "SECID", "BOARDID"], '
             '"data": ' + json.dumps(rows) + '}, '
             + cursor_json + '}',
         )
@@ -502,7 +502,7 @@ async def test_backfill_from_moex_handles_invalid_date_format_in_meta(
                     ]
                 ]
             }
-        },
+        , "description": {"data": [['ISIN', 'ISIN', 'RU0009029540']]}},
     )
     responses.add(
         responses.GET,
