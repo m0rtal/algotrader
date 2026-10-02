@@ -74,7 +74,7 @@
 
 set -u
 
-WORKER_NAME="${ALGOTRADER_LIVE_WORKER:-algotrader-moex-backfill}"
+WORKER_NAME="${ALGOTRADER_LIVE_WORKER:-worker.py}"
 DB="${ALGOTRADER_STATE_DB:-/home/hermes/algotrader/apps/api/data/state.db}"
 LOG="${LIVENESS_LOG:-/home/hermes/.hermes/logs/algotrader-liveness-cron.log}"
 LOCK_FILE="${LIVENESS_LOCK_FILE:-$(dirname "$DB")/cron_liveness.lock}"
@@ -122,7 +122,7 @@ if [ -z "$FIRST_MATCH_FILE" ]; then
 fi
 if [ -z "$SUPERVISOR_MATCH_FILE" ]; then
     SUPERVISOR_MATCH_FILE="$(mktemp)"
-    printf 'algotrader-supervisor.sh\0algotrader-moex-backfill\0worker.py\0daily\0first\0' > "$SUPERVISOR_MATCH_FILE"
+    printf '/home/hermes/algotrader/scripts/algotrader-supervisor.sh\0algotrader-moex-backfill\0worker.py\0daily\0first\0' > "$SUPERVISOR_MATCH_FILE"
     SUPERVISOR_MATCH_FILE_CLEANUP=1
 fi
 if [ -z "$FIRST_DENY_FILE" ]; then

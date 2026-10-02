@@ -39,6 +39,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -205,8 +206,8 @@ def harness(tmp_path: Path):
 
             The child's argv is what /proc/$PID/cmdline will show; the
             argv-selection logic in the script must match this exactly.
-            We use execvp on the test python so argv0 is real python,
-            not a shell wrapper.
+            We use Popen on the test python so argv0 is real python,
+            not a shell wrapper, and retain a reliable liveness probe.
 
             `sleep_s` is short (default 5s) so a leaked child self-dies
             quickly even if the fixture cleanup fails.
@@ -215,7 +216,35 @@ def harness(tmp_path: Path):
                 sys.executable, "-c",
                 f"import time, sys; time.sleep({sleep_s})",
             ] + list(argv)
-            pid = os.spawnvp(os.P_NOWAIT, sys.executable, argv)
+            proc = subprocess.Popen(
+                argv,
+                executable=sys.executable,
+                close_fds=True,
+            )
+            pid = proc.pid
+            expected = [token.encode() for token in argv]
+            proc_cmdline = Path(f"/proc/{pid}/cmdline")
+            actual: list[bytes] = []
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                try:
+                    actual = [token for token in proc_cmdline.read_bytes().split(b"\0") if token]
+                except FileNotFoundError:
+                    actual = []
+                if actual == expected and proc.poll() is None:
+                    break
+                time.sleep(0.01)
+            if actual != expected or proc.poll() is not None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+                pytest.fail(
+                    "spawned child must stay alive with exact /proc argv; "
+                    f"pid={pid} poll={proc.poll()} "
+                    f"expected={expected!r} actual={actual!r}"
+                )
             cmdline = "\0".join(argv) + "\0"
             (self.tmp_path / f"cmdline.{pid}").write_text(cmdline)
             self.spawned.append((pid, argv))
@@ -234,6 +263,7 @@ def harness(tmp_path: Path):
             first_argv_match: list[str] | None = None,
             supervisor_argv_match: list[str] | None = None,
             threshold: int = 300,
+            production_match_defaults: bool = False,
         ) -> subprocess.CompletedProcess:
             """Run the script with the harness boundaries set up.
 
@@ -259,9 +289,14 @@ def harness(tmp_path: Path):
             env["LIVENESS_KILL_BIN"] = str(kill_stub)
             env["LIVENESS_SETSID_BIN"] = str(setsid_stub)
             env["LIVENESS_FOREGROUND_DISPATCH"] = "1"
-            env["LIVENESS_FIRST_MATCH_FILE"] = str(self.first_match_file)
-            env["LIVENESS_SUPERVISOR_MATCH_FILE"] = str(self.supervisor_match_file)
-            env["LIVENESS_FIRST_DENY_FILE"] = str(self.first_deny_file)
+            if production_match_defaults:
+                env.pop("LIVENESS_FIRST_MATCH_FILE", None)
+                env.pop("LIVENESS_SUPERVISOR_MATCH_FILE", None)
+                env.pop("LIVENESS_FIRST_DENY_FILE", None)
+            else:
+                env["LIVENESS_FIRST_MATCH_FILE"] = str(self.first_match_file)
+                env["LIVENESS_SUPERVISOR_MATCH_FILE"] = str(self.supervisor_match_file)
+                env["LIVENESS_FIRST_DENY_FILE"] = str(self.first_deny_file)
             env["PGREP_PID_FILE"] = str(self.pgrep_pids)
             env["KILL_LOG"] = str(self.kill_log)
             env["SETSID_LOG"] = str(self.setsid_log)
@@ -758,6 +793,54 @@ def test_supervisor_argv_passes_supervisor_role(harness):
     assert "supervisor alive" in log, (
         f"expected 'supervisor alive' branch in log; got:\n{log}"
     )
+
+
+def test_production_pgrep_and_absolute_argv_find_both_roles(harness):
+    """Regression: production pgrep must return both real argv shapes.
+
+    The worker argv has ``worker.py`` but not the service name. The
+    supervisor argv carries the absolute script path, not the basename
+    token. A stub that blindly returns every configured PID hid both
+    mismatches and let the watchdog launch duplicate supervisors.
+    """
+    sup_pid = harness.spawn_argv([
+        "bash",
+        "/home/hermes/algotrader/scripts/algotrader-supervisor.sh",
+        "algotrader-moex-backfill",
+        "/home/hermes/algotrader/apps/api/.venv/bin/python",
+        "worker.py", "daily", "first",
+        "/home/hermes/algotrader/apps/api",
+    ])
+    worker_pid = harness.spawn_argv([
+        "/home/hermes/algotrader/apps/api/.venv/bin/python",
+        "worker.py", "daily", "first",
+    ])
+    harness.set_pgrep_pids(sup_pid, worker_pid)
+    realistic_pgrep = harness.tmp_path / "pgrep-realistic.py"
+    realistic_pgrep.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, sys\n"
+        "pattern = sys.argv[-1]\n"
+        "for raw in pathlib.Path(os.environ['PGREP_PID_FILE']).read_text().split():\n"
+        "    try:\n"
+        "        cmd = pathlib.Path('/proc', raw, 'cmdline').read_bytes().replace(b'\\0', b' ').decode()\n"
+        "    except OSError:\n"
+        "        continue\n"
+        "    if pattern in cmd:\n"
+        "        print(raw)\n"
+    )
+    realistic_pgrep.chmod(0o755)
+    harness.fresh_heartbeat(age_s=10)
+    proc = harness.run(
+        extra_env={"LIVENESS_PGREP_BIN": str(realistic_pgrep)},
+        production_match_defaults=True,
+    )
+    assert proc.returncode == 0
+    assert harness.launch_log_text() == "", (
+        "live production-shaped supervisor+worker must not trigger recovery"
+    )
+    log = harness.log_text()
+    assert f"first worker present (pid={worker_pid})" in log, log
 
 
 # --------------------------------------------------------------------------- #
