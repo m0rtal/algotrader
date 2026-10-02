@@ -163,6 +163,17 @@ def harness(tmp_path: Path):
                     "worker.py", "daily", "first",
                 ]).encode() + b"\0"
             )
+            # Production deny-table for the first-worker role: any
+            # candidate carrying these tokens is the supervisor
+            # (or its launcher wrapper), not the worker. Tests can
+            # override via set_first_deny.
+            self.first_deny_file = tmp_path / "first-deny.argv"
+            self.first_deny_file.write_bytes(
+                "\0".join([
+                    "algotrader-supervisor.sh",
+                    "algotrader-moex-backfill",
+                ]).encode() + b"\0"
+            )
             self.spawned: list[tuple[int, list[str]]] = []  # (pid, argv)
 
         # ---- scenario setup helpers ---------------------------------- #
@@ -178,6 +189,16 @@ def harness(tmp_path: Path):
             con.execute("CREATE TABLE foo (bar INTEGER);")
             con.commit()
             con.close()
+
+        def set_first_deny(self, tokens: list[str]) -> None:
+            """Replace the first-deny argv file with `tokens` (NUL-joined).
+
+            Used by tests that want to disable or customise the
+            role-disambiguation deny table.
+            """
+            self.first_deny_file.write_bytes(
+                "\0".join(tokens).encode() + b"\0"
+            )
 
         def spawn_argv(self, argv: list[str], *, sleep_s: int = 5) -> int:
             """Spawn a long-lived child with a deterministic argv.
@@ -240,6 +261,7 @@ def harness(tmp_path: Path):
             env["LIVENESS_FOREGROUND_DISPATCH"] = "1"
             env["LIVENESS_FIRST_MATCH_FILE"] = str(self.first_match_file)
             env["LIVENESS_SUPERVISOR_MATCH_FILE"] = str(self.supervisor_match_file)
+            env["LIVENESS_FIRST_DENY_FILE"] = str(self.first_deny_file)
             env["PGREP_PID_FILE"] = str(self.pgrep_pids)
             env["KILL_LOG"] = str(self.kill_log)
             env["SETSID_LOG"] = str(self.setsid_log)
@@ -608,6 +630,133 @@ def test_diagnostic_command_argv_is_not_selected(harness):
     kill_log = harness.kill_log_text()
     assert f" {pid}" not in kill_log, (
         f"diagnostic-shell pid={pid} was killed; argv match too loose:\n{kill_log}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Role disambiguation: supervisor argv must not match first-worker role
+# --------------------------------------------------------------------------- #
+
+
+def test_supervisor_argv_is_not_first_worker(harness):
+    """[BUG / #177 follow-up] Production argv shapes share the
+    include-table tokens 'worker.py daily first'. Without role
+    disambiguation, an include-only match selects the supervisor
+    PID as the daily-first worker — the script then SIGKILLs the
+    supervisor instead of the actual worker (observed 2026-10-02:
+    cron log named pid=1785 as the first worker, but pid=1785 was
+    bash algotrader-supervisor.sh; the real daily-first worker was
+    pid=1795 and was missed).
+
+    With the fix, the supervisor PID carrying `algotrader-supervisor.sh`
+    is excluded from FIRST_PIDS. The stale path then sees
+    WORKER_PID empty AND SUPERVISOR_PIDS non-empty, and trusts the
+    supervisor's restart loop instead of dispatching (which would
+    duplicate the supervisor). The supervisor MUST NOT be killed.
+    """
+    sup_pid = harness.spawn_argv([
+        "algotrader-supervisor.sh",
+        "algotrader-moex-backfill",
+        "/home/hermes/algotrader/apps/api/.venv/bin/python",
+        "worker.py", "daily", "first",
+        "/home/hermes/algotrader/apps/api",
+    ])
+    harness._seed_pipeline_heartbeat(age_s=900)
+    harness.set_pgrep_pids(sup_pid)
+    proc = harness.run(threshold=300)
+    assert proc.returncode == 0
+    # Supervisor must NOT be the target — it's not a worker process.
+    # Pre-fix this assertion failed: the include-only match selected
+    # the supervisor PID and the script SIGKILLed the supervisor.
+    assert f" {sup_pid}" not in harness.kill_log_text(), (
+        f"supervisor pid={sup_pid} was killed; argv match selected "
+        f"supervisor as first worker:\n{harness.kill_log_text()}"
+    )
+    # No recovery dispatch: the supervisor is alive, its restart loop
+    # respawns the worker on its own. Dispatching a duplicate
+    # supervisor here would double-start the chain.
+    log = harness.log_text()
+    assert "FATAL: heartbeat stale" in log, (
+        f"expected stale path; got:\n{log}"
+    )
+    assert "supervisor alive without first worker" in log, (
+        f"expected 'supervisor alive' branch (no duplicate dispatch); got:\n{log}"
+    )
+    assert "dispatching clean supervisor" not in log, (
+        f"must NOT dispatch a duplicate supervisor while one is alive; got:\n{log}"
+    )
+    assert harness.launch_log_text() == "", (
+        f"watchdog must not launch a duplicate supervisor; got:\n"
+        f"{harness.launch_log_text()}"
+    )
+
+
+def test_supervisor_alongside_worker_kills_only_worker(harness):
+    """The supervisor argv and the worker argv both contain the
+    include-table tokens. When BOTH processes are alive and the
+    heartbeat is stale, the script must kill the WORKER, not the
+    supervisor — so the supervisor's restart loop respawns it.
+
+    The harness exposes this case explicitly: spawn a supervisor
+    argv and a worker argv, set pgrep to return both, and assert
+    the kill log names the worker PID, not the supervisor PID.
+    """
+    sup_pid = harness.spawn_argv([
+        "algotrader-supervisor.sh",
+        "algotrader-moex-backfill",
+        "/home/hermes/algotrader/apps/api/.venv/bin/python",
+        "worker.py", "daily", "first",
+        "/home/hermes/algotrader/apps/api",
+    ])
+    worker_pid = harness.spawn_argv([
+        "/home/hermes/algotrader/apps/api/.venv/bin/python",
+        "worker.py", "daily", "first",
+        "/home/hermes/algotrader/apps/api",
+    ])
+    harness._seed_pipeline_heartbeat(age_s=900)
+    harness.set_pgrep_pids(sup_pid, worker_pid)
+    proc = harness.run(threshold=300)
+    assert proc.returncode == 0
+    kill_log = harness.kill_log_text()
+    assert f" {worker_pid}" in kill_log, (
+        f"expected kill of worker={worker_pid}; got:\n{kill_log}"
+    )
+    assert f" {sup_pid}" not in kill_log, (
+        f"supervisor pid={sup_pid} must NOT be killed; got:\n{kill_log}"
+    )
+    # No recovery dispatch: the supervisor is alive, its loop handles it.
+    assert harness.launch_log_text() == "", (
+        "must not relaunch; supervisor's restart loop respawns the worker"
+    )
+
+
+def test_supervisor_argv_passes_supervisor_role(harness):
+    """The deny filter is applied ONLY to the first-worker role; the
+    supervisor scan keeps include-only matching so a live supervisor
+    is correctly detected by the recovery dispatch logic.
+    """
+    sup_pid = harness.spawn_argv([
+        "algotrader-supervisor.sh",
+        "algotrader-moex-backfill",
+        "/home/hermes/algotrader/apps/api/.venv/bin/python",
+        "worker.py", "daily", "first",
+        "/home/hermes/algotrader/apps/api",
+    ])
+    harness.fresh_heartbeat(age_s=10)
+    harness.set_pgrep_pids(sup_pid)
+    proc = harness.run()
+    assert proc.returncode == 0
+    # Supervisor alive, no worker → recovery branch logs that supervisor
+    # respawn will handle it; no setsid dispatch, no kill.
+    assert harness.kill_log_text() == "", (
+        f"supervisor must not be killed; got:\n{harness.kill_log_text()}"
+    )
+    assert harness.launch_log_text() == "", (
+        "watchdog must not dispatch a duplicate supervisor when one is alive"
+    )
+    log = harness.log_text()
+    assert "supervisor alive" in log, (
+        f"expected 'supervisor alive' branch in log; got:\n{log}"
     )
 
 

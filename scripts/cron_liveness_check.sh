@@ -48,6 +48,19 @@
 # pattern. Broad pgrep is replaced by a narrowed scan that verifies
 # each candidate's argv before any kill or recovery dispatch.
 #
+# 2026-10-02 fix (role disambiguation): the supervisor and the
+# daily-first worker share the include-tokens 'worker.py daily first'
+# in argv, so the include-only match selected the supervisor PID as
+# the first worker (cron log: 'first worker present (pid=1785)' but
+# pid=1785 was bash algotrader-supervisor.sh; the actual daily-first
+# worker was pid=1795). Selection now also applies a deny-table
+# (LIVENESS_FIRST_DENY_FILE, default tokens 'algotrader-supervisor.sh'
+# and 'algotrader-moex-backfill') to the first-worker scan: a
+# candidate carrying any deny token is the supervisor (or its launcher
+# wrapper), not the worker, and is excluded from FIRST_PIDS. The
+# supervisor scan keeps include-only matching so the recovery branch
+# can still detect a live supervisor.
+#
 # Catches the failure modes the in-process watchdog misses:
 #   - Supervisor itself dies (so its watchdog dies with it)
 #   - Worker process alive but stuck (e.g., infinite loop in a
@@ -87,6 +100,15 @@ FOREGROUND_DISPATCH="${LIVENESS_FOREGROUND_DISPATCH:-0}"
 # even when no override is provided.
 FIRST_MATCH_FILE="${LIVENESS_FIRST_MATCH_FILE:-}"
 SUPERVISOR_MATCH_FILE="${LIVENESS_SUPERVISOR_MATCH_FILE:-}"
+# Optional deny-table for the first-worker role. NUL-separated argv
+# tokens that MUST NOT appear in the candidate's cmdline. Used to
+# distinguish the worker subprocess from the supervisor that launched
+# it: their include-tokens ('worker.py daily first') overlap, so the
+# include-table alone cannot tell them apart. The deny-table carries
+# the supervisor-specific tokens ('algotrader-supervisor.sh',
+# 'algotrader-moex-backfill'); a candidate carrying them is the
+# supervisor, not the worker, and is excluded from FIRST_PIDS.
+FIRST_DENY_FILE="${LIVENESS_FIRST_DENY_FILE:-}"
 
 # Default match tables used when the override env var is empty. Each
 # is a NUL-separated list of argv tokens that must appear, in order,
@@ -103,6 +125,13 @@ if [ -z "$SUPERVISOR_MATCH_FILE" ]; then
     printf 'algotrader-supervisor.sh\0algotrader-moex-backfill\0worker.py\0daily\0first\0' > "$SUPERVISOR_MATCH_FILE"
     SUPERVISOR_MATCH_FILE_CLEANUP=1
 fi
+if [ -z "$FIRST_DENY_FILE" ]; then
+    # Supervisor-only tokens. Any candidate carrying these is the
+    # supervisor (or its launcher wrapper), not the daily-first worker.
+    FIRST_DENY_FILE="$(mktemp)"
+    printf 'algotrader-supervisor.sh\0algotrader-moex-backfill\0' > "$FIRST_DENY_FILE"
+    FIRST_DENY_FILE_CLEANUP=1
+fi
 
 # Single EXIT trap: cleanup temp match files (production defaults).
 _cleanup_match_files() {
@@ -111,6 +140,9 @@ _cleanup_match_files() {
     fi
     if [ "${SUPERVISOR_MATCH_FILE_CLEANUP:-0}" = "1" ] && [ -f "${SUPERVISOR_MATCH_FILE:-}" ]; then
         rm -f "$SUPERVISOR_MATCH_FILE" || true
+    fi
+    if [ "${FIRST_DENY_FILE_CLEANUP:-0}" = "1" ] && [ -f "${FIRST_DENY_FILE:-}" ]; then
+        rm -f "$FIRST_DENY_FILE" || true
     fi
 }
 trap _cleanup_match_files EXIT
@@ -137,23 +169,49 @@ release_lock() {
 
 # Read a NUL-separated argv-match table from a file. Tokens must
 # appear in order in the candidate's argv. Returns 0 if match, 1
-# otherwise. Empty match-file = always match (legacy behaviour, only
-# used when LIVENESS_*_MATCH_FILE is unset for backwards compat).
+# otherwise. An optional third argument is a NUL-separated deny
+# table: any deny token present in the candidate's cmdline rejects
+# the match (used to exclude the supervisor argv from the worker
+# role — both processes carry 'worker.py daily first', but only the
+# supervisor carries 'algotrader-supervisor.sh'). If match-file is
+# unset or unreadable, return 1 (fail-closed): an empty match table
+# is a misconfiguration and must never select a candidate.
 argv_matches_pid() {
     local pid="$1"
     local match_file="$2"
+    local deny_file="${3:-}"
     local cmdline tokens i arg
 
     if [ -z "$match_file" ] || [ ! -r "$match_file" ]; then
-        # No match file provided: accept any /proc-readable candidate.
-        [ -r "/proc/$pid/cmdline" ] || return 1
-        return 0
+        # Fail-closed: a missing/unreadable match table is a
+        # misconfiguration. The earlier 'legacy accept' branch
+        # silently accepted every /proc-readable candidate when
+        # the env override was empty, which made process selection
+        # dependent on the default-table creation above succeeding.
+        return 1
     fi
 
     [ -r "/proc/$pid/cmdline" ] || return 1
     # Read NUL-separated cmdline; replace NULs with newlines for shell parsing.
     local cmdline_str
     cmdline_str="$(tr '\0' '\n' < "/proc/$pid/cmdline")"
+
+    # Deny-table first: reject the candidate outright if it carries any
+    # supervisor-only token. Cheap O(N×M) scan over a tiny argv (the
+    # worker is single-threaded, the deny table is <10 entries).
+    if [ -n "$deny_file" ] && [ -r "$deny_file" ]; then
+        local darg dline
+        while IFS= read -r -d '' darg; do
+            [ -n "$darg" ] || continue
+            while IFS= read -r dline; do
+                if [ "$dline" = "$darg" ]; then
+                    return 1
+                fi
+            done <<EOF
+$cmdline_str
+EOF
+        done < "$deny_file"
+    fi
 
     i=0
     # Walk tokens in match-file in order; each must appear later in cmdline_str.
@@ -185,9 +243,12 @@ EOF
 }
 
 # List PIDs whose argv matches the given match-file. Uses PGREP_BIN
-# (overrideable) for the candidate scan, then filters by argv.
+# (overrideable) for the candidate scan, then filters by argv. An
+# optional second argument is a NUL-separated deny-table whose tokens
+# MUST NOT appear in the candidate's argv (role-disambiguation).
 find_matching_pids() {
     local match_file="$1"
+    local deny_file="${2:-}"
     local candidate pid matched=() rc=1
 
     # Broad scan: any process with the worker-name substring is a
@@ -197,7 +258,7 @@ find_matching_pids() {
     while IFS= read -r candidate; do
         [ -n "$candidate" ] || continue
         [ "$candidate" = "$$" ] && continue  # never select self
-        if argv_matches_pid "$candidate" "$match_file"; then
+        if argv_matches_pid "$candidate" "$match_file" "$deny_file"; then
             matched+=("$candidate")
             rc=0
         fi
@@ -294,8 +355,13 @@ fi
 
 # Resolve process presence once and reuse below. We pass the resolved
 # first-worker / supervisor PID lists into the recovery branch so we
-# never re-scan with broad pgrep.
-read -r -a FIRST_PIDS < <(find_matching_pids "$FIRST_MATCH_FILE" | tr '\n' ' ')
+# never re-scan with broad pgrep. The first-worker scan uses the
+# deny-table to exclude the supervisor argv — both processes carry
+# the same include-tokens 'worker.py daily first', so without the deny
+# filter the supervisor PID would be killed instead of the worker
+# (observed 2026-10-02: cron log named pid=1785 as the first worker
+# while the actual daily-first worker was pid=1795).
+read -r -a FIRST_PIDS < <(find_matching_pids "$FIRST_MATCH_FILE" "$FIRST_DENY_FILE" | tr '\n' ' ')
 read -r -a SUPERVISOR_PIDS < <(find_matching_pids "$SUPERVISOR_MATCH_FILE" | tr '\n' ' ')
 
 # If neither heartbeat store has rows, fall back to checking worker
