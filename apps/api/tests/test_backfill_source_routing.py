@@ -36,7 +36,7 @@ def runner(tmp_path):
     )
 
 
-def test_auto_routes_long_window_to_moex_year_walker(runner):
+def test_auto_routes_long_window_to_moex_year_walker(runner, tmp_path):
     """A 5-year window must call _fetch_year_moex for each year, NOT get_candles."""
     # Pre-populate the MOEX metadata cache so `_resolve_source` sees
     # this ticker as MOEX-tradable. Production callers do this via
@@ -45,7 +45,21 @@ def test_auto_routes_long_window_to_moex_year_walker(runner):
     runner._moex_meta["TEST"] = {
         "market": "shares", "board": "TQBR",
         "listed_from": date(2021, 1, 1),
+        # Identity gate (PR #176 follow-up): meta carries an ISIN
+        # field; the fixture below seeds the instrument with the
+        # same ISIN so the gate passes.
+        "isin": "TEST0000000",
     }
+    # Identity gate reads the figi's ISIN from `instruments`. Seed it.
+    import sqlite3
+    con = sqlite3.connect(runner.db_path)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin) "
+        "VALUES ('TEST', '00000000-0000-0000-0000-000000000001', "
+        "'share', 'Test', 'rub', 1, 'TEST0000000')"
+    )
+    con.commit()
+    con.close()
     moex_calls: list[int] = []
     tinkoff_calls: list[tuple[date, date]] = []
 
@@ -66,6 +80,14 @@ def test_auto_routes_long_window_to_moex_year_walker(runner):
 
     runner._fetch_year_moex = staticmethod(fake_moex_year)
     runner.client.get_candles = AsyncMock(side_effect=fake_tinkoff)
+
+    # Identity gate (PR #176 follow-up): _backfill_one_moex calls
+    # ``fetch_issuer_identity`` for the figi's expected MOEX ISIN.
+    # Stub it to match the seeded ``TEST0000000`` ISIN.
+    from algotrader_api.ingestion import no_trade_evidence as _nte
+    _nte.fetch_issuer_identity = lambda ticker: {
+        "board": "TQBR", "isin": "TEST0000000",
+    }
 
     # 5-year span: 2021..2026 — should produce 5 MOEX year calls, plus
     # 0 Tinkoff calls (the trailing 9m is empty since MOEX covers it).
@@ -179,6 +201,25 @@ def test_moex_year_exception_is_swallowed(runner):
     runner._moex_meta["BOOM"] = {
         "market": "shares", "board": "TQBR",
         "listed_from": date(2024, 1, 1),
+        # Identity gate (PR #176 follow-up): ISIN must match between
+        # the meta and the seeded instrument, or the new gate refuses
+        # the run before _fetch_year_moex is even called.
+        "isin": "BOOM0000000",
+    }
+    # Seed the instrument with a matching ISIN + stub
+    # ``fetch_issuer_identity`` so the gate's two checks pass.
+    import sqlite3
+    con = sqlite3.connect(runner.db_path)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin) "
+        "VALUES ('BOOM', '00000000-0000-0000-0000-000000000004', "
+        "'share', 'Boom', 'rub', 1, 'BOOM0000000')"
+    )
+    con.commit()
+    con.close()
+    from algotrader_api.ingestion import no_trade_evidence as _nte
+    _nte.fetch_issuer_identity = lambda ticker: {
+        "board": "TQBR", "isin": "BOOM0000000",
     }
 
     def boom_moex(market, board, ticker, year, last_trading_day=None):

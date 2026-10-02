@@ -39,6 +39,11 @@ from typing import Any, Awaitable, Callable, Iterable
 
 from ..observability.logging import get_logger
 from .closed_candles import is_closed_candle
+# Imported lazily inside the call sites that need it; this keeps the
+# module-level import surface minimal — `_backfill_one_moex` is the
+# only path that calls ``fetch_issuer_identity`` directly (the other
+# paths use ``_get_meta_moex`` which already extracts ISIN from the
+# same HTTP response).
 
 logger = get_logger("algotrader_api.ingestion.backfill")
 
@@ -218,12 +223,19 @@ def _get_meta_moex(
     meta_cache: dict[str, dict | None],
     meta_lock: threading.Lock,
 ) -> dict | None:
-    """Probe MOEX for ticker. Return {market, board, listed_from, listed_till} or None.
+    """Probe MOEX for ticker. Return {market, board, listed_from, listed_till, isin} or None.
 
     Uses the module-level pooled ``_MOEX_SESSION`` so the prefetch reuses
     TCP+TLS connections across all 3837 figis instead of opening a fresh
     connection per call. Caches results in ``meta_cache`` (guarded by
     ``meta_lock``).
+
+    ``isin`` is pulled from the same response's ``description`` block —
+    zero new HTTP round-trips. It lets the MOEX-routed write paths
+    cross-check each figi's stored ISIN before stamping bars onto it
+    (the T/DIOD/ROST cross-listed-mirror collision in production):
+    ``fetch_issuer_identity`` is reserved for the same-day script
+    where the meta cache already exists in a different shape.
     """
     with meta_lock:
         if ticker in meta_cache:
@@ -253,11 +265,20 @@ def _get_meta_moex(
     market = "bonds" if boardid in ("TQOB", "TQCB") else "shares"
     listed_from = primary[12]
     listed_till = primary[13]
+    # Pull ISIN from the same response's ``description`` block.
+    # Match the lookup in ``fetch_issuer_identity`` (no_trade_evidence)
+    # so the two paths agree on what MOEX thinks the issuer ISIN is.
+    isin = ""
+    for row in data.get("description", {}).get("data", []):
+        if len(row) > 2 and row[0] == "ISIN" and isinstance(row[2], str):
+            isin = row[2]
+            break
     meta = {
         "market": market,
         "board": boardid,
         "listed_from": listed_from,
         "listed_till": listed_till or yesterday.isoformat(),
+        "isin": isin,
     }
     with meta_lock:
         meta_cache[ticker] = meta
@@ -599,6 +620,34 @@ def _fetch_moex_range(
             if window_lo <= str(ts)[:10] <= window_hi:
                 out.append(b)
     return out
+
+
+def _filter_moex_bars_by_identity(
+    bars: list[dict], *, ticker: str, board: str,
+) -> list[dict]:
+    """Drop bars whose raw MOEX SECID/BOARDID disagrees with what we asked for.
+
+    Every MOEX source emits ``_secid`` and ``_boardid`` alongside the
+    candle columns (set in :func:`_fetch_year_moex`). When the upstream
+    board lookup is stale or the ticker is shared by a cross-listed
+    mirror, MOEX can serve rows from a different instrument on the same
+    board (or even a different board under the same history endpoint).
+    Without this filter those rows would be silently attached to the
+    figi the caller asked about — the root cause of the T/DIOD/ROST
+    cross-pollution seen in production.
+
+    The filter is data-driven (no extra HTTP round-trip per figi);
+    callers that already know the expected ticker/board do the
+    comparison in-process. Empty lists pass through unchanged; rows
+    missing either identity field are dropped fail-closed.
+    """
+    if not bars:
+        return bars
+    return [
+        b for b in bars
+        if str(b.get("_secid") or "") == ticker
+        and str(b.get("_boardid") or "") == board
+    ]
 
 
 async def _fetch_tinkoff_fallback_impl(
@@ -1140,6 +1189,14 @@ class BackfillRunner:
                 meta["market"], meta["board"], inst["ticker"], year,
                 last_trading_day=yesterday,
             )
+            # Identity filter: drop rows whose raw SECID/BOARDID disagrees
+            # with the ticker/board we asked MOEX for. Closes the
+            # cross-listed-mirror path (T/DIOD/ROST cases in production)
+            # for the historical multi-year walk. Cost is in-process; no
+            # extra HTTP round-trips.
+            year_bars = _filter_moex_bars_by_identity(
+                year_bars, ticker=inst["ticker"], board=meta["board"],
+            )
             for b in year_bars:
                 b["figi"] = inst["figi"]
             return year_bars
@@ -1257,6 +1314,25 @@ class BackfillRunner:
             if meta is None:
                 await self._log("info", figi=figi, message="no MOEX board; falling back to Tinkoff")
                 return await _process_tinkoff(inst)
+
+            # Identity gate (PR #176 follow-up). For a ticker shared by
+            # multiple figis (T / DIOD / ROST in production), MOEX
+            # serves only the primary board's instrument. Stamping
+            # those bars on every figi carrying the ticker cross-
+            # pollutes the table. Refuse unless the meta's ISIN
+            # matches the figi's stored ISIN. A NULL/empty ISIN on
+            # either side short-circuits the write — verification is
+            # impossible, so the safe move is to skip and log.
+            inst_isin = (inst.get("isin") or "").strip()
+            meta_isin = (meta.get("isin") or "").strip()
+            if not inst_isin or not meta_isin or inst_isin != meta_isin:
+                await self._log(
+                    "info", figi=figi,
+                    message=f"moex identity mismatch (ticker={ticker} "
+                            f"inst_isin={inst_isin!r} meta_isin={meta_isin!r}); "
+                            f"skipping",
+                )
+                return 0
 
             listed_from_iso = meta["listed_from"]
             listed_till_iso = meta["listed_till"]
@@ -1512,6 +1588,23 @@ class BackfillRunner:
                 # fallback is intentionally NOT attempted here; the
                 # whole point of this pass is to bypass Tinkoff.
                 return 0
+            # Identity gate (PR #176 follow-up). The recent-tail pass
+            # routes by ticker too; without this check every figi
+            # carrying the same ticker (T / DIOD / ROST in production)
+            # would receive the same MOEX bars. Skip unless the meta
+            # ISIN matches the figi's stored ISIN — a NULL/empty ISIN
+            # on either side also skips (verification impossible).
+            inst_isin = (inst.get("isin") or "").strip()
+            meta_isin = (meta.get("isin") or "").strip()
+            if not inst_isin or not meta_isin or inst_isin != meta_isin:
+                await self._log(
+                    "info", figi=figi,
+                    message=f"moex_recent_tail identity mismatch "
+                            f"(ticker={ticker} inst_isin={inst_isin!r} "
+                            f"meta_isin={meta_isin!r}); skipping",
+                )
+                return 0
+
             listed_till_iso = meta.get("listed_till") or yesterday.isoformat()
             try:
                 listed_till_d = date.fromisoformat(listed_till_iso[:10])
@@ -1534,6 +1627,13 @@ class BackfillRunner:
                     message=f"moex_recent_tail fetch failed for {ticker}: {e!r}",
                 )
                 return 0
+            # Identity filter: drop rows whose raw SECID/BOARDID disagrees
+            # with the ticker/board we asked MOEX for. Closes the
+            # cross-listed-mirror path for the recent-tail pass; same
+            # data-driven check the same-day script uses (PR176).
+            bars = _filter_moex_bars_by_identity(
+                bars, ticker=ticker, board=meta["board"],
+            )
             for b in bars:
                 b["figi"] = figi
             # Persist confirmed zero-trade evidence BEFORE the bar
@@ -1833,6 +1933,32 @@ class BackfillRunner:
     async def _backfill_one_moex(self, *, figi, ticker, from_, to) -> int:
         """Walk `from_..to` year-by-year through MOEX ISS; bridge trailing 9m via Tinkoff."""
         today = date.today()
+        # Identity gate (PR #176 follow-up). This entry point takes
+        # figi+ticker directly (no ``inst`` dict), so resolve the
+        # figi's stored ISIN + MOEX's ISIN for the ticker up front and
+        # refuse the run on mismatch. Without it the full-history
+        # walker would happily stamp the RU bar onto every US mirror
+        # figi carrying the ticker (the production cross-pollution
+        # the audit flagged).
+        from ..db.bars_sqlite import get_connection
+        try:
+            row = get_connection(self.db_path).execute(
+                "SELECT isin FROM instruments WHERE figi = ?", (figi,),
+            ).fetchone()
+            inst_isin = ((row["isin"] if row else "") or "").strip()
+        except Exception:
+            inst_isin = ""
+        from .no_trade_evidence import fetch_issuer_identity
+        ident = fetch_issuer_identity(ticker)
+        meta_isin = ((ident.get("isin") or "") if ident else "").strip()
+        if not inst_isin or not meta_isin or inst_isin != meta_isin:
+            await self._log(
+                "info", figi=figi,
+                message=f"moex identity mismatch (ticker={ticker} "
+                        f"inst_isin={inst_isin!r} meta_isin={meta_isin!r}); "
+                        f"skipping",
+            )
+            return 0
         total_added = 0
         year = from_.year
         while year <= to.year:
@@ -1850,12 +1976,22 @@ class BackfillRunner:
                 await self._log("warn", figi=figi,
                                 message=f"moex empty year={year} ticker={ticker}")
             else:
-                # Mark figi on the candles dict (MOEX doesn't know figi)
-                for c in candles:
-                    c["figi"] = figi
-                from ..db.bars_sqlite import replace_bars_for_figi
-                added = replace_bars_for_figi(self.db_path, figi, candles, replace=False)
-                total_added += added
+                # Identity filter: drop rows whose raw SECID/BOARDID
+                # disagrees with the ticker/board we asked MOEX for.
+                # Closes the cross-listed-mirror path for the full-history
+                # walker; same data-driven check the same-day script
+                # uses (PR176). The trailing 9-month Tinkoff block below
+                # is by-figi and intentionally untouched.
+                candles = _filter_moex_bars_by_identity(
+                    candles, ticker=ticker, board="TQBR",
+                )
+                if candles:
+                    # Mark figi on the candles dict (MOEX doesn't know figi)
+                    for c in candles:
+                        c["figi"] = figi
+                    from ..db.bars_sqlite import replace_bars_for_figi
+                    added = replace_bars_for_figi(self.db_path, figi, candles, replace=False)
+                    total_added += added
             year += 1
         # Trailing bridge: ask Tinkoff for the last 9 months of the window.
         # R1: bridge_start = to - 270 days (the trailing 9m), NOT year-aligned.
@@ -2170,6 +2306,26 @@ class BackfillRunner:
             f"SELECT ticker, figi, class FROM instruments "
             f"WHERE class IN ({placeholders})"
         )
+        # ``isin`` is selected defensively — the column exists in the
+        # production schema (migration 002) but is optional for any
+        # custom / minimal schema that hand-rolls the table for unit
+        # tests. Wrap the column lookup in a pragma so a missing column
+        # surfaces as ``SELECT '' AS isin`` rather than aborting the
+        # runner. Identity-gate callers must handle an empty ISIN
+        # (they do — empty ISIN means "skip, can't prove").
+        from ..db.bars_sqlite import get_connection as _gc
+        try:
+            has_isin = bool(_gc(self.db_path).execute(
+                "SELECT 1 FROM pragma_table_info('instruments') "
+                "WHERE name = 'isin'"
+            ).fetchone())
+        except Exception:
+            has_isin = False
+        if has_isin:
+            sql = sql.replace(
+                "SELECT ticker, figi, class",
+                "SELECT ticker, figi, class, isin", 1,
+            )
         params: list = list(TRADEABLE_CLASSES)
         if limit_to:
             qs = ",".join("?" for _ in limit_to)
