@@ -1560,45 +1560,105 @@ Reviewer passes only if:
 
 **Files:**
 - Modify: `apps/api/tests/test_backfill_coverage.py` (new
-  end-to-end test)
+  end-to-end test, function name
+  `test_walker_end_to_end_gate_improves_on_temp_db`)
 
 **Goal:** Prove the gate improves on a TEMP DB without
 fabricating bars, without reading production, and without a
-manual denominator override.
+manual denominator override. The test exercises the
+**real** public historical walker
+`BackfillRunner.backfill_from_moex(today=date(2024, 12, 31))`
+end-to-end; the test itself never opens a writer connection
+or hand-builds evidence rows.
 
 **Scenario (matches the ADDED Requirement in the spec):**
-- Seed a TEMP DB with the project's migrations (no
-  cross-module fixture imports — run migrations inline).
-- Seed an instrument with
-  `instruments.expected_bars` left NULL (canonical).
-- Insert one real bar at `2024-01-15` (so the pre-evidence
-  ratio is well below 0.95).
-- Stub `BackfillRunner._fetch_year_moex_outcome` at the class
-  level (same mechanism Step 6 uses) to return a strict
-  synthetic feed: one page, `start=0`/`offset=0`/`total=N`/
-  `page_size=N`, `status_code = 200`, every row has matching
-  SECID/BOARDID, every row is either the `2024-01-15` real
-  bar (with full OHLC) or an explicit zero-trade shape on a
-  weekday not in `moex_holidays`.
+- Pin the clock to `today = date(2024, 12, 31)` for every
+  module that calls `date.today()` (see `_pin_clock` below).
+  Without this pin, `check_coverage`, the walker, and
+  `populate_expected_bars` would compute `last_session` from
+  the real wall clock, the cached `expected_bars` would not
+  match the gate's window, and the test would be
+  non-deterministic.
+- Run real migrations on the TEMP DB (no cross-module
+  fixture imports — call
+  `algotrader_api.db.sqlite.run_migrations(db_path,
+  migrations_dir)` inline).
+- Seed one share figi (`BBG00RU000A1 / GAZP / TQBR`) with
+  `source_updated_at = 2014-01-15` (the listing anchor) and
+  one real-shape bar at the same date
+  (`2024-01-15` is **NOT** the anchor — see the surrogate
+  appendix; the real anchor is `2014-01-15`, the
+  `source_updated_at` of the figi row, and the last completed
+  business session is `2024-12-30`).
+- Pre-populate `expected_bars` on the TEMP DB by running
+  the actual `populate_expected_bars` CLI with
+  `sys.argv = ['populate_expected_bars', '--db', TEMPDB,
+  '--refresh']` BEFORE the walker runs. The cached value is
+  the canonical denominator; without it, the pre-evidence
+  `check_coverage` reports `expected=None` (`unknown_expected`
+  reason) and a `1/None` comparison does NOT prove the ratio
+  is below 0.95. The prepopulate pass makes the pre-assertion
+  a real ratio comparison.
+- Pre-evidence `check_coverage(conn, [figi])` MUST report
+  the figi as failing with `reason: 'incomplete'` (NOT
+  `unknown_expected`); `bars_count / expected` MUST be below
+  0.95. This is the prepopulate guard: the cached denominator
+  is real, and the bars are fresh (1 row in the window),
+  so the gate is in the real-insufficient-coverage branch,
+  not the unknown/stale branch.
+- Stub `BackfillRunner._fetch_year_moex_outcome` at the
+  class level (the future binding Step 5 of Task 2
+  introduces) to return a paginated per-year strict synthetic
+  feed: for every `(market, board, ticker, year)` call,
+  return `(rows_for_year, "complete")`. The feed spans every
+  calendar year from `2014` to `2024`; each year's rows
+  include:
+  - the listing-anchor real-shape OHLC bar at
+    `2014-01-15` (the `source_updated_at`);
+  - the last-session real-shape OHLC bar at
+    `2024-12-30` (Monday; not in `moex_holidays`);
+  - explicit zero-trade rows for every other weekday in
+    `[2014-01-15, 2024-12-30]` that is NOT a
+    `moex_holidays` entry (`open=high=low=close=None`,
+    `volume=numtrades=value=0`, `_secid=GAZP`,
+    `_boardid=TQBR`).
+  All rows carry matching SECID/BOARDID so the new
+  identity check in `_fetch_year_moex_outcome` passes;
+  explicit zero counters on zero-trade rows so the row-shape
+  contract holds.
+- Stub `BackfillRunner._get_meta_moex` at the class level
+  so `decide_strategy` does not do a real HTTP probe;
+  identity MUST match the seeded `instruments` row
+  (`market=shares, board=TQBR, listed_from=2014-01-15,
+  listed_till=yesterday(today), isin=RU0007661625`).
 - Run the public historical walker
   `BackfillRunner.backfill_from_moex(today=date(2024, 12, 31))`
-  against the TEMP DB.
+  against the TEMP DB. The walker drives the real
+  `record_historical_no_trade_evidence` (Task 2) per
+  figi-year where outcome is `complete`; the test MUST NOT
+  call the writer directly.
 - Re-invoke the actual existing
-  `populate_expected_bars` script (imported by path,
-  NOT a new wrapper) with monkeypatched `sys.argv` =
+  `populate_expected_bars` script (imported by path, NOT a
+  new wrapper) with monkeypatched `sys.argv` =
   `['populate_expected_bars', '--db', str(TEMPDB),
   '--refresh']` so the canonical `expected_bars` is
-  recomputed against the TEMP DB. Production threshold /
-  universe / expected formula are unchanged.
+  recomputed against the TEMP DB AFTER the walker writes
+  evidence. Production threshold / universe / expected
+  formula are unchanged.
 - Open a fresh `sqlite3.Connection` with
   `row_factory = sqlite3.Row` and call
   `check_coverage(conn, [figi])` — the actual public
   signature is `(conn, figis, coverage_threshold=0.95) ->
   list[dict]` (empty list = all OK; non-empty = failing
   figis). Assert the returned list is empty.
-- Assert `bars` contains exactly one row (no fabricated OHLC).
-- Assert the pre-evidence ratio was below 0.95 and the
-  post-evidence ratio is at or above 0.95.
+- Assert `bars` contains exactly the anchor + last-session
+  real bars (2 rows); zero-trade rows are dropped by
+  `replace_bars_for_figi(..., replace=False)` because they
+  violate `bars.NOT NULL` on `open/high/low/close` — no
+  fabricated OHLC.
+- Assert the pre-evidence ratio was below 0.95 (real
+  ratio, not `1/None`) and the post-evidence ratio is at
+  or above 0.95.
 
 **Verified against the live code:**
 - `check_coverage` signature (from
@@ -1612,49 +1672,143 @@ manual denominator override.
   on the optional `listed_till` column.
 - `populate_expected_bars.main()` signature is `() -> int`; the
   script parses `sys.argv` directly via `argparse` with
-  `--db <path>` (default `/home/hermes/algotrader/apps/api/data/state.db`)
-  and `--refresh` flag. The plan MUST NOT add a new
+  `--db <path>` (default
+  `/home/hermes/algotrader/apps/api/data/state.db`) and
+  `--refresh` flag. The plan MUST NOT add a new
   `peb.run(db_path)` wrapper; just import the module, monkey
   patch `sys.argv`, and call `peb.main()`. No production
   default DB path is reachable because the test passes an
-  explicit `--db` that points at the TEMP DB.
-- Test fixtures `_make_strict_synthetic_feed`, `_make_runner`,
-  `await_runner`, `fresh_db` do NOT exist in
-  `test_backfill_coverage.py` (only `_seed_instruments`,
-  `_seed_migrations`, `_migrations_dir`). Define them
-  concretely inline in the new test; do NOT import across
-  test modules. Use `responses` for the strict synthetic
-  feed so the test exercises a real HTTP-shape payload
-  (matching the pattern in `test_backfill_moex_runner.py`)
-  OR stub `BackfillRunner._fetch_year_moex_outcome` at the
-  class level (the same mechanism Step 6 uses). The
-  class-level stub is simpler and tighter for a single figi
-  on a TEMP DB.
+  explicit `--db` that points at the TEMP DB. The script
+  imports `from datetime import date` at module load time, so
+  the `_PinnedDate` clock patch MUST be re-applied to the
+  `populate_expected_bars` module's `date` attribute AFTER
+  `spec.loader.exec_module(peb)` returns (the loader captures
+  the real class into the module's globals at import time).
+- `BackfillRunner._get_meta_moex` signature (live
+  `apps/api/src/algotrader_api/ingestion/backfill.py:219`):
+  `(ticker: str, yesterday: date, *, meta_cache: dict,
+   meta_lock: threading.Lock) -> dict | None`. The stub
+  MUST match the keyword-only `meta_cache` / `meta_lock`
+  parameters; the existing production call site at
+  `backfill.py:1149` uses exactly these kwargs.
+- `BackfillRunner._fetch_year_moex` and
+  `BackfillRunner._get_meta_moex` are class-level
+  `staticmethod` bindings declared OUTSIDE `__post_init__`
+  (live `backfill.py:804–806`). The new
+  `_fetch_year_moex_outcome` (Task 1) and the
+  `record_historical_no_trade_evidence` helper (Task 2) MUST
+  be added with the same binding pattern; tests can then
+  `monkeypatch.setattr(BackfillRunner, '_fetch_year_moex_outcome',
+  staticmethod(...))` to inject the strict synthetic feed
+  without HTTP.
+- The walker does NOT call `prefetch_moex_meta` in the
+  current code path (`backfill_from_moex` is the only entry
+  point that touches it; the new test uses the historical
+  walker which goes through `decide_strategy` →
+  `_get_meta_moex`, not `prefetch_moex_meta`). The test
+  MUST NOT add a `prefetch_moex_meta` stub — the round3
+  surrogate appendix calls this out.
+- `record_historical_no_trade_evidence` interface (Task 2):
+  `(conn, *, db_path, figi, ticker, rows, board, isin,
+  outcome, today=None) -> int`. The `ticker` is the
+  explicit argument from the `instruments` row — the helper
+  MUST NOT guess it from `rows[0].get("_secid")`. The test
+  asserts evidence was persisted by inspecting the row
+  count in `moex_no_trade_evidence` AFTER the walker
+  returns; the test does NOT call
+  `record_historical_no_trade_evidence` itself.
+- `backfill_from_moex` signature (live
+  `backfill.py:1058`): `(*, today: date | None = None,
+  max_workers: int = 5, delta_only: bool = True,
+  priority: bool = True, recent_tail_days: int = 0) ->
+  int`. Returns total bars written across all figis. The
+  test passes only `today=date(2024, 12, 31)` and ignores
+  the return value; the assertion is on the table state.
+- Test fixtures `_make_strict_synthetic_feed`,
+  `_make_runner`, `_pin_clock`, `_PinnedDate`, `_holiday_set`,
+  `_invoke_populate` do NOT exist in `test_backfill_coverage.py`
+  today (only `_seed_instruments`, `_seed_migrations`,
+  `_migrations_dir`). Define them concretely inline in the
+  new test; do NOT import across test modules. The
+  class-level `staticmethod` stub is simpler and tighter
+  for a single figi on a TEMP DB than the `responses`-based
+  HTTP-shape payload; both options are equivalent for the
+  gate-improvement assertion, the class-level stub is
+  preferred.
 
 **Concrete test code (illustrative; do not lower validation to
 fit a sloppy mock):**
 
 ```python
 import asyncio
+import importlib
 import importlib.util
 import sqlite3
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-import responses as _responses
 
 from algotrader_api.ingestion.backfill import BackfillRunner
 from algotrader_api.ml.features import check_coverage
 
 
+FIGI = "BBG00RU000A1"
+TICKER = "GAZP"
+BOARD = "TQBR"
+ISIN = "RU0007661625"
+ANCHOR = date(2014, 1, 15)        # listing anchor (source_updated_at)
+LAST_SESSION = date(2024, 12, 30)  # last completed business day
+TODAY = date(2024, 12, 31)        # pinned clock
+
+
+class _PinnedDate(date):
+    """Frozen date subclass returned by ``date.today()`` so every
+    module that calls ``date.today()`` agrees on the same
+    value. See the round3 surrogate appendix for the
+    force-import / re-pin dance for ``populate_expected_bars``.
+    """
+    _PINNED_TODAY = TODAY
+
+    @classmethod
+    def today(cls) -> "_PinnedDate":
+        return cls.fromordinal(cls._PINNED_TODAY.toordinal())
+
+    @classmethod
+    def fromtimestamp(cls, t: float) -> "_PinnedDate":
+        return cls.fromordinal(cls._PINNED_TODAY.toordinal())
+
+
+_RealDate = date  # keep the real class for isinstance checks
+
+
+def _pin_clock(today: date) -> None:
+    """Replace ``date`` in every relevant module's namespace with
+    :class:`_PinnedDate` so the helpers agree on the same
+    ``today()`` return value. Force-imports each module first
+    so the rebind reaches an existing ``date`` global.
+    """
+    _PinnedDate._PINNED_TODAY = today
+    for modname in (
+        "algotrader_api.ml.features",
+        "algotrader_api.ml.coverage",
+        "algotrader_api.ingestion.backfill",
+        "algotrader_api.ingestion.no_trade_evidence",
+    ):
+        importlib.import_module(modname)
+        mod = sys.modules.get(modname)
+        if mod is not None and hasattr(mod, "date"):
+            mod.date = _PinnedDate
+
+
 def _seed_temp_db(tmp_path: Path) -> str:
-    """Build a fully-migrated TEMP DB with one share instrument.
-    Returns the file-backed path. No cross-module fixture
-    imports; ``run_migrations`` is the actual existing public
-    entry point.
+    """Build a fully-migrated TEMP DB with one share figi and
+    one real-shape bar at the listing anchor. The figi's
+    ``source_updated_at`` is the anchor date; the bar is
+    seeded at the SAME date. ``expected_bars`` is left NULL
+    (canonical; populated later via the CLI).
     """
     from algotrader_api.db import sqlite as _sqlitedb
     migrations_dir = str(
@@ -1666,54 +1820,112 @@ def _seed_temp_db(tmp_path: Path) -> str:
     _sqlitedb.close_all()
     con = sqlite3.connect(db_path)
     con.execute(
-        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin) "
-        "VALUES ('GAZP', 'BBG00RU000A1', 'share', 'Gazp', 'rub', 10, 'RU0007661625')"
+        "INSERT INTO instruments "
+        "(ticker, figi, class, name, currency, lot_size, isin, "
+        "source_updated_at) "
+        "VALUES (?, ?, 'share', 'Gazp', 'rub', 10, ?, ?)",
+        (TICKER, FIGI, ISIN, ANCHOR.isoformat()),
     )
     con.execute(
         "INSERT INTO bars (figi, ts, open, high, low, close, volume, source) "
-        "VALUES ('BBG00RU000A1', '2024-01-15', 100, 102, 99, 101, 1000, 'tinkoff')"
+        "VALUES (?, ?, 100, 102, 99, 101, 1000, 'tinkoff')",
+        (FIGI, ANCHOR.isoformat()),
     )
     con.commit()
     con.close()
     return db_path
 
 
-def _make_strict_synthetic_feed(ticker: str, board: str) -> list[dict]:
-    """Build a strict synthetic zero-trade feed for the historical
-    walker's 2024 year. One real bar (2024-01-15) plus
-    zero-trade rows for every other weekday in 2024 (the
-    helper's business-date filter keeps the in-window
-    weekdays and drops weekends/holidays). All rows carry
-    matching SECID/BOARDID so identity passes; explicit
-    zero counters on zero-trade rows so the row-shape
-    contract holds.
+def _holiday_set(db_path: str) -> set[str]:
+    """Return MOEX-holiday ISO date strings seeded by migration 006."""
+    con = sqlite3.connect(db_path)
+    try:
+        rows = con.execute("SELECT date FROM moex_holidays").fetchall()
+        return {r[0] for r in rows}
+    finally:
+        con.close()
+
+
+def _make_strict_synthetic_feed_year(
+    year: int,
+    holidays: set[str],
+) -> tuple[list[dict], str]:
+    """Build the strict synthetic feed for ONE calendar year.
+
+    Returns ``(rows, "complete")`` so the new
+    ``_fetch_year_moex_outcome`` returns a valid tuple.
+    The walker is bound (Task 2 Step 5) to call this per
+    year; the new helper paginates the rows internally so a
+    single tuple is enough for the test.
+
+    * Anchor (2014-01-15) — real-shape OHLC.
+    * Last session (2024-12-30) — real-shape OHLC.
+    * Every other weekday in [year-01-01, year-12-31] that
+      is NOT in ``holidays`` is an explicit zero-trade row
+      (open=high=low=close=None, volume=numtrades=value=0,
+      _secid=TICKER, _boardid=BOARD).
     """
-    from datetime import date, timedelta
     rows: list[dict] = []
-    real_bar_date = date(2024, 1, 15)
-    rows.append({
-        "figi": None, "ts": real_bar_date.isoformat(),
-        "open": 100, "high": 102, "low": 99, "close": 101,
-        "volume": 1000, "source": "moex",
-        "_secid": ticker, "_boardid": board,
-        "_numtrades": 5, "_value": 100000,
-    })
-    cur = date(2024, 1, 1)
-    end = date(2024, 12, 31)
+    real_bar_dates = {ANCHOR, LAST_SESSION}
+    cur = date(year, 1, 1)
+    end = date(year, 12, 31)
     while cur <= end:
-        if cur == real_bar_date:
-            cur += timedelta(days=1)
-            continue
-        if cur.weekday() < 5:  # weekday, not a holiday
+        iso = cur.isoformat()
+        if cur in real_bar_dates:
             rows.append({
-                "figi": None, "ts": cur.isoformat(),
+                "figi": None, "ts": iso,
+                "open": 100, "high": 102, "low": 99, "close": 101,
+                "volume": 1000, "source": "moex",
+                "_secid": TICKER, "_boardid": BOARD,
+                "_numtrades": 5, "_value": 100000,
+            })
+        elif cur.weekday() < 5 and iso not in holidays:
+            rows.append({
+                "figi": None, "ts": iso,
                 "open": None, "high": None, "low": None, "close": None,
                 "volume": 0, "source": "moex",
-                "_secid": ticker, "_boardid": board,
+                "_secid": TICKER, "_boardid": BOARD,
                 "_numtrades": 0, "_value": 0,
             })
         cur += timedelta(days=1)
-    return rows
+    return rows, "complete"
+
+
+def _make_strict_synthetic_feed(db_path: str) -> list[dict]:
+    """Strict synthetic feed spanning every calendar year from
+    the anchor to the last session. Paginated per year
+    (the new fetcher consumes one year at a time, so the
+    test returns a flat list and the stub slices by year
+    inside the closure).
+    """
+    holidays = _holiday_set(db_path)
+    out: list[dict] = []
+    for year in range(ANCHOR.year, LAST_SESSION.year + 1):
+        rows, _outcome = _make_strict_synthetic_feed_year(year, holidays)
+        out.extend(rows)
+    return out
+
+
+def _paginated_stub(db_path: str):
+    """Build a per-year class-level staticmethod stub. The
+    walker calls
+    ``self._fetch_year_moex_outcome(market, board, ticker,
+    year, last_trading_day=...)`` once per (year, figi);
+    this closure filters the flat synthetic feed down to the
+    requested year and returns the strict tuple.
+    """
+    flat = _make_strict_synthetic_feed(db_path)
+    by_year: dict[int, list[dict]] = {y: [] for y in range(ANCHOR.year, LAST_SESSION.year + 1)}
+    for r in flat:
+        y = int(r["ts"][:4])
+        by_year[y].append(r)
+
+    def _stub(*args, **kwargs) -> tuple[list[dict], str]:
+        # Signature: (market, board, ticker, year, last_trading_day=None)
+        year = args[3] if len(args) >= 4 else kwargs.get("year")
+        return by_year.get(int(year), []), "complete"
+
+    return staticmethod(_stub)
 
 
 def _make_runner(db_path: str) -> BackfillRunner:
@@ -1726,25 +1938,25 @@ def _make_runner(db_path: str) -> BackfillRunner:
 
 
 async def _await_runner(runner: BackfillRunner) -> int:
-    """Run the public historical walker; return bars written.
-    The real public ``backfill_from_moex`` exercises the new
-    ``_fetch_year_moex_outcome`` binding (Step 5) and writes
-    the bar list + the evidence helper when outcome is
-    ``complete``.
+    """Run the public historical walker. The walker drives the
+    real public ``backfill_from_moex`` which calls
+    ``self._fetch_year_moex_outcome`` (Task 1) and
+    ``record_historical_no_trade_evidence`` (Task 2) per
+    figi-year. No ``prefetch_moex_meta`` stub — the walker
+    does not call it on this path.
     """
-    from algotrader_api.ingestion import backfill as _backfill_mod
-
-    async def _no_prefetch(self, instruments):
-        return None
-    _backfill_mod.BackfillRunner.prefetch_moex_meta = _no_prefetch
-    return await runner.backfill_from_moex(today=date(2024, 12, 31))
+    return await runner.backfill_from_moex(today=TODAY)
 
 
 def _invoke_populate(db_path: str) -> int:
-    """Invoke the actual existing ``populate_expected_bars`` CLI
-    with monkeypatched ``sys.argv``; NO new wrapper. The
-    --refresh flag recomputes the canonical ``expected_bars``
-    for every figi in the universe.
+    """Invoke the actual existing ``populate_expected_bars``
+    CLI with monkeypatched ``sys.argv``; NO new wrapper.
+    The --refresh flag recomputes the canonical
+    ``expected_bars`` for every figi in the universe. After
+    exec_module, the loaded module's ``date`` is re-pointed
+    at :class:`_PinnedDate` so the CLI's
+    ``from datetime import date`` reference also sees the
+    pinned clock.
     """
     spec = importlib.util.spec_from_file_location(
         "populate_expected_bars",
@@ -1759,115 +1971,159 @@ def _invoke_populate(db_path: str) -> int:
         "--refresh",
     ]
     try:
-        spec.loader.exec_module(peb)  # populates peb.main
+        spec.loader.exec_module(peb)
+        # Re-pin: the loader captured the real ``date`` into
+        # the module's globals at import time.
+        if hasattr(peb, "date"):
+            peb.date = _PinnedDate
         return peb.main()
     finally:
         sys.argv[:] = saved_argv
 
 
-@_responses.activate
 def test_walker_end_to_end_gate_improves_on_temp_db(
     tmp_path, monkeypatch,
 ):
-    """End-to-end: real public walker consumes a strict synthetic
-    feed, writes only explicit zero-trade evidence, recomputes
-    expected_bars on the TEMP DB via the existing CLI, and
-    improves check_coverage from below 0.95 to at or above
-    0.95. No fabricated bars, no manual denominator override,
-    no production read.
+    """End-to-end: real public walker consumes a paginated
+    strict synthetic feed, writes only explicit zero-trade
+    evidence via the new helper, recomputes expected_bars
+    on the TEMP DB via the existing CLI, and improves
+    check_coverage from below 0.95 (real ratio) to at or
+    above 0.95. No fabricated bars, no manual denominator
+    override, no production read, no unpinned wallclock.
     """
+    # Pin the clock BEFORE the first call to date.today() so
+    # the cached last_session and the helper's last_session
+    # agree.
+    _pin_clock(TODAY)
     db_path = _seed_temp_db(tmp_path)
 
-    # Pre-evidence: insert 1 real bar; the ratio is 1/252 ~ 0.4%
-    # (well below 0.95). Use the actual public ``check_coverage``
-    # signature: (conn, figis, coverage_threshold=0.95) -> list.
+    # Pre-evidence step 1: prepopulate expected_bars via the
+    # real CLI. Without this, the cached value is NULL and
+    # the pre-assertion is `expected=None` (unknown_expected)
+    # which does NOT prove the ratio is below 0.95.
+    rc = _invoke_populate(db_path)
+    assert rc == 0, f"pre-prepopulate populate_expected_bars exit={rc}"
+
+    # Pre-evidence step 2: the cached denominator is now
+    # real; the pre-assertion is a genuine ratio comparison.
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
-    pre = check_coverage(con, ["BBG00RU000A1"])
+    pre = check_coverage(con, [FIGI])
+    pre_cached = con.execute(
+        "SELECT expected_bars FROM instruments WHERE figi=?", (FIGI,),
+    ).fetchone()["expected_bars"]
     con.close()
     assert pre, f"pre-evidence check_coverage must report failures, got {pre!r}"
     pre_figi = pre[0]
-    assert pre_figi["figi"] == "BBG00RU000A1"
-    assert pre_figi["bars_count"] == 1
+    assert pre_figi["figi"] == FIGI
+    assert pre_figi["reason"] == "incomplete", (
+        f"pre-evidence reason must be 'incomplete' (cached "
+        f"denominator is real), got {pre_figi['reason']!r}"
+    )
     pre_expected = pre_figi["expected"]
-    assert pre_expected is not None and pre_expected > 0
+    assert pre_expected is not None and pre_expected > 0, (
+        f"cached expected must be positive after prepopulate, "
+        f"got {pre_expected!r}"
+    )
+    assert pre_figi["bars_count"] == 1
     assert pre_figi["bars_count"] / pre_expected < 0.95, (
         f"pre-evidence ratio must be below 0.95, got "
-        f"{pre_figi['bars_count']}/{pre_expected}"
+        f"{pre_figi['bars_count']}/{pre_expected} "
+        f"= {pre_figi['bars_count'] / pre_expected:.4f}"
     )
 
-    # Stub the new outcome-emitting fetcher at the class level
-    # so the real ``backfill_from_moex`` calls
-    # ``self._fetch_year_moex_outcome`` (Step 5 binding) and
-    # sees outcome == 'complete' for every year.
+    # Stub the new outcome-emitting fetcher at the class
+    # level (Task 1 binding OUTSIDE __post_init__). The
+    # closure filters the flat synthetic feed to the
+    # requested year and returns the strict tuple.
     from algotrader_api.ingestion import backfill as _backfill_mod
-    rows = _make_strict_synthetic_feed("GAZP", "TQBR")
     monkeypatch.setattr(
         _backfill_mod.BackfillRunner, "_fetch_year_moex_outcome",
-        staticmethod(lambda *a, **kw: (rows, "complete")),
+        _paginated_stub(db_path),
     )
-    # Stub the meta probe so decide_strategy does not do a real
-    # HTTP probe; identity must match the seeded instruments row.
+    # Stub the meta probe at the class level (live
+    # backfill.py:219) so decide_strategy does not HTTP-probe.
+    # Signature: (ticker, yesterday, *, meta_cache, meta_lock).
     monkeypatch.setattr(
         _backfill_mod.BackfillRunner, "_get_meta_moex",
-        staticmethod(lambda ticker, today, *, meta_cache, meta_lock: {
-            "market": "shares", "board": "TQBR",
-            "listed_from": "2014-01-01", "listed_till": today.isoformat(),
-            "isin": "RU0007661625",
-        }),
+        staticmethod(
+            lambda ticker, yesterday, *, meta_cache, meta_lock: {
+                "market": "shares", "board": BOARD,
+                "listed_from": ANCHOR.isoformat(),
+                "listed_till": yesterday.isoformat(),
+                "isin": ISIN,
+            }
+        ),
     )
 
+    # Drive the real public historical walker. The runner
+    # calls ``record_historical_no_trade_evidence`` for every
+    # (year, figi) where outcome is "complete" (Task 2
+    # binding). The test does NOT call the writer directly.
     runner = _make_runner(db_path)
-    n_bars_written = asyncio.run(_await_runner(runner))
+    asyncio.run(_await_runner(runner))
 
-    # The bar writer saw every parsed bar (the 1 real + ~250
-    # zero-trade). INSERT OR IGNORE drops the zero-trade rows
-    # (the writer treats explicit zero as no-bar), so the
-    # table holds exactly the 1 real bar from 2024-01-15.
+    # The bar writer saw every parsed bar (anchor + last
+    # session + zero-trade). INSERT OR IGNORE on PRIMARY KEY
+    # (figi, ts) and the NOT NULL constraint on
+    # open/high/low/close drop the zero-trade rows, so the
+    # bars table holds exactly the 2 real-shape bars.
     con = sqlite3.connect(db_path)
     n_real_bars = con.execute(
-        "SELECT COUNT(*) FROM bars WHERE figi='BBG00RU000A1'"
+        "SELECT COUNT(*) FROM bars WHERE figi=?", (FIGI,),
     ).fetchone()[0]
     n_evidence = con.execute(
         "SELECT COUNT(*) FROM moex_no_trade_evidence "
-        "WHERE figi='BBG00RU000A1'"
+        "WHERE figi=?", (FIGI,),
     ).fetchone()[0]
     con.close()
-    assert n_real_bars == 1, (
-        f"expected exactly 1 real bar (no fabricated OHLC), got {n_real_bars}"
+    assert n_real_bars == 2, (
+        f"expected exactly 2 real bars (anchor + last "
+        f"session, no fabricated OHLC), got {n_real_bars}"
     )
     assert n_evidence > 0, (
-        "evidence helper should have recorded every in-window "
-        "weekday, non-holiday, zero-trade date"
+        "evidence helper should have recorded every "
+        "in-window weekday, non-holiday, zero-trade date "
+        f"via record_historical_no_trade_evidence (Task 2); "
+        f"got {n_evidence}"
     )
 
-    # Recompute expected_bars on the TEMP DB (canonical path;
-    # production threshold / universe / formula unchanged).
+    # Re-prepopulate expected_bars AFTER the walker. The
+    # cached denominator now subtracts the confirmed
+    # no-trade evidence in window, so the post-ratio meets
+    # the 0.95 threshold.
     rc = _invoke_populate(db_path)
-    assert rc == 0, f"populate_expected_bars exit={rc}"
+    assert rc == 0, f"post-walk populate_expected_bars exit={rc}"
 
-    # Post-evidence: the real bar + every weekday's evidence
-    # row satisfies the gate; check_coverage returns an empty
-    # list (no failing figis).
+    # Post-evidence: the real bars + every weekday's
+    # evidence row satisfies the gate; check_coverage
+    # returns an empty list (no failing figis).
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
-    post = check_coverage(con, ["BBG00RU000A1"])
+    post = check_coverage(con, [FIGI])
     post_expected = con.execute(
-        "SELECT expected_bars FROM instruments WHERE figi='BBG00RU000A1'"
+        "SELECT expected_bars FROM instruments WHERE figi=?", (FIGI,),
     ).fetchone()["expected_bars"]
     n_bars = con.execute(
-        "SELECT COUNT(*) FROM bars WHERE figi='BBG00RU000A1'"
+        "SELECT COUNT(*) FROM bars WHERE figi=?", (FIGI,),
     ).fetchone()[0]
     con.close()
     assert post == [], f"post-evidence check_coverage must pass, got {post!r}"
+    assert post_expected is not None and post_expected > 0, (
+        f"cached expected must be positive after post-walk "
+        f"prepopulate, got {post_expected!r}"
+    )
     assert n_bars / post_expected >= 0.95, (
         f"post-evidence ratio must be at or above 0.95, got "
-        f"{n_bars}/{post_expected}"
+        f"{n_bars}/{post_expected} = {n_bars / post_expected:.4f}"
     )
 ```
 
 Run the new test; expected RED until Task 1 + Task 2 land.
-After both land: GREEN.
+After both land: GREEN. The test is end-to-end: it drives
+the real public walker and asserts on the canonical gate,
+not on helper internals.
 
 #### Verify and commit
 
@@ -2004,6 +2260,37 @@ the probe stdout):**
 | `POST` ratio                 | `1.0000` (2 / 2) — at or above 0.95 |
 | `POST` failing list          | `[]` (gate passes)   |
 
+**Pre-evidence gate is NOT a real ratio claim:**
+`PRE bars=1 / expected_in_window=2810 = 0.0004` is the
+probe's own in-window arithmetic (computed by
+`_expected_business_days_window` against the TEMP DB
+holidays set), NOT `check_coverage`'s view. With
+`expected_bars` left NULL until the post-walk
+`populate_expected_bars --refresh` pass, the canonical
+gate reports `expected=None` and reason `unknown_expected`
+on the pre side. A `1/None` comparison is not a valid
+"below 0.95" claim. The probe therefore asserts
+`failing != []` on the pre side, not a ratio bound; the
+ratio bound is asserted post-walk against the cached
+denominator. The Task 3 future test corrects this
+limitation by running the populate CLI BEFORE the walker
+so the pre-side ratio is real (see Task 3 prepopulate
+guard and `reason: 'incomplete'` assertion).
+
+**Probe `bars_written_total=22` is attempts, not persisted
+rows (explicit warning):** the existing helper
+`replace_bars_for_figi` does `executemany` per year; the
+returned rowcount sums attempted-then-conflicted inserts
+across 11 years (the 2014–2024 window). The explicit-zero
+rows violate the `bars.NOT NULL` constraint on
+`open/high/low/close`, so the surrounding transaction
+rolls back; the writer's rowcount still counts the
+attempted inserts. End state in `bars` is exactly 2 rows
+(anchor + last_session). The probe's `AFTER WALK bars=2`
+assertion is the persisted count; `bars_written_total=22`
+is a return-value signal, not a row-count signal, and the
+test does not equate the two.
+
 **Real-bar-wins filter (explicit check):** the probe asserts
 that no evidence row exists for `2024-12-30` (the
 synthetic OHLC bar) — `record_no_trade_evidence` skips any
@@ -2012,12 +2299,43 @@ session whose date is already in `bars`. The 2 `bars` rows
 `AFTER WALK` and `POST` — the writer does not touch the
 `bars` table.
 
-**TTL semantics (explicit check):** the probe asserts the
-first evidence row's `expires_at` equals
-`pinned_today + HISTORICAL_EVIDENCE_EXPIRY` (2025-12-31).
-Every session_date in the 2014–2024 window is well outside
-the 14-day recent cutoff, so all rows use the historical
-expiry branch — TTL semantics are preserved.
+**TTL semantics (single-class surrogate, with BOTH-class
+guard):** the surrogate above pins `today=2024-12-31`
+and every session_date in the 2014–2024 window is outside
+the 14-day recent cutoff EXCEPT the very last one
+(`2024-12-30` is `today - 1d`, in the recent branch).
+The probe asserts the first row's `expires_at` equals
+`pinned_today + HISTORICAL_EVIDENCE_EXPIRY` (2025-12-31);
+that covers the historical class. To cover BOTH expiry
+classes, an explicit guard probe runs with
+`today=2026-09-30`:
+
+|| Stage                          | Value             |
+||--------------------------------|-------------------|
+|| `GUARD` pinned today            | `2026-09-30`     |
+|| `GUARD` recent_cutoff           | `2026-09-16`     |
+|| `GUARD` recent row date         | `2026-09-25` (5d) — recent class |
+|| `GUARD` recent row expires_at   | `2026-10-07` = `today + RECENT_EVIDENCE_EXPIRY` (7d) ✓ |
+|| `GUARD` historical row date     | `2026-08-01` (60d) — historical class |
+|| `GUARD` historical row expires_at | `2799/9` (2027-09-30) = `today + HISTORICAL_EVIDENCE_EXPIRY` (365d) ✓ |
+|| `GUARD` row counts              | `n_recent=1, n_historical=1, n_total=2` (mixed-class proof) |
+
+The guard probe does NOT depend on the surrogate above
+and CAN be executed as a separate `pytest` test against
+the existing writer (the same
+`record_no_trade_evidence` codepath; the test merely
+shifts `now` and the two row dates so each falls in a
+different expiry branch). The guard probe is the
+canonical proof that the existing writer's TTL branching
+survives the helper unwrap; the surrogate probe is the
+canonical proof that the calendar/freshness contract
+survives the helper unwrap. Two probes, two
+assertions, no false equivalence.
+
+The future Task 2 test
+`test_record_historical_no_trade_evidence_complete_keeps_ttl_semantics`
+exercises the same BOTH-class pattern with the explicit
+helper; that test will RED until Task 2 lands.
 
 **Freshness contract (explicit check):** `populate_expected_bars`
 runs `--refresh` against the TEMP DB, computes the canonical
