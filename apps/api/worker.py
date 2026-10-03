@@ -308,6 +308,7 @@ _DAILY_CHAIN_FIRST_PHASES: tuple[str, ...] = (
     "migrations",
     "universe_sync",
     "backfill_moex",      # replaces daily_backfill + full_history (MOEX ISS, dynamic listed_from→yesterday)
+    "bonds_depth",        # spec data-quality lines 79-90: AFTER backfill_moex, BEFORE corporate_actions (in "derived")
     "gap_recovery",
 )
 _DAILY_CHAIN_DERIVED_PHASES: tuple[str, ...] = (
@@ -502,24 +503,55 @@ def _step_bonds_depth(db_path: str) -> tuple[bool, str]:
     bonds is deferred to the priority-queue-redesign sub-project; this
     step is the daily-chain integration of the depth backfill from
     PR-1 (which already rate-limits via asyncio.run inside the body).
+
+    Fix/daily-bonds-depth (2026-10-03):
+      * Use the shared ``get_connection`` cache and DO NOT close it on
+        the way out — closing the cached connection would invalidate
+        it for every subsequent step (gap_recovery, corporate_actions,
+        …) which reuse the same handle and would crash with
+        ``ProgrammingError: Cannot operate on a closed database``.
+        Connection lifetime is owned by ``db.sqlite`` / ``close_all``;
+        the step is a borrower, not the owner.
+      * Return ``(False, detail)`` when the partial result reports
+        ``errors > 0`` so the daily runner's retry semantics can pick
+        it up. Detail is the bounded numeric summary (no raw exception)
+        so the operator log line stays greppable.
+      * The step does NOT rollback or reacquire the connection on
+        either the partial-failure or the exception branch. The step
+        is a pure borrower of the cached connection; transaction
+        lifecycle (BEGIN/COMMIT/ROLLBACK) is owned by the writer
+        helper (``backfill_bonds_to_depth``) inside its own lock, so
+        a second rollback from the step would race the helper and
+        could silently drop a batch the helper has already committed.
+        On an unexpected exception the step just returns
+        ``(False, f"bonds_depth failed: {exc}")`` — the helper's own
+        ``finally`` / lock-release is responsible for putting the
+        connection back into a clean state.
     """
     try:
         from algotrader_api.db.sqlite import get_connection
         from algotrader_api.ingestion.backfill import backfill_bonds_to_depth
 
         conn = get_connection(db_path)
-        try:
-            result = backfill_bonds_to_depth(target_days=30, conn=conn)
-        finally:
-            conn.close()
+        result = backfill_bonds_to_depth(target_days=30, conn=conn)
+        errors = int(result.get("errors", 0) or 0)
         detail = (
             f"bonds_depth: figis_processed={result['figis_processed']} "
             f"bars_added={result['bars_added']} "
             f"skipped={result['skipped']} "
-            f"errors={result['errors']}"
+            f"errors={errors}"
         )
+        if errors > 0:
+            # Partial success is not an honest success; surface to the
+            # daily runner so the next cycle (or operator) can retry.
+            # Borrower contract: no rollback here — the helper already
+            # owned the transaction under its own lock.
+            return False, detail
         return True, detail
     except Exception as exc:  # noqa: BLE001 — daily-chain step pattern
+        # Borrower contract: no reacquire + rollback here either. The
+        # helper's lock release / finally is responsible for cleaning
+        # the connection state; the step just reports the failure.
         return False, f"bonds_depth failed: {exc}"
 
 
