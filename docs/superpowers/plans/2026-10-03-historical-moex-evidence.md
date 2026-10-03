@@ -1906,6 +1906,170 @@ Reviewer verifies:
 
 ---
 
+### Round3 docs-only fix: deterministic calendar/freshness surrogate (no production code change)
+
+**Status (2026-10-03):** Tasks 1–3 of this plan are future
+TDD-RED work (the new helpers — `MOEXFetchOutcome`,
+`_fetch_year_moex_outcome`, `record_historical_no_trade_evidence`,
+the new binding on `BackfillRunner.backfill_from_moex`, the
+business-date filter — do NOT exist in the live codebase at
+commit `3ad3977`). An integrated "new historical walker
+end-to-end" test therefore cannot be authored or run today
+without first landing Task 1 + Task 2. Per the brief, this
+section does NOT claim green for the new walker.
+
+What this section DOES establish: a deterministic
+fixture-arithmetic surrogate that proves the **existing**
+gate + **existing** writer + **existing** populate CLI improve
+on a strict synthetic feed inside a TEMP DB. No fabricated
+provider data, no production reads, no manual denominator
+override, no new helpers, no new code paths.
+
+**Probe path:**
+
+`/home/hermes/.hermes/cache/scratch/round3_probe.py`
+
+**Run command:**
+
+```bash
+cd /home/hermes/algotrader
+apps/api/.venv/bin/python /home/hermes/.hermes/cache/scratch/round3_probe.py
+```
+
+**Fixture shape (clock pinned to `today = 2024-12-31`):**
+
+* Listing anchor — real-shape OHLC bar at `2014-01-15` (the
+  figi's `source_updated_at`).
+* Latest completed business session — synthetic OHLC bar at
+  `2024-12-30` (Monday; not in `moex_holidays`).
+* Every other weekday in `[2014-01-15, 2024-12-30]` not in
+  `moex_holidays` — explicit zero-trade row
+  (`open=high=low=close=None`, `volume=numtrades=0`,
+  `value=0.0`, `_secid=GAZP`, `_boardid=TQBR`).
+* Walked against the real public
+  `BackfillRunner.backfill_from_moex(today=date(2024, 12, 31))`
+  with two class-level `staticmethod` stubs (per the live
+  pattern at `apps/api/src/algotrader_api/ingestion/backfill.py:804`
+  — bindings declared OUTSIDE `__post_init__`):
+  - `BackfillRunner._fetch_year_moex` → returns the strict
+    synthetic feed for every `(market, board, ticker, year)`
+    call.
+  - `BackfillRunner._get_meta_moex` → returns
+    `{market: "shares", board: "TQBR", listed_from:
+    "2014-01-15", listed_till: yesterday.isoformat(), isin:
+    "RU0007661625"}`.
+
+**Clock pin (the brief calls this out explicitly):** every
+helper that calls `date.today()` is rebound to a
+`_PinnedDate` subclass via module-level attribute replacement.
+Modules covered: `algotrader_api.ml.features`,
+`algotrader_api.ml.coverage`,
+`algotrader_api.ingestion.backfill`,
+`algotrader_api.ingestion.no_trade_evidence`, plus the
+loaded `populate_expected_bars` module (its `date` is
+re-pointed after `spec.loader.exec_module(peb)` because
+`from datetime import date` captured the real class into
+the module's globals at load time). The CLI receives
+`sys.argv = ["populate_expected_bars", "--db", <TEMP>,
+"--refresh"]` and `peb.main()` is called — no new wrapper.
+
+**Strict feed contract enforced before the writer call:**
+the existing helper
+`apps.api.ingestion.no_trade_evidence._extract_zero_trade_rows`
+accepts only the explicit zero-trade shape (all OHLC
+`None`, all counters `0`, matching SECID + BOARDID). The
+probe routes the feed through this helper — the writer
+NEVER sees unfiltered weekday evidence. The anchor and the
+last-session real-shape rows are correctly dropped from the
+zero-row list (they do not match the strict shape).
+
+**Verified numbers (recorded on 2026-10-03, captured from
+the probe stdout):**
+
+| Stage                        | Value                |
+|------------------------------|----------------------|
+| `PRE` bars in DB             | `1`                  |
+| `PRE` failing list           | non-empty, `reason: 'both'` (stale + unknown_expected) |
+| `PRE` ratio (window)         | `0.0004` (1 / 2810) — well below 0.95 |
+| `FEED` rows                  | `2810`               |
+| `AFTER WALK` bars            | `2` (anchor + last_session) |
+| `AFTER WALK` evidence rows   | `0` (walker does not call the writer today) |
+| `ZERO_ROWS` accepted by `_extract_zero_trade_rows` | `2808` (2810 − 2 real bars) |
+| `EVIDENCE` written (return)  | `2808`               |
+| `EVIDENCE` first row expires_at | `2025-12-31` = `today + HISTORICAL_EVIDENCE_EXPIRY` ✓ |
+| `POPULATE` exit code         | `0`                  |
+| `POPULATE` `end_date`        | `2024-12-30` (yesterday from pinned today) |
+| `POST` bars in DB            | `2` (unchanged)      |
+| `POST` cached `expected_bars` | `2` (`business_days(2014-01-15, 2024-12-30) − 2808 evidence`) |
+| `POST` ratio                 | `1.0000` (2 / 2) — at or above 0.95 |
+| `POST` failing list          | `[]` (gate passes)   |
+
+**Real-bar-wins filter (explicit check):** the probe asserts
+that no evidence row exists for `2024-12-30` (the
+synthetic OHLC bar) — `record_no_trade_evidence` skips any
+session whose date is already in `bars`. The 2 `bars` rows
+(2014-01-15 + 2024-12-30) are unchanged between
+`AFTER WALK` and `POST` — the writer does not touch the
+`bars` table.
+
+**TTL semantics (explicit check):** the probe asserts the
+first evidence row's `expires_at` equals
+`pinned_today + HISTORICAL_EVIDENCE_EXPIRY` (2025-12-31).
+Every session_date in the 2014–2024 window is well outside
+the 14-day recent cutoff, so all rows use the historical
+expiry branch — TTL semantics are preserved.
+
+**Freshness contract (explicit check):** `populate_expected_bars`
+runs `--refresh` against the TEMP DB, computes the canonical
+`expected_bars` (= `business_days(listing, yesterday) −
+confirmed zero-trade evidence in window`), and the result
+matches the post-ratio the gate computes against the cached
+column. The cached denominator is positive (`2`).
+
+**What this probe does NOT prove:**
+
+* The new `MOEXFetchOutcome` reduction rules (Tasks 1 + 2).
+* The new business-date filter in the new helper
+  `record_historical_no_trade_evidence` (Task 2, not yet
+  merged; the probe uses the existing
+  `record_no_trade_evidence` and applies the filter inline
+  via `_extract_zero_trade_rows`).
+* The new walker binding of `_fetch_year_moex_outcome`
+  (Task 2, not yet merged; the probe stubs the existing
+  `_fetch_year_moex` at the class level).
+* The historical CLI rewrite to delegate to the new
+  `_fetch_year_moex_outcome` + `record_historical_no_trade_evidence`
+  chain (Task 2 Step 7, not yet merged).
+* Any claim that all 215 incomplete-history figis are
+  recoverable; the daily phase hang; or any production-side
+  behaviour change.
+
+These are intentionally separate TDD-RED workstreams that
+land when Tasks 1 and 2 land. The probe above is a
+fixture-arithmetic proof on the existing helpers, not a
+proof of the new walker.
+
+**Minor cleanups applied to the touched code path
+(per brief):**
+
+* The plan's original Task 3 contained a dead
+  `prefetch_moex_meta = _no_prefetch` patch
+  (`backfill_from_moex` does not call `prefetch_moex_meta`).
+  The probe does not include that patch.
+* The plan's original `_await_runner` accepted a `figi`
+  kwarg the real `backfill_from_moex` does not consume.
+  The probe's `_walk` passes only `today=date(2024,12,31)`.
+* The new helpers will be `staticmethod` bindings declared
+  on `BackfillRunner` OUTSIDE `__post_init__`, matching the
+  live pattern at
+  `apps/api/src/algotrader_api/ingestion/backfill.py:804`
+  (`_fetch_year_moex = staticmethod(_fetch_year_moex)`,
+  etc.), so tests can `patch.object(BackfillRunner,
+  '_fetch_year_moex_outcome')` the same way. This is a
+  Task 1 implementation note, recorded here for the reviewer.
+
+---
+
 ### End-to-end smoke (after Tasks 1–3 land)
 
 Run the focused regression set and the broader safe regression
