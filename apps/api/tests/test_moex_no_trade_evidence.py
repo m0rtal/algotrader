@@ -1443,6 +1443,329 @@ def test_fetch_year_moex_outcome_zero_trade_missing_counters_is_malformed():
     assert outcome == "malformed"
 
 
+# -- Task1 R2: strict raw-row poison (parent repro) ---------------------
+
+
+def test_fetch_year_moex_outcome_malformed_short_row_poisons_outcome():
+    """Parent repro: 1 valid row + 1 short row (len 9 vs cols 10). The
+    short row must poison the outcome to ``malformed`` BEFORE the loop
+    continues, and the valid row is preserved in the returned list
+    (bar consumers keep their data, evidence path is refused).
+
+    Without the fix: outcome=complete, len(rows)=1 (silent drop on
+    the short row, cursor close still reads complete). Spec demands
+    malformed.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    # short_row: drops the last column (VALUE) — len 9 vs cols 10.
+    short_row = valid_row[:-1]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row, short_row],
+        },
+        # Raw length 2, but kept length 1. Spec: any malformed raw row
+        # poisons outcome — cursor close is irrelevant.
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+    # The valid clean row is preserved — bar consumers still get the
+    # data they would have accepted today.
+    assert len(rows) == 1
+    assert rows[0]["_secid"] == "GAZP"
+
+
+def test_fetch_year_moex_outcome_malformed_long_row_poisons_outcome():
+    """A row LONGER than the columns list must also poison the outcome
+    (the strict feed contract is column-list-anchored, not "row shorter
+    than cols only"). Kept clean row preserved.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    long_row = valid_row + [99]  # one extra trailing value
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row, long_row],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+    assert len(rows) == 1
+    assert rows[0]["_secid"] == "GAZP"
+
+
+def test_fetch_year_moex_outcome_row_is_none_does_not_crash():
+    """A row whose value is ``None`` (where the strict contract expects a
+    scalar) must not crash the parser; it counts as malformed and poisons
+    the outcome. The remaining valid rows are preserved.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            # Second "row" is the literal None — common when a server
+            # pads an empty slot. Must not crash; must poison outcome.
+            "data": [valid_row, None],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+    assert len(rows) == 1
+    assert rows[0]["_secid"] == "GAZP"
+
+
+def test_fetch_year_moex_outcome_row_is_string_does_not_crash():
+    """A row whose value is a string (where the contract expects a
+    sequence) must not crash. The length check catches it cleanly:
+    ``len("a string") == 8`` which is shorter than the columns list
+    (10), so it drops + poisons. No exception bubbles to the caller.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row, "not-a-row"],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+    assert len(rows) == 1
+    assert rows[0]["_secid"] == "GAZP"
+
+
+def test_fetch_year_moex_outcome_cursor_offset_wrong_type_is_malformed():
+    """Spec cursor: ``[offset, total, page_size]`` integers only. A
+    fractional ``offset`` (``0.5``) is malformed — we cannot use a
+    non-integer as a pagination index. Bool, float fraction, None are
+    all malformed. The kept clean row is preserved.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row],
+        },
+        # offset is a fraction — the strict cursor contract is integer.
+        "history.cursor": {"data": [[0.5, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+    assert len(rows) == 1
+
+
+def test_fetch_year_moex_outcome_cursor_page_size_inconsistent_is_malformed():
+    """F1: cursor promises page_size=100 but the server returned 200
+    rows on the same page. Spec line 30-31: page_size consistency check
+    → malformed. Kept clean rows preserved.
+
+    Independent of the parent repro: this is the F1 page_size
+    consistency guard.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-29", "GAZP", "TQBR",
+                 100, 102, 99, 101, 1000, 5, 100000]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row] * 200,  # 200 rows
+        },
+        # cursor says page_size=100; server returned 200. Inconsistent.
+        "history.cursor": {"data": [[0, 200, 100]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+
+
+def test_fetch_year_moex_outcome_missing_status_code_is_malformed():
+    """F3: a response with no ``status_code`` attribute at all must
+    fail closed to ``malformed`` (cannot certify HTTP success without
+    the attribute). The legacy test that omits status_code goes
+    through the bar-list wrapper, which never reads status_code, so
+    that test is unaffected.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeRespNoStatus:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeRespNoStatus(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+
+
+def test_fetch_year_moex_outcome_fractional_volume_is_malformed():
+    """F4: a non-integer VOLUME (e.g. 1000.5) is malformed. The strict
+    contract requires integer share counts; ``int(1000.5) == 1000``
+    would silently truncate. Reject fractional VOLUME explicitly.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 100, 102, 99, 101, 1000.5, 5, 100000],
+            ],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+
+
 # -- bar-list compatibility (Step 2 / Step 3) --------------------------
 
 

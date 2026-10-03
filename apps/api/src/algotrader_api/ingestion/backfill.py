@@ -612,10 +612,25 @@ def _fetch_year_moex_iter(
         rows_raw = data.get("history", {}).get("data", []) or []
         page_outcome = "complete"
         for row in rows_raw:
-            if len(row) != len(cols):
-                # Drop malformed rows; page_outcome stays whatever
-                # the cursor / identity checks determine (kept
-                # rows already passed the strict contract).
+            # Strict feed contract: every raw row MUST match the
+            # column-list length. Any malformed raw row (short, long,
+            # non-sequence) POISONS the page's outcome to ``malformed``
+            # BEFORE the loop continues; valid clean rows already
+            # accepted in earlier iterations are preserved in
+            # ``kept_rows`` so the bar consumer keeps its data, and
+            # the evidence path refuses the batch via the outcome.
+            # Without the poison: cursor-close on a kept-only count
+            # would certify a fetch that actually contained a bad row
+            # (parent repro, round 2).
+            row_ok = False
+            try:
+                if len(row) == len(cols):
+                    row_ok = True
+            except TypeError:
+                # Non-sequence row (None, str, dict, scalar) — malformed.
+                row_ok = False
+            if not row_ok:
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
                 continue
             d = dict(zip(cols, row))
             # SECID/BOARDID identity check (per-batch poison).
@@ -731,6 +746,19 @@ def _fetch_year_moex_iter(
             try:
                 srv_page_size_i = int(_srv_page_size)
             except (TypeError, ValueError):
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            # Reject non-strict-integer cursor values: ``bool`` is a
+            # subclass of ``int`` (``int(True) == 1``); a ``float``
+            # silently truncates (``int(0.5) == 0``). The strict feed
+            # contract demands an integer offset/total/page_size; any
+            # other type is malformed.
+            if (isinstance(offset, bool) or isinstance(total, bool)
+                    or isinstance(_srv_page_size, bool)
+                    or isinstance(offset, float)
+                    or isinstance(total, float)
+                    or isinstance(_srv_page_size, float)):
                 page_outcome = _reduce_outcomes(page_outcome, "malformed")
                 yield (kept_rows, page_outcome)
                 return
