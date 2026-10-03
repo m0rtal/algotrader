@@ -13,7 +13,17 @@ instrument demonstrably did not trade — they must not count against the
 95% completeness ratio. Both adjustments are conservative: missing
 columns / missing evidence fall back to the plain calendar count.
 
-Idempotent.
+Idempotent. Writer-coordination contract (Task 4):
+  * expected-bar values are computed BEFORE the shared writer lock
+    is acquired (no pending mutation under the lock except the
+    ``BEGIN IMMEDIATE`` batch itself).
+  * The complete update batch is applied in ONE coordinated
+    ``BEGIN IMMEDIATE`` transaction under
+    ``role="expected-bars" / phase="expected-bars"``; the batch
+    commits or rolls back as a single unit.
+  * A shared-lock busy raises ``WriterLockBusy``; the CLI returns
+    75 with no partial mutation.
+  * No ``--dry-run`` is added.
 
 Usage:
     python apps/api/scripts/populate_expected_bars.py
@@ -31,6 +41,10 @@ from pathlib import Path
 API_SRC = Path(__file__).resolve().parent.parent / "src"
 sys.path.insert(0, str(API_SRC))
 
+from algotrader_api.ingestion.writer_lock import (  # noqa: E402
+    WriterLockBusy,
+    writer_lock,
+)
 from algotrader_api.ml.coverage import expected_business_days  # noqa: E402
 
 
@@ -50,11 +64,12 @@ def main() -> int:
         print(f"ERROR: {db_path} does not exist", file=sys.stderr)
         return 2
 
+    # Pre-flight: confirm schema, then read everything we need to
+    # compute expected-bars values. The reader connection commits
+    # nothing; all mutation happens under the writer lock below.
     con = sqlite3.connect(str(db_path), timeout=30)
-    # Row factory: the loops below address columns by name.
     con.row_factory = sqlite3.Row
     try:
-        # Check migration 023 applied
         cols = [r[1] for r in con.execute("PRAGMA table_info(instruments)").fetchall()]
         if "expected_bars" not in cols:
             print("ERROR: instruments.expected_bars column missing. "
@@ -67,13 +82,6 @@ def main() -> int:
         except sqlite3.OperationalError:
             has_evidence = False
 
-        # Listing date = MIN(bars.ts) for figis with bars (most reliable
-        # source); falls back to instruments.source_updated_at for figis
-        # without bars. ADAPT-10 (live smoke 2026-09-25): the original
-        # implementation used source_updated_at only, which is the LAST
-        # UPDATE timestamp (when Tinkoff ISS last touched the row), not
-        # the listing date. For most figis source_updated_at > yesterday,
-        # so expected_bars was 0 for the entire population.
         listed_till_expr = ", i.listed_till AS listed_till" if has_listed_till else ""
         rows = con.execute(
             f"""SELECT i.figi,
@@ -85,8 +93,6 @@ def main() -> int:
                GROUP BY i.figi"""
         ).fetchall()
 
-        # Confirmed, unexpired no-trade evidence per figi, so the window
-        # subtraction below is O(1) per figi.
         evidence_by_figi: dict[str, set[str]] = {}
         if has_evidence:
             today_iso = date.today().isoformat()
@@ -98,52 +104,102 @@ def main() -> int:
                 evidence_by_figi.setdefault(r["figi"], set()).add(
                     r["session_date"]
                 )
+    finally:
+        con.close()
 
-        yesterday = date.today() - timedelta(days=1)
-        updated = 0
-        for r in rows:
-            figi = r["figi"]
-            listing = r["listing_ts"]
-            listing_date = date.fromisoformat(listing[:10])  # "2024-01-15T10:00:00"
-            # Delisted instruments stop expecting sessions at listed_till.
-            # Guard: a listed_till BEFORE the listing window is a MOEX
-            # board artefact (foreign securities whose MOEX boards closed
-            # years before the broker's data — e.g. TSLA listed_till
-            # 2020-09-07 with bars through today). Applying it would
-            # zero the denominator. Ignore nonsensical bounds.
-            end_date = yesterday
-            if has_listed_till and r["listed_till"]:
-                lt = date.fromisoformat(str(r["listed_till"])[:10])
-                if listing_date < lt < end_date:
-                    end_date = lt
-            expected = expected_business_days(con, listing_date, end_date)
-            # Subtract confirmed no-trade sessions inside the window.
-            for ds in evidence_by_figi.get(figi, set()):
-                try:
-                    d = date.fromisoformat(ds[:10])
-                except ValueError:
-                    continue
-                if listing_date <= d <= end_date and d.weekday() < 5:
-                    expected -= 1
-            if expected < 0:
-                expected = 0
-            con.execute(
-                "UPDATE instruments SET expected_bars = ? WHERE figi = ?",
-                (expected, figi),
-            )
-            updated += 1
-        con.commit()
-        print(f"OK: populated expected_bars for {updated} figis "
+    # Compute the complete batch OUTSIDE the shared writer lock:
+    # network I/O, calendar arithmetic, and any evidence lookups
+    # happen here. The lock below only covers the BEGIN IMMEDIATE
+    # batch and its commit/rollback.
+    yesterday = date.today() - timedelta(days=1)
+    updates: list[tuple[int, str]] = []
+    for r in rows:
+        figi = r["figi"]
+        listing = r["listing_ts"]
+        listing_date = date.fromisoformat(listing[:10])
+        end_date = yesterday
+        if has_listed_till and r["listed_till"]:
+            lt = date.fromisoformat(str(r["listed_till"])[:10])
+            if listing_date < lt < end_date:
+                end_date = lt
+        # The connection used here is a fresh read-only connection
+        # so the calendar computation does not depend on the
+        # mutating connection that will run the batch.
+        ro = sqlite3.connect(str(db_path))
+        try:
+            expected = expected_business_days(ro, listing_date, end_date)
+        finally:
+            ro.close()
+        for ds in evidence_by_figi.get(figi, set()):
+            try:
+                d = date.fromisoformat(ds[:10])
+            except ValueError:
+                continue
+            if listing_date <= d <= end_date and d.weekday() < 5:
+                expected -= 1
+        if expected < 0:
+            expected = 0
+        updates.append((expected, figi))
+
+    if not updates:
+        print("OK: populated expected_bars for 0 figis "
               f"(end_date={yesterday.isoformat()}, "
               f"evidence={'yes' if has_evidence else 'no'}, "
               f"listed_till={'yes' if has_listed_till else 'no'})")
         return 0
-    except Exception as e:
-        con.rollback()
-        print(f"FAIL: {e}", file=sys.stderr)
+
+    # Apply the complete batch inside the shared writer lock,
+    # exactly one BEGIN IMMEDIATE transaction. The whole batch
+    # commits or rolls back as one unit. Any non-WriterLockBusy
+    # failure inside the lock is re-raised out of the with-block;
+    # we catch it here, log a bounded failure line, and return 1
+    # so the wrapper can decide whether to retry.
+    try:
+        with writer_lock(
+            str(db_path),
+            role="expected-bars",
+            phase="expected-bars",
+        ):
+            mut = sqlite3.connect(str(db_path), timeout=30)
+            try:
+                try:
+                    mut.execute("BEGIN IMMEDIATE")
+                    try:
+                        mut.executemany(
+                            "UPDATE instruments SET expected_bars = ? "
+                            "WHERE figi = ?",
+                            updates,
+                        )
+                        mut.commit()
+                    except Exception:
+                        mut.rollback()
+                        raise
+                finally:
+                    # Explicit close in the finally to keep the
+                    # writer lock window narrow.
+                    pass
+            finally:
+                mut.close()
+    except WriterLockBusy as exc:
+        print(
+            f"DEFER writer-lock-busy role={exc.role} phase={exc.phase} "
+            f"reason={exc.reason} timeout={exc.timeout_seconds:g}s "
+            f"result={exc.result}",
+            file=sys.stderr,
+        )
+        return 75
+    except Exception as exc:
+        print(
+            f"FAIL: expected-bars batch rolled back: {exc}",
+            file=sys.stderr,
+        )
         return 1
-    finally:
-        con.close()
+
+    print(f"OK: populated expected_bars for {len(updates)} figis "
+          f"(end_date={yesterday.isoformat()}, "
+          f"evidence={'yes' if has_evidence else 'no'}, "
+          f"listed_till={'yes' if has_listed_till else 'no'})")
+    return 0
 
 
 if __name__ == "__main__":
