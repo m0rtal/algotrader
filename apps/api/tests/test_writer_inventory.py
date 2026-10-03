@@ -6,7 +6,7 @@ Asserts that:
   represented after the coordinated refactor.
 * `_async_backfill_impl` no longer contains a raw ``INSERT INTO bars``
   literal in executable code (only comments/docstrings may mention
-  it; the strict-xfail is removed by Task 2).
+  it).
 * No ``with writer_lock(...)`` body contains ``os.fork``,
   ``subprocess``, or ``multiprocessing`` calls (no process creation
   inside the critical section).
@@ -151,10 +151,6 @@ def _func_body_strings(tree: ast.Module, func_name: str) -> list[str]:
     return []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Task 2 removes raw bar INSERT",
-)
 def test_async_backfill_impl_has_no_raw_insert_into_bars():
     tree = _parse(IN_SCOPE_FUNCTIONS["_async_backfill_impl"])
     strings = _func_body_strings(tree, "_async_backfill_impl")

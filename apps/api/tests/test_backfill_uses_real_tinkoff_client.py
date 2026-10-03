@@ -28,7 +28,14 @@ import pytest
 
 @pytest.fixture
 def db_with_bonds(tmp_path: Path):
-    """In-memory SQLite with one bond that needs depth backfill."""
+    """In-memory SQLite with one bond that needs depth backfill.
+
+    The ``instrument_metadata`` table is included so the
+    coordinated bar writer (Task 2) can run its aggregate UPDATE
+    without an ``OperationalError``. Production DBs run all
+    migrations including 004 + 005b; this fixture mirrors that
+    surface for the test.
+    """
     con = sqlite3.connect(str(tmp_path / "test_red.db"))
     con.executescript("""
         CREATE TABLE instruments (
@@ -42,6 +49,16 @@ def db_with_bonds(tmp_path: Path):
             open REAL, high REAL, low REAL, close REAL, volume INTEGER,
             source TEXT DEFAULT 'moex',
             PRIMARY KEY (figi, ts)
+        );
+        CREATE TABLE instrument_metadata (
+            figi              TEXT PRIMARY KEY,
+            last_bar_ts       TEXT,
+            first_bar_ts      TEXT,
+            last_backfilled_at TEXT,
+            total_bars        INTEGER NOT NULL DEFAULT 0,
+            last_run_status   TEXT,
+            last_run_at       TEXT,
+            last_error        TEXT
         );
         INSERT INTO instruments VALUES ('BBG000BONDX1', 'BONDX1', 'bond');
         INSERT INTO bars VALUES ('BBG000BONDX1', '2024-12-01', 100, 101, 99, 100, 1000, 'moex');

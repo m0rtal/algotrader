@@ -10,6 +10,14 @@ updates `instrument_metadata.total_bars`, `first_bar_ts`, and
 `last_bar_ts` so the pending counter and Bars tab header stay in
 sync with the actual row count.
 
+The mutation runs under the shared market-data writer lock
+(``<db>.writer.lock``) acquired immediately before ``BEGIN
+IMMEDIATE`` and released immediately after commit/rollback. The
+reconciliation and snapshot-rebuild hooks (``reconcile_no_trade_evidence``,
+``maybe_refresh``) run AFTER the lock has been released so a
+post-commit hiccup can never roll back the bar write and so a
+long-running reconciliation never starves another writer.
+
 Read path
 ---------
 `resolve_figi_for_ticker(sqlite_path, symbol)` is called by
@@ -22,6 +30,18 @@ from datetime import date as _date
 from typing import Iterable
 
 from .sqlite import get_connection
+from ..ingestion.writer_lock import writer_lock
+
+# Public, monkeypatchable lock-timeout knob for the public
+# ``replace_bars_for_figi`` call. The brief explicitly forbids
+# relying on a mutable default argument, so the timeout is a
+# module attribute that tests (and the CLI) can swap out. The
+# default mirrors the production default for non-coordinated
+# auxiliary writers (30s) — it is only used on the single
+# short critical section, so a stuck holder still surfaces
+# promptly via ``WriterLockBusy`` and the caller's deferred
+# branch.
+LOCK_TIMEOUT_SECONDS: float = 30.0
 
 
 def _row(c: dict | object) -> tuple:
@@ -92,6 +112,58 @@ def _row(c: dict | object) -> tuple:
     )
 
 
+def _replace_bars_for_figi_tx(
+    conn,
+    figi: str,
+    rows: list[tuple],
+    *,
+    replace: bool,
+    source: str,
+) -> int:
+    """Private transaction body for ``replace_bars_for_figi``.
+
+    Performs the bar ``DELETE`` / ``INSERT``, the matching
+    ``instrument_metadata`` aggregate update, and the commit (or
+    rollback on error). Called only while the shared writer lock
+    is already held by the public entry point; the helper must
+    NOT re-acquire the lock (the brief is explicit — one
+    acquisition protects the whole transaction).
+
+    ``rows`` is the pre-normalized list of
+    ``(figi, ts, open, high, low, close, volume, source)`` tuples
+    the public function assembled BEFORE acquiring the lock; the
+    public function also filters out rows with missing OHLC values
+    so the transaction never sees None.
+    """
+    if not rows:
+        return 0
+    conn.execute("BEGIN IMMEDIATE")
+    if replace:
+        conn.execute("DELETE FROM bars WHERE figi = ?", (figi,))
+        insert_sql = (
+            "INSERT INTO bars (figi, ts, open, high, low, close, volume, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+    else:
+        insert_sql = (
+            "INSERT OR IGNORE INTO bars (figi, ts, open, high, low, close, volume, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+    conn.executemany(insert_sql, rows)
+    conn.execute(
+        "UPDATE instrument_metadata SET "
+        "  total_bars = (SELECT COUNT(*) FROM bars WHERE figi = ?), "
+        "  first_bar_ts = (SELECT MIN(ts)     FROM bars WHERE figi = ?), "
+        "  last_bar_ts  = (SELECT MAX(ts)     FROM bars WHERE figi = ?), "
+        "  last_run_status = 'ok', "
+        "  last_run_at = datetime('now') "
+        "WHERE figi = ?",
+        (figi, figi, figi, figi),
+    )
+    conn.commit()
+    return len(rows)
+
+
 def replace_bars_for_figi(
     sqlite_path: str,
     figi: str,
@@ -118,9 +190,32 @@ def replace_bars_for_figi(
     column of every inserted row — no longer relying on the column
     default, so attribution survives future schema migrations.
 
-    The function runs everything in a single transaction so a
-    concurrent reader via SQLite WAL sees either the pre-call or
-    post-call snapshot, never a half-written state.
+    Coordination (writer-coordination spec, Task 2):
+    * Candle normalization and the None-OHLC filter run BEFORE
+      the lock is acquired — the per-candle work is pure-Python
+      and should never block another writer.
+    * The shared ``<db>.writer.lock`` is acquired immediately
+      before ``BEGIN IMMEDIATE`` and released immediately after
+      commit/rollback. The private ``_replace_bars_for_figi_tx``
+      helper performs the actual SQL; it does not re-acquire the
+      lock (process-local + kernel-visible single acquisition).
+    * The reconciliation hook (``reconcile_no_trade_evidence``)
+      and the snapshot rebuild hook (``maybe_refresh``) run
+      AFTER the writer lock has been released, so a
+      post-commit hiccup can never roll back the bar write and
+      so a long-running reconciliation never starves another
+      writer. The two hooks are intentionally retained in this
+      public function so existing callers (and their cache
+      snapshots) keep working unchanged.
+    * The lock timeout is the module-level
+      ``LOCK_TIMEOUT_SECONDS`` constant — tests and the CLI can
+      monkeypatch it; the brief explicitly forbids relying on a
+      mutable default argument.
+
+    On lock busy, raises ``WriterLockBusy`` (no rows written, no
+    metadata touched). On SQL failure inside the transaction, the
+    helper rolls back and re-raises; the lock is released by the
+    ``with`` block in ``finally`` so the next writer can acquire.
     """
     rows = []
     for c in candles:
@@ -137,39 +232,38 @@ def replace_bars_for_figi(
         return 0
 
     conn = get_connection(sqlite_path)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        if replace:
-            conn.execute("DELETE FROM bars WHERE figi = ?", (figi,))
-            insert_sql = (
-                "INSERT INTO bars (figi, ts, open, high, low, close, volume, source) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    # Acquire the shared writer lock immediately before the
+    # BEGIN IMMEDIATE — the critical section is exactly the bar
+    # transaction body (delete/insert/metadata/commit/rollback).
+    # Reconciliation and snapshot rebuild run below, AFTER this
+    # block exits, so they don't extend the lock window.
+    with writer_lock(
+        sqlite_path,
+        role="bar-writer",
+        phase="bars",
+        timeout_seconds=LOCK_TIMEOUT_SECONDS,
+    ):
+        try:
+            _replace_bars_for_figi_tx(
+                conn, figi, rows, replace=replace, source=source,
             )
-        else:
-            insert_sql = (
-                "INSERT OR IGNORE INTO bars (figi, ts, open, high, low, close, volume, source) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            )
-        conn.executemany(insert_sql, rows)
-        conn.execute(
-            "UPDATE instrument_metadata SET "
-            "  total_bars = (SELECT COUNT(*) FROM bars WHERE figi = ?), "
-            "  first_bar_ts = (SELECT MIN(ts)     FROM bars WHERE figi = ?), "
-            "  last_bar_ts  = (SELECT MAX(ts)     FROM bars WHERE figi = ?), "
-            "  last_run_status = 'ok', "
-            "  last_run_at = datetime('now') "
-            "WHERE figi = ?",
-            (figi, figi, figi, figi),
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                # Rollback can itself raise on a closed connection;
+                # the lock-release path is more important than the
+                # rollback error, so swallow this.
+                pass
+            raise
     # Real bars always win over stored zero-trade evidence. Without
     # this step a stale evidence row could mask a real candle that
-    # arrived later and let the ML coverage gate under-count. The
-    # operation runs in its own auto-commit transaction so a write
-    # failure here cannot roll back the bar insert above.
+    # arrived later and let the ML coverage gate under-count.
+    # The hook runs OUTSIDE the bar lock so a slow reconciliation
+    # never starves another writer; contention is deferred
+    # independently. A failure here must never roll back the bar
+    # insert above (it already committed) and must never escape —
+    # the caller has already returned success.
     try:
         from ..ingestion.no_trade_evidence import reconcile_no_trade_evidence
         reconcile_no_trade_evidence(conn)
@@ -178,7 +272,9 @@ def replace_bars_for_figi(
     # Snapshot rebuild hook — runs after the commit so the file
     # rewrite never races with an in-flight transaction. Cost is
     # bounded by REFRESH_BUDGET_S: hot figis (every minute) only
-    # trigger a real recompute when the budget elapses.
+    # trigger a real recompute when the budget elapses. Runs
+    # OUTSIDE the bar lock for the same reason as the reconcile
+    # hook above.
     try:
         from ..ui_snapshot import maybe_refresh
 
