@@ -151,12 +151,6 @@ def main() -> int:
         rows_written = 0
         figis_nometa = 0
         figis_delisted = 0
-        # R1: count figis that the per-year fetcher returned a
-        # non-``complete`` outcome for. The CLI exits non-zero
-        # when at least one such figi was seen AND no evidence
-        # was produced — a degraded run must not look like
-        # success in cron / supervisor.
-        figis_degraded = 0
         t0 = time.time()
         for i, r in enumerate(todo, 1):
             figi = r["figi"]
@@ -271,7 +265,6 @@ def main() -> int:
             if overall != "complete":
                 # The helper emits its own structured rejection line;
                 # we only need the figi context for the operator log.
-                figis_degraded += 1
                 print(
                     f"  [{i}/{len(todo)}] {ticker}: "
                     f"moex_historical_evidence_rejected figi={figi} "
@@ -338,16 +331,14 @@ def main() -> int:
         dt = time.time() - t0
         print(f"done: figis_with_evidence={figis_written} rows={rows_written} "
               f"delisted={figis_delisted} no_meta={figis_nometa} "
-              f"degraded={figis_degraded} elapsed_s={dt:.1f}")
-        # R1: a degraded run must not exit 0. We only escalate
-        # when ``figis_degraded > 0 AND figis_written == 0`` — a
-        # mixed run (some evidence, some degraded) is still a
-        # partial success and exits 0; cron / supervisor only
-        # flags a fully-degraded run. Exit code 76 mirrors the
-        # existing 75 (``WriterLockBusy``) convention: 75 = lock
-        # busy, 76 = degraded run.
-        if figis_degraded > 0 and figis_written == 0:
-            return 76
+              f"elapsed_s={dt:.1f}")
+        # Canonical: the CLI exits 0 regardless of how many figis
+        # were degraded. The diagnostic
+        # ``moex_historical_evidence_rejected`` line above carries
+        # the operator signal; cron / supervisor policy reads the
+        # log, not the exit code. The only non-zero exit is the
+        # existing ``return 75`` on ``WriterLockBusy`` — no new
+        # exit code is introduced for partial outcomes.
         return 0
     finally:
         con.close()

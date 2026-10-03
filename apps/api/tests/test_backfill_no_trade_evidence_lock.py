@@ -651,19 +651,25 @@ def test_cli_dry_run_does_not_acquire_writer_lock(tmp_path, monkeypatch):
     assert "[dry]" in out, f"dry-run marker missing from output: {out!r}"
 
 
-# ─── R1: CLI partial outcome must NOT exit 0 ─────────────────────────────
+# ─── Canonical: CLI partial outcome exits 0 with zero evidence ─────────
 
 
-def test_cli_partial_outcome_does_not_exit_zero(tmp_path, monkeypatch):
-    """R1: when every figi's MOEX fetch returns a non-``complete``
-    outcome (``partial``), the CLI MUST NOT exit 0 — the operator
-    must see a non-zero exit code so cron / supervisor can flag a
-    degraded run. Previously the CLI exited 0 unconditionally
-    regardless of how many figis produced evidence, which made the
-    script look successful in cron even when every fetch degraded.
+def test_cli_partial_outcome_exits_zero_without_writing_evidence(
+    tmp_path, monkeypatch,
+):
+    """Canonical spec scenario: when every figi's MOEX fetch returns
+    a non-``complete`` outcome (``partial``), the CLI exits 0 and
+    writes zero evidence rows. The diagnostic line
+    ``moex_historical_evidence_rejected`` is emitted so the
+    operator sees the degraded run; cron / supervisor policy
+    relies on that structured log, not on a new exit code.
 
-    Bounded: 1 figi, 1 year, ``partial`` outcome. The CLI must
-    not exit 0 in this case.
+    No new exit code is introduced — the existing
+    ``WriterLockBusy`` -> ``return 75`` path is the only non-zero
+    exit.
+
+    Bounded: 1 figi, 1 year, ``partial`` outcome, matching upstream
+    ISIN, no ``WriterLockBusy``.
     """
     import importlib.util
     import io
@@ -703,7 +709,10 @@ def test_cli_partial_outcome_does_not_exit_zero(tmp_path, monkeypatch):
     }
     # Force a ``partial`` outcome from the per-year fetcher — the
     # helper short-circuits, no evidence is written, the CLI
-    # must NOT exit 0.
+    # exits 0 because the canonical contract is
+    # ``partial -> zero evidence rows -> exit 0`` with the
+    # ``moex_historical_evidence_rejected`` log line carrying
+    # the diagnostic.
     monkeypatch.setattr(
         mod, "_fetch_year_moex_outcome",
         lambda *a, **kw: ([], "partial"),
@@ -728,12 +737,15 @@ def test_cli_partial_outcome_does_not_exit_zero(tmp_path, monkeypatch):
     with contextlib.redirect_stdout(buf):
         rc = mod.main()
     output = buf.getvalue()
-    # CLI must NOT exit 0 — a partial outcome with zero evidence
-    # is a degraded run, not a success.
-    assert rc != 0, (
-        f"CLI exited 0 despite partial outcome; output={output!r}"
+    # Canonical: partial outcome + zero evidence rows -> exit 0.
+    # The diagnostic line is what surfaces the degraded run to
+    # operators / cron — not a new exit code.
+    assert rc == 0, (
+        f"CLI must exit 0 on partial outcome (zero evidence); "
+        f"got rc={rc}, output={output!r}"
     )
-    # And no evidence row was persisted.
+    # And no evidence row was persisted — the partial fetcher
+    # returned no rows, so the writer must not fabricate any.
     con2 = sqlite3.connect(str(db))
     try:
         n = con2.execute(
@@ -746,3 +758,9 @@ def test_cli_partial_outcome_does_not_exit_zero(tmp_path, monkeypatch):
     assert n == 0, (
         f"partial outcome must NOT write evidence, got n={n}"
     )
+    # Diagnostic must surface the degraded run in the operator log.
+    assert (
+        "moex_historical_evidence_rejected" in output
+        and "figi=FIGI-PARTIAL" in output
+        and "reason=partial" in output
+    ), f"missing diagnostic line in output={output!r}"
