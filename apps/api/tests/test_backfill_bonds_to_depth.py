@@ -756,3 +756,186 @@ def test_async_backfill_impl_prefilter_stays_under_sqlite_variable_limit(
         f"1000 fetched candles must all be inserted; "
         f"got bars_added={result['bars_added']!r}"
     )
+
+
+# ─── fix/bond-client-db-path: explicit sqlite_path to make_client ─────
+#
+# Production bug (2026-10-03 smoke run, bonds_depth step):
+# ``_async_backfill_impl`` resolves the file-backed DB path via
+# ``get_settings().sqlite_path`` (or ``PRAGMA database_list`` on an
+# injected conn) and then ignores it when calling ``make_client()``.
+# ``make_client`` falls back to ``ALGOTRADER_SQLITE_PATH`` which the
+# worker process never exports, so ``load_broker_token`` logs
+# ``tinkoff.token.sqlite_path_unset`` and raises. The bond figis
+# were processed=74, errors=0, bars_added=0.
+#
+# Fix: pass the already-resolved canonical ``sqlite_path`` as
+# ``make_client(sqlite_path=...)`` so the token lookup uses the same
+# app-local DB the writer path uses. No new env-var dependency.
+#
+# The two tests below pin both branches of the resolution:
+#   1. conn=None (production worker entry) — pass settings.sqlite_path.
+#   2. conn=injected (tests / manual backfill) — pass the file-backed
+#      path read from PRAGMA database_list.
+#
+# A capturing factory is the assertion target: the test does NOT
+# call the real ``load_broker_token``, so it stays hermetic and
+# independent of the actual secrets table.
+
+
+def test_async_backfill_impl_passes_settings_sqlite_path_to_make_client(
+    monkeypatch, tmp_path,
+):
+    """When called WITHOUT a conn (production worker path),
+    ``_async_backfill_impl`` must pass ``get_settings().sqlite_path``
+    as ``make_client(sqlite_path=...)`` — never rely on the unset
+    ``ALGOTRADER_SQLITE_PATH`` env var.
+    """
+    import asyncio
+    from algotrader_api.ingestion import backfill
+
+    # Pin the canonical path the production writer would use.
+    canonical = str(tmp_path / "state.db")
+    # Seed the file-backed DB with the minimum schema the loop
+    # touches: ``instruments`` (figi list), ``bars`` (skip-decision
+    # COUNT), and ``instrument_metadata`` (writer aggregate). Mirror
+    # the surface the existing fixture already covers.
+    seed = sqlite3.connect(canonical)
+    seed.executescript("""
+        CREATE TABLE instruments (
+            figi TEXT PRIMARY KEY, ticker TEXT, class TEXT
+        );
+        CREATE TABLE bars (
+            figi TEXT, ts TEXT, open REAL, high REAL, low REAL, close REAL,
+            volume INTEGER, source TEXT DEFAULT 'moex',
+            PRIMARY KEY (figi, ts)
+        );
+        CREATE TABLE instrument_metadata (
+            figi              TEXT PRIMARY KEY,
+            last_bar_ts       TEXT,
+            first_bar_ts      TEXT,
+            last_backfilled_at TEXT,
+            total_bars        INTEGER NOT NULL DEFAULT 0,
+            last_run_status   TEXT,
+            last_run_at       TEXT,
+            last_error        TEXT
+        );
+        -- One bond figi at zero bars so the loop reaches
+        -- ``make_client`` exactly once.
+        INSERT INTO instruments VALUES ('BBG000BONDPATH', 'BONDPATH', 'bond');
+    """)
+    seed.commit()
+    seed.close()
+    settings = MagicMock()
+    settings.sqlite_path = canonical
+    monkeypatch.setattr(
+        "algotrader_api.config.get_settings", lambda: settings,
+    )
+    # The conn=None branch calls get_connection; the real one
+    # returns a cached connection for the same path.
+    from algotrader_api.db import sqlite as _sqlite_mod
+    real_get = _sqlite_mod.get_connection
+    con = real_get(canonical)
+    try:
+        # Patch the source module attribute (the implementation
+        # imports make_client lazily inside the loop).
+        from algotrader_api.ingestion import client as client_mod
+        captured_kwargs: dict = {}
+        fake_client = MagicMock()
+        fake_client.get_candles = AsyncMock(return_value=[])
+        def _capture(**kwargs):
+            captured_kwargs.update(kwargs)
+            return fake_client
+        monkeypatch.setattr(
+            "algotrader_api.ingestion.client.make_client",
+            MagicMock(side_effect=_capture),
+        )
+        # Spy on get_global so rl.acquire doesn't need to await a real limiter.
+        from algotrader_api.ingestion import rate_limit
+        fake_rl = MagicMock()
+        fake_rl.acquire = AsyncMock()
+        monkeypatch.setattr(rate_limit, "get_global", lambda: fake_rl)
+
+        # CRITICAL: ALGOTRADER_SQLITE_PATH must be UNSET for this
+        # test to pin the bug — if it is set, the legacy fallback
+        # would mask the production omission.
+        monkeypatch.delenv("ALGOTRADER_SQLITE_PATH", raising=False)
+
+        asyncio.run(backfill._async_backfill_impl(target_days=30))
+    finally:
+        con.close()
+
+    # The fix: the explicit canonical path is forwarded to make_client.
+    assert captured_kwargs.get("sqlite_path") == canonical, (
+        f"make_client must receive the explicit canonical sqlite_path; "
+        f"got {captured_kwargs.get('sqlite_path')!r}, expected {canonical!r}"
+    )
+
+
+def test_async_backfill_impl_passes_pragmas_sqlite_path_to_make_client(
+    monkeypatch, tmp_path,
+):
+    """When called WITH a file-backed conn (tests / manual backfill),
+    ``_async_backfill_impl`` must pass the on-disk path read from
+    ``PRAGMA database_list`` as ``make_client(sqlite_path=...)`` —
+    again, never rely on the env var.
+    """
+    import asyncio
+    from algotrader_api.ingestion import backfill
+
+    db_file = str(tmp_path / "injected.db")
+    con = sqlite3.connect(db_file)
+    con.executescript("""
+        CREATE TABLE instruments (
+            figi TEXT PRIMARY KEY, ticker TEXT, class TEXT
+        );
+        CREATE TABLE bars (
+            figi TEXT, ts TEXT, open REAL, high REAL, low REAL, close REAL,
+            volume INTEGER, source TEXT DEFAULT 'moex',
+            PRIMARY KEY (figi, ts)
+        );
+        CREATE TABLE instrument_metadata (
+            figi              TEXT PRIMARY KEY,
+            last_bar_ts       TEXT,
+            first_bar_ts      TEXT,
+            last_backfilled_at TEXT,
+            total_bars        INTEGER NOT NULL DEFAULT 0,
+            last_run_status   TEXT,
+            last_run_at       TEXT,
+            last_error        TEXT
+        );
+    """)
+    con.commit()
+    try:
+        # Insert one bond figi so the loop reaches ``make_client``
+        # exactly once.
+        con.execute(
+            "INSERT INTO instruments VALUES ('BBG000BONDPATH', 'BONDPATH', 'bond')"
+        )
+        con.commit()
+        from algotrader_api.ingestion import client as client_mod
+        captured_kwargs: dict = {}
+        fake_client = MagicMock()
+        fake_client.get_candles = AsyncMock(return_value=[])
+        def _capture(**kwargs):
+            captured_kwargs.update(kwargs)
+            return fake_client
+        monkeypatch.setattr(
+            "algotrader_api.ingestion.client.make_client",
+            MagicMock(side_effect=_capture),
+        )
+        from algotrader_api.ingestion import rate_limit
+        fake_rl = MagicMock()
+        fake_rl.acquire = AsyncMock()
+        monkeypatch.setattr(rate_limit, "get_global", lambda: fake_rl)
+        monkeypatch.delenv("ALGOTRADER_SQLITE_PATH", raising=False)
+
+        asyncio.run(backfill._async_backfill_impl(target_days=30, conn=con))
+    finally:
+        con.close()
+
+    assert captured_kwargs.get("sqlite_path") == db_file, (
+        f"make_client must receive the on-disk path from PRAGMA "
+        f"database_list; got {captured_kwargs.get('sqlite_path')!r}, "
+        f"expected {db_file!r}"
+    )
