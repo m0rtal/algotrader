@@ -309,10 +309,13 @@ def replace_bars_for_figi(
     # never starves another writer; contention is deferred
     # independently. A failure here must never roll back the bar
     # insert above (it already committed) and must never escape —
-    # the caller has already returned success.
+    # the caller has already returned success. Task 3: the
+    # public reconcile helper acquires the lock for its own
+    # DELETE + commit; we pass the explicit ``sqlite_path`` so
+    # the lock namespace matches the bar lock's namespace.
     try:
         from ..ingestion.no_trade_evidence import reconcile_no_trade_evidence
-        reconcile_no_trade_evidence(conn)
+        reconcile_no_trade_evidence(conn, db_path=sqlite_path)
     except Exception:
         pass
     # Snapshot rebuild hook — runs after the commit so the file
@@ -399,9 +402,11 @@ def replace_bars_for_figi_with_rowcount(
             raise
     # Post-commit hooks identical to the public function. They are
     # run OUTSIDE the bar lock and never affect the return value.
+    # Task 3: public reconcile helper takes explicit ``db_path``
+    # so the lock namespace matches the bar lock's namespace.
     try:
         from ..ingestion.no_trade_evidence import reconcile_no_trade_evidence
-        reconcile_no_trade_evidence(conn)
+        reconcile_no_trade_evidence(conn, db_path=sqlite_path)
     except Exception:
         pass
     try:

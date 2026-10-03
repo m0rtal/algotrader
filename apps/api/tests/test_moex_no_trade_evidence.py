@@ -27,8 +27,18 @@ import pytest
 # -- helpers ---------------------------------------------------------------
 
 
-def _make_conn():
-    con = sqlite3.connect(":memory:")
+def _make_conn(db_path):
+    """Open a file-backed SQLite connection for the duration of a test.
+
+    Task 3: the public evidence wrappers acquire the shared writer
+    lock via ``flock`` on ``<db_path>.writer.lock``. ``:memory:``
+    has no backing file so the lock would be useless. Each test
+    that exercises the public wrappers runs against a temp dir DB;
+    the few private-tx tests that only need the SQL semantics may
+    still pass an in-memory connection because the lock is not
+    part of their contract.
+    """
+    con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
     con.executescript("""
         CREATE TABLE instruments (
@@ -153,15 +163,17 @@ def test_extract_zero_trade_rows_skips_missing_identity():
 # -- record_no_trade_evidence ---------------------------------------------
 
 
-def test_record_skips_dates_that_have_real_bars():
+def test_record_skips_dates_that_have_real_bars(tmp_path):
     from algotrader_api.ingestion.no_trade_evidence import (
         record_no_trade_evidence,
     )
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     _insert_bar(con, "FIGI1", "2026-09-28")
     written = record_no_trade_evidence(
         con,
+        db_path=str(db),
         figi="FIGI1",
         rows=[{"ts": "2026-09-28"}],
         board="TQCB",
@@ -174,17 +186,18 @@ def test_record_skips_dates_that_have_real_bars():
     assert count == 0
 
 
-def test_record_idempotent_on_conflict_refreshes_timestamps():
+def test_record_idempotent_on_conflict_refreshes_timestamps(tmp_path):
     from algotrader_api.ingestion.no_trade_evidence import (
         record_no_trade_evidence,
     )
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     today = date(2026, 9, 28)
     rows = [{"ts": "2026-09-26"}]
 
     record_no_trade_evidence(
-        con, figi="FIGI1", rows=rows, board="TQCB", isin="X",
+        con, db_path=str(db), figi="FIGI1", rows=rows, board="TQCB", isin="X",
         now=today,
     )
     row = con.execute(
@@ -197,7 +210,7 @@ def test_record_idempotent_on_conflict_refreshes_timestamps():
     # only expires_at is deterministic across sub-second repeats;
     # expires_at must advance because it is derived from `now`.
     record_no_trade_evidence(
-        con, figi="FIGI1", rows=rows, board="TQCB", isin="X",
+        con, db_path=str(db), figi="FIGI1", rows=rows, board="TQCB", isin="X",
         now=today + timedelta(days=3),
     )
     row2 = con.execute(
@@ -211,17 +224,19 @@ def test_record_idempotent_on_conflict_refreshes_timestamps():
     assert count == 1
 
 
-def test_record_assigns_recent_vs_historical_expiry():
+def test_record_assigns_recent_vs_historical_expiry(tmp_path):
     from algotrader_api.ingestion.no_trade_evidence import (
         record_no_trade_evidence,
         RECENT_EVIDENCE_EXPIRY,
         HISTORICAL_EVIDENCE_EXPIRY,
     )
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     today = date(2026, 9, 28)
     record_no_trade_evidence(
         con,
+        db_path=str(db),
         figi="FIGI1",
         rows=[
             {"ts": "2026-09-22"},  # within 14 days → recent
@@ -245,22 +260,24 @@ def test_record_assigns_recent_vs_historical_expiry():
 # -- reconcile_no_trade_evidence ------------------------------------------
 
 
-def test_reconcile_removes_evidence_when_bar_lands():
+def test_reconcile_removes_evidence_when_bar_lands(tmp_path):
     from algotrader_api.ingestion.no_trade_evidence import (
         record_no_trade_evidence,
         reconcile_no_trade_evidence,
     )
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     record_no_trade_evidence(
         con,
+        db_path=str(db),
         figi="FIGI1",
         rows=[{"ts": "2026-09-26"}, {"ts": "2026-09-27"}],
         board="TQCB",
         isin="X",
     )
     _insert_bar(con, "FIGI1", "2026-09-26")
-    removed = reconcile_no_trade_evidence(con)
+    removed = reconcile_no_trade_evidence(con, db_path=str(db))
     assert removed == 1
     remaining = con.execute(
         "SELECT session_date FROM moex_no_trade_evidence ORDER BY session_date"
@@ -268,39 +285,43 @@ def test_reconcile_removes_evidence_when_bar_lands():
     assert [r["session_date"] for r in remaining] == ["2026-09-27"]
 
 
-def test_reconcile_idempotent():
+def test_reconcile_idempotent(tmp_path):
     from algotrader_api.ingestion.no_trade_evidence import (
         record_no_trade_evidence,
         reconcile_no_trade_evidence,
     )
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     record_no_trade_evidence(
         con,
+        db_path=str(db),
         figi="FIGI1",
         rows=[{"ts": "2026-09-26"}],
         board="TQCB",
         isin="X",
     )
     _insert_bar(con, "FIGI1", "2026-09-26")
-    reconcile_no_trade_evidence(con)
+    reconcile_no_trade_evidence(con, db_path=str(db))
     # Second call must not raise or count any rows.
-    assert reconcile_no_trade_evidence(con) == 0
+    assert reconcile_no_trade_evidence(con, db_path=str(db)) == 0
 
 
 # -- load_no_trade_dates ---------------------------------------------------
 
 
-def test_load_excludes_expired_rows():
+def test_load_excludes_expired_rows(tmp_path):
     from algotrader_api.ingestion.no_trade_evidence import (
         record_no_trade_evidence,
         load_no_trade_dates,
     )
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     today = date(2026, 9, 28)
     record_no_trade_evidence(
         con,
+        db_path=str(db),
         figi="FIGI1",
         rows=[{"ts": "2026-09-22"}, {"ts": "2020-05-15"}],
         board="TQCB",
@@ -322,13 +343,14 @@ def test_load_excludes_expired_rows():
 # -- expected_sessions_for_figi -------------------------------------------
 
 
-def test_expected_sessions_subtracts_confirmed_evidence_and_holidays():
+def test_expected_sessions_subtracts_confirmed_evidence_and_holidays(tmp_path):
     from algotrader_api.ingestion.no_trade_evidence import (
         expected_sessions_for_figi,
         record_no_trade_evidence,
     )
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     # Saturday 2026-09-26 and Sunday 2026-09-27 already excluded by
     # weekday < 5. Monday 2026-09-28 is a regular session.
     con.execute(
@@ -336,6 +358,7 @@ def test_expected_sessions_subtracts_confirmed_evidence_and_holidays():
     )
     record_no_trade_evidence(
         con,
+        db_path=str(db),
         figi="FIGI1",
         rows=[{"ts": "2026-09-28"}],  # confirmed no-trade Mon
         board="TQCB",
@@ -356,13 +379,14 @@ def test_expected_sessions_subtracts_confirmed_evidence_and_holidays():
 # -- check_coverage staleness override ------------------------------------
 
 
-def test_check_coverage_accepts_continuous_chain():
+def test_check_coverage_accepts_continuous_chain(tmp_path):
     from algotrader_api.ingestion.no_trade_evidence import (
         record_no_trade_evidence,
     )
     from algotrader_api.ml.features import check_coverage
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     con.execute(
         "INSERT INTO instruments(figi, ticker, isin, source_updated_at, expected_bars) "
         "VALUES ('FIGI1', 'X', 'X', '2025-01-01', 1)"
@@ -372,6 +396,7 @@ def test_check_coverage_accepts_continuous_chain():
     _insert_bar(con, "FIGI1", "2026-09-25")
     record_no_trade_evidence(
         con,
+        db_path=str(db),
         figi="FIGI1",
         rows=[{"ts": "2026-09-28"}],  # Mon confirmed no-trade
         board="TQCB",
@@ -397,13 +422,14 @@ def test_check_coverage_accepts_continuous_chain():
     assert failing == []
 
 
-def test_check_coverage_rejects_partial_chain():
+def test_check_coverage_rejects_partial_chain(tmp_path):
     from algotrader_api.ingestion.no_trade_evidence import (
         record_no_trade_evidence,
     )
     from algotrader_api.ml.features import check_coverage
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     con.execute(
         "INSERT INTO instruments(figi, ticker, isin, source_updated_at, expected_bars) "
         "VALUES ('FIGI1', 'X', 'X', '2025-01-01', 1)"
@@ -412,6 +438,7 @@ def test_check_coverage_rejects_partial_chain():
     # Gap: only Mon evidence, no evidence for Tue (the last session).
     record_no_trade_evidence(
         con,
+        db_path=str(db),
         figi="FIGI1",
         rows=[{"ts": "2026-09-28"}],
         board="TQCB",
@@ -437,13 +464,14 @@ def test_check_coverage_rejects_partial_chain():
     assert "stale" in reasons["FIGI1"]
 
 
-def test_check_coverage_keeps_incomplete_arm_separate():
+def test_check_coverage_keeps_incomplete_arm_separate(tmp_path):
     from algotrader_api.ingestion.no_trade_evidence import (
         record_no_trade_evidence,
     )
     from algotrader_api.ml.features import check_coverage
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     # Cached expected_bars artificially high; coverage ratio < 95%.
     con.execute(
         "INSERT INTO instruments(figi, ticker, isin, source_updated_at, expected_bars) "
@@ -452,6 +480,7 @@ def test_check_coverage_keeps_incomplete_arm_separate():
     _insert_bar(con, "FIGI1", "2026-09-25")
     record_no_trade_evidence(
         con,
+        db_path=str(db),
         figi="FIGI1",
         rows=[{"ts": "2026-09-28"}],
         board="TQCB",
@@ -476,13 +505,14 @@ def test_check_coverage_keeps_incomplete_arm_separate():
     assert reasons["FIGI1"] == "incomplete"
 
 
-def test_check_coverage_treats_expired_evidence_as_unknown():
+def test_check_coverage_treats_expired_evidence_as_unknown(tmp_path):
     from algotrader_api.ingestion.no_trade_evidence import (
         record_no_trade_evidence,
     )
     from algotrader_api.ml.features import check_coverage
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     con.execute(
         "INSERT INTO instruments(figi, ticker, isin, source_updated_at, expected_bars) "
         "VALUES ('FIGI1', 'X', 'X', '2025-01-01', 1)"
@@ -491,6 +521,7 @@ def test_check_coverage_treats_expired_evidence_as_unknown():
     # Evidence recorded 30 days ago with a 7-day expiry → expired.
     record_no_trade_evidence(
         con,
+        db_path=str(db),
         figi="FIGI1",
         rows=[{"ts": "2026-09-28"}],
         board="TQCB",
@@ -583,7 +614,7 @@ def test_fetch_year_moex_emits_raw_columns_per_dict():
 # -- delisted instruments (listed_till, migration 026) ---------------------
 
 
-def test_check_coverage_delisted_with_evidence_chain_not_stale():
+def test_check_coverage_delisted_with_evidence_chain_not_stale(tmp_path):
     """A delisted figi whose last bar + evidence chain reach listed_till
     is complete and must not be flagged stale."""
     from algotrader_api.ingestion.no_trade_evidence import (
@@ -591,7 +622,8 @@ def test_check_coverage_delisted_with_evidence_chain_not_stale():
     )
     from algotrader_api.ml.features import check_coverage
 
-    con = _make_conn()
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
     # Delisted 2026-09-10; last bar 2026-09-08; no-trade on 09-09 and 09-10.
     con.execute(
         "INSERT INTO instruments(figi, ticker, isin, source_updated_at, expected_bars, listed_till) "
@@ -599,7 +631,7 @@ def test_check_coverage_delisted_with_evidence_chain_not_stale():
     )
     _insert_bar(con, "FIGI1", "2026-09-08")
     record_no_trade_evidence(
-        con, figi="FIGI1",
+        con, db_path=str(db), figi="FIGI1",
         rows=[{"ts": "2026-09-09"}, {"ts": "2026-09-10"}],
         board="TQCB", isin="X",
     )
@@ -627,7 +659,33 @@ def test_check_coverage_delisted_without_evidence_is_stale():
     stale (no evidence, no bar)."""
     from algotrader_api.ml.features import check_coverage
 
-    con = _make_conn()
+    # The test does not call any public writer-lock-acquiring helper,
+    # so the in-memory conn is fine here. (It does not assert
+    # interprocess locking.)
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+        CREATE TABLE instruments (
+            figi TEXT PRIMARY KEY, ticker TEXT NOT NULL, isin TEXT,
+            source_updated_at TEXT, expected_bars INTEGER, listed_till TEXT
+        );
+        CREATE TABLE bars (
+            figi TEXT NOT NULL, ts TEXT NOT NULL,
+            open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
+            close REAL NOT NULL, volume INTEGER NOT NULL,
+            source TEXT NOT NULL DEFAULT 'tinkoff',
+            PRIMARY KEY (figi, ts)
+        );
+        CREATE TABLE moex_no_trade_evidence (
+            figi TEXT NOT NULL, session_date TEXT NOT NULL,
+            board TEXT NOT NULL, isin TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'moex_iss',
+            observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT NOT NULL,
+            UNIQUE (figi, session_date)
+        );
+        CREATE TABLE moex_holidays (date TEXT PRIMARY KEY, name TEXT NOT NULL);
+    """)
     con.execute(
         "INSERT INTO instruments(figi, ticker, isin, source_updated_at, expected_bars, listed_till) "
         "VALUES ('FIGI1', 'X', 'X', '2025-01-01', 1, '2026-09-10')"
@@ -658,7 +716,32 @@ def test_check_coverage_delisted_last_bar_on_listed_till_passes():
     no evidence needed."""
     from algotrader_api.ml.features import check_coverage
 
-    con = _make_conn()
+    # No public writer-lock-acquiring helper is invoked here; the
+    # in-memory conn keeps the test fast.
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+        CREATE TABLE instruments (
+            figi TEXT PRIMARY KEY, ticker TEXT NOT NULL, isin TEXT,
+            source_updated_at TEXT, expected_bars INTEGER, listed_till TEXT
+        );
+        CREATE TABLE bars (
+            figi TEXT NOT NULL, ts TEXT NOT NULL,
+            open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
+            close REAL NOT NULL, volume INTEGER NOT NULL,
+            source TEXT NOT NULL DEFAULT 'tinkoff',
+            PRIMARY KEY (figi, ts)
+        );
+        CREATE TABLE moex_no_trade_evidence (
+            figi TEXT NOT NULL, session_date TEXT NOT NULL,
+            board TEXT NOT NULL, isin TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'moex_iss',
+            observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT NOT NULL,
+            UNIQUE (figi, session_date)
+        );
+        CREATE TABLE moex_holidays (date TEXT PRIMARY KEY, name TEXT NOT NULL);
+    """)
     con.execute(
         "INSERT INTO instruments(figi, ticker, isin, source_updated_at, expected_bars, listed_till) "
         "VALUES ('FIGI1', 'X', 'X', '2025-01-01', 1, '2026-09-10')"

@@ -51,6 +51,10 @@ from algotrader_api.ingestion.no_trade_evidence import (  # noqa: E402
     _moex_session,
     record_no_trade_evidence,
 )
+from algotrader_api.ingestion.writer_lock import (  # noqa: E402
+    WriterLockBusy,
+    writer_lock,
+)
 
 DEFAULT_DB = "/home/hermes/algotrader/apps/api/data/state.db"
 
@@ -92,6 +96,22 @@ def _probe_board_last(ticker: str) -> tuple[str, str] | None:
         if best is None or lt_s > best[1]:
             best = (str(b[idx["boardid"]]), lt_s)
     return best
+
+
+def _format_defer(exc: "WriterLockBusy") -> str:
+    """Render a single bounded ``DEFER writer-lock-busy ...`` line.
+
+    The line carries only the safe metadata exposed by
+    :class:`WriterLockBusy` (role, phase, timeout, reason, result).
+    It must not include the database path, figi, ticker, or any
+    secret. Used by the CLI when either the ``listed-till`` lock or
+    the ``evidence`` lock acquisition times out.
+    """
+    return (
+        f"DEFER writer-lock-busy role={exc.role} phase={exc.phase} "
+        f"reason={exc.reason} timeout={exc.timeout_seconds:g}s "
+        f"result={exc.result}"
+    )
 
 
 def main() -> int:
@@ -180,11 +200,29 @@ def main() -> int:
                 win_hi = lt
                 figis_delisted += 1
                 if not args.dry_run:
-                    con.execute(
-                        "UPDATE instruments SET listed_till = ? WHERE figi = ?",
-                        (lt_iso, figi),
-                    )
-                    con.commit()
+                    # Coordination (Task 3): ``instruments.listed_till``
+                    # UPDATE acquires the shared writer lock under
+                    # ``role="no-trade-evidence" / phase="listed-till"``.
+                    # The evidence write below uses a SEPARATE
+                    # ``role="no-trade-evidence" / phase="evidence"``
+                    # acquisition so the two writes never nest. MOEX
+                    # fetch and ``time.sleep`` run AFTER both locks
+                    # are released.
+                    try:
+                        with writer_lock(
+                            str(db_path),
+                            role="no-trade-evidence",
+                            phase="listed-till",
+                        ):
+                            con.execute(
+                                "UPDATE instruments SET listed_till = ? "
+                                "WHERE figi = ?",
+                                (lt_iso, figi),
+                            )
+                            con.commit()
+                    except WriterLockBusy as exc:
+                        print(_format_defer(exc))
+                        return 75
                 else:
                     print(f"  [dry] {ticker}: DELISTED {lt_iso} (board {board})")
             lo = max(floor, date.fromisoformat(r["max_ts"]) + timedelta(days=1))
@@ -207,10 +245,21 @@ def main() -> int:
                 figis_written += 1
                 rows_written += len(zrows)
                 continue
-            n = record_no_trade_evidence(
-                con, figi=figi, rows=zrows,
-                board=board, isin=str(r["isin"] or ""),
-            )
+            # Coordination (Task 3): evidence write uses the public
+            # ``record_no_trade_evidence`` wrapper, which acquires the
+            # shared lock with
+            # ``role="no-trade-evidence" / phase="evidence"``. The
+            # ``listed_till`` lock (if any) was released above so the
+            # two never nest. MOEX fetch and ``time.sleep`` run OUTSIDE
+            # the lock.
+            try:
+                n = record_no_trade_evidence(
+                    con, db_path=str(db_path), figi=figi, rows=zrows,
+                    board=board, isin=str(r["isin"] or ""),
+                )
+            except WriterLockBusy as exc:
+                print(_format_defer(exc))
+                return 75
             if n:
                 figis_written += 1
                 rows_written += n

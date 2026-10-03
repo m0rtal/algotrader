@@ -1641,7 +1641,9 @@ class BackfillRunner:
             # HTTP response can rely on the same upstream confirmation.
             # Errors here are logged but never abort the bar write:
             # a missing evidence row is "unknown", not a fail-closed
-            # block on the bars path.
+            # block on the bars path. Task 3: pass the explicit
+            # ``db_path`` so the evidence lock uses the same
+            # namespace as the bar lock.
             try:
                 from .no_trade_evidence import (
                     record_no_trade_evidence,
@@ -1657,6 +1659,7 @@ class BackfillRunner:
                     inst_isin = inst_row["isin"] if inst_row else ""
                     record_no_trade_evidence(
                         get_connection(self.db_path),
+                        db_path=self.db_path,
                         figi=figi,
                         rows=zero_rows,
                         board=meta["board"],

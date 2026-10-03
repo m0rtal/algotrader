@@ -600,7 +600,7 @@ def test_replace_bars_for_figi_reconcile_runs_outside_bar_lock(
         "    time.sleep(0.05)\n"
     )
 
-    def _fake_reconcile(_conn):
+    def _fake_reconcile(_conn, *, db_path=None):  # noqa: ARG001
         # 1. Lock acquisition check: run a subprocess that must
         #    acquire the bar lock. If the bar lock is still held
         #    (regression), the subprocess raises ``WriterLockBusy``

@@ -23,6 +23,22 @@ deadline; the gate treats expired rows as "unknown" until a fresh
 observation refreshes them. Historical evidence is held for the long
 term so the denominator stays stable; recent evidence gets a short
 expiry so the system adapts to instruments that start trading again.
+
+Coordination (writer-coordination spec, Task 3):
+* Public :func:`record_no_trade_evidence` and
+  :func:`reconcile_no_trade_evidence` each acquire the shared
+  writer lock once via :func:`writer_lock` (or a hook-injected
+  replacement) and explicitly call the corresponding private
+  :func:`_record_no_trade_evidence_tx` /
+  :func:`_reconcile_no_trade_evidence_tx`. The private helpers
+  never re-acquire the lock; callers must NOT bypass the public
+  wrappers for any code path that mutates the database.
+* Both public wrappers accept an explicit ``db_path`` and use the
+  ``_evidence_lock_timeout`` module constant for the bounded
+  acquisition timeout (default 30 s, monkeypatchable for tests).
+* A single ``_acquire_evidence_lock`` helper centralizes the
+  ``writer_lock`` call so both wrappers go through one audit
+  point (no duplicate logic).
 """
 from __future__ import annotations
 
@@ -36,6 +52,35 @@ from datetime import date, timedelta
 # because the upstream source itself treats those sessions as settled.
 RECENT_EVIDENCE_EXPIRY = timedelta(days=7)
 HISTORICAL_EVIDENCE_EXPIRY = timedelta(days=365)
+
+# Bounded lock-acquisition timeout for both public evidence wrappers
+# (record + reconcile). Default 30 s mirrors the bar-writer timeout;
+# tests and the CLI can monkeypatch it to keep the suite fast.
+_EVIDENCE_LOCK_TIMEOUT_SECONDS: float = 30.0
+
+
+def _evidence_writer_lock(db_path: str, *, role: str, phase: str):
+    """Single audit point for evidence public-wrapper lock acquisition.
+
+    Both public wrappers (:func:`record_no_trade_evidence` and
+    :func:`reconcile_no_trade_evidence`) must acquire the shared
+    writer lock through this helper. The helper is the only place
+    the lock timeout and the lock namespace derivation are wired,
+    so future changes (timeout, role/phase naming) touch one line.
+
+    ``writer_lock`` is imported lazily inside the helper body so
+    tests can monkeypatch the symbol on the source module
+    ``algotrader_api.ingestion.writer_lock`` and the public
+    wrappers pick up the shim.
+    """
+    from .writer_lock import writer_lock as _writer_lock
+
+    return _writer_lock(
+        db_path,
+        role=role,
+        phase=phase,
+        timeout_seconds=_EVIDENCE_LOCK_TIMEOUT_SECONDS,
+    )
 
 
 def _moex_session():
@@ -185,9 +230,75 @@ def fetch_no_trade_rows(
     return [r for r in out if lo <= r["ts"] <= hi]
 
 
+def _record_no_trade_evidence_tx(
+    conn: sqlite3.Connection,
+    *,
+    figi: str,
+    rows: list[dict],
+    board: str,
+    isin: str,
+    now: date | None = None,
+) -> int:
+    """Private transaction body for :func:`record_no_trade_evidence`.
+
+    Performs the row-level filtering (skip dates that already have
+    real bars, branch recent vs historical expiry, assemble the
+    INSERT params) and the ``executemany`` upsert + commit. Called
+    only while the shared writer lock is already held by the public
+    entry point; the helper must NOT re-acquire the lock (the brief
+    is explicit — one acquisition protects the whole transaction).
+
+    Returns the number of accepted parameter rows (i.e. rows that
+    were not skipped because of a real bar already in the table).
+    The caller is responsible for the lock acquisition and for any
+    rollback semantics.
+    """
+    if not rows:
+        return 0
+    today = now or date.today()
+    recent_cutoff = today - timedelta(days=14)
+    params = []
+    for r in rows:
+        ts = (r.get("ts") or "")[:10]
+        if not ts:
+            continue
+        exists = conn.execute(
+            "SELECT 1 FROM bars WHERE figi = ? AND ts = ?",
+            (figi, ts),
+        ).fetchone()
+        if exists:
+            continue
+        try:
+            row_date = date.fromisoformat(ts)
+        except ValueError:
+            continue
+        expiry_days = (
+            RECENT_EVIDENCE_EXPIRY
+            if row_date >= recent_cutoff
+            else HISTORICAL_EVIDENCE_EXPIRY
+        )
+        expires_at = (today + expiry_days).isoformat()
+        params.append((figi, ts, board, isin, expires_at))
+    if not params:
+        return 0
+    conn.executemany(
+        """INSERT INTO moex_no_trade_evidence
+               (figi, session_date, board, isin, observed_at, expires_at)
+           VALUES (?, ?, ?, ?, datetime('now'), ?)
+           ON CONFLICT(figi, session_date) DO UPDATE SET
+               board = excluded.board,
+               isin = excluded.isin,
+               observed_at = excluded.observed_at,
+               expires_at = excluded.expires_at""",
+        params,
+    )
+    return len(params)
+
+
 def record_no_trade_evidence(
     conn: sqlite3.Connection,
     *,
+    db_path: str,
     figi: str,
     rows: list[dict],
     board: str,
@@ -201,69 +312,57 @@ def record_no_trade_evidence(
     are skipped silently. On INSERT the entry's ``expires_at`` is set
     to ``now + RECENT_EVIDENCE_EXPIRY`` for the last 14 days of the
     window and ``now + HISTORICAL_EVIDENCE_EXPIRY`` otherwise.
+
+    Coordination (writer-coordination spec, Task 3):
+    * The shared writer lock is acquired exactly once via
+      :func:`_evidence_writer_lock` with ``role="no-trade-evidence"``
+      and ``phase="evidence"``. The lock covers the full
+      ``INSERT ... ON CONFLICT`` upsert and the commit. The
+      private ``_record_no_trade_evidence_tx`` performs the SQL;
+      it does not re-acquire the lock (process-local + kernel-
+      visible single acquisition).
+    * The caller MUST pass an explicit ``db_path`` — there is no
+      implicit / inferred production DB-path shim. The
+      :func:`db.sqlite.get_connection` cache is open and
+      write-friendly in production; tests must use a file-backed
+      temp DB so the kernel-level ``flock`` is actually exercised.
+    * On ``WriterLockBusy`` the helper lets the exception propagate;
+      the caller decides whether to defer, abort, or fall back.
     """
     if not rows:
         return 0
-    today = now or date.today()
-    recent_cutoff = today - timedelta(days=14)
-    written = 0
-    # SQLite ":memory:" defaults to autocommit mode and rejects an
-    # explicit BEGIN; the file-backed production DB uses autocommit
-    # too because the shared `get_connection` singleton wraps each
-    # call in its own implicit transaction. We use `executemany` for
-    # speed and rely on the connection's autocommit semantics.
-    try:
-        params = []
-        for r in rows:
-            ts = (r.get("ts") or "")[:10]
-            if not ts:
-                continue
-            exists = conn.execute(
-                "SELECT 1 FROM bars WHERE figi = ? AND ts = ?",
-                (figi, ts),
-            ).fetchone()
-            if exists:
-                continue
-            try:
-                row_date = date.fromisoformat(ts)
-            except ValueError:
-                continue
-            expiry_days = (
-                RECENT_EVIDENCE_EXPIRY
-                if row_date >= recent_cutoff
-                else HISTORICAL_EVIDENCE_EXPIRY
-            )
-            expires_at = (today + expiry_days).isoformat()
-            params.append((figi, ts, board, isin, expires_at))
-        if not params:
-            return 0
-        conn.executemany(
-            """INSERT INTO moex_no_trade_evidence
-                   (figi, session_date, board, isin, observed_at, expires_at)
-               VALUES (?, ?, ?, ?, datetime('now'), ?)
-               ON CONFLICT(figi, session_date) DO UPDATE SET
-                   board = excluded.board,
-                   isin = excluded.isin,
-                   observed_at = excluded.observed_at,
-                   expires_at = excluded.expires_at""",
-            params,
-        )
-        conn.commit()
-        written = len(params)
-    except Exception:
+    with _evidence_writer_lock(
+        db_path, role="no-trade-evidence", phase="evidence",
+    ):
         try:
-            conn.rollback()
+            written = _record_no_trade_evidence_tx(
+                conn, figi=figi, rows=rows, board=board,
+                isin=isin, now=now,
+            )
         except Exception:
-            pass
-        raise
+            try:
+                conn.rollback()
+            except Exception:
+                # Rollback can itself raise on a closed connection;
+                # the lock-release path is more important than the
+                # rollback error, so swallow this.
+                pass
+            raise
+        conn.commit()
     return written
 
 
-def reconcile_no_trade_evidence(conn: sqlite3.Connection) -> int:
-    """Drop evidence rows whose date has a real bar now. Returns rows removed.
+def _reconcile_no_trade_evidence_tx(conn: sqlite3.Connection) -> int:
+    """Private transaction body for :func:`reconcile_no_trade_evidence`.
 
-    Called after every bar write so a stale evidence row never beats a
-    real candle.
+    Performs the ``DELETE FROM moex_no_trade_evidence WHERE EXISTS
+    (SELECT 1 FROM bars ...)`` and returns the cursor rowcount
+    (number of evidence rows whose date now has a real bar). Called
+    only while the shared writer lock is already held by the public
+    entry point; the helper must NOT re-acquire the lock (the brief
+    is explicit — one acquisition protects the whole transaction).
+
+    The caller is responsible for the commit / rollback.
     """
     cur = conn.execute(
         """DELETE FROM moex_no_trade_evidence
@@ -273,8 +372,46 @@ def reconcile_no_trade_evidence(conn: sqlite3.Connection) -> int:
                  AND bars.ts = moex_no_trade_evidence.session_date
            )"""
     )
-    conn.commit()
     return cur.rowcount
+
+
+def reconcile_no_trade_evidence(
+    conn: sqlite3.Connection, *, db_path: str,
+) -> int:
+    """Drop evidence rows whose date has a real bar now. Returns rows removed.
+
+    Called after every bar write so a stale evidence row never beats a
+    real candle.
+
+    Coordination (writer-coordination spec, Task 3):
+    * The shared writer lock is acquired exactly once via
+      :func:`_evidence_writer_lock` with ``role="evidence-reconcile"``
+      and ``phase="reconcile"``. The private
+      ``_reconcile_no_trade_evidence_tx`` performs the SQL; it does
+      not re-acquire the lock.
+    * The caller MUST pass an explicit ``db_path`` — there is no
+      implicit / inferred production DB-path shim. The
+      :func:`db.sqlite.get_connection` cache is open and
+      write-friendly in production; tests must use a file-backed
+      temp DB so the kernel-level ``flock`` is actually exercised.
+    * On ``WriterLockBusy`` the helper lets the exception propagate;
+      the caller (e.g. the bar writer) decides whether to defer,
+      abort, or fall back. The bar writer's existing fallback is
+      to swallow the busy error and leave the bar write committed.
+    """
+    with _evidence_writer_lock(
+        db_path, role="evidence-reconcile", phase="reconcile",
+    ):
+        try:
+            removed = _reconcile_no_trade_evidence_tx(conn)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        conn.commit()
+    return removed
 
 
 def load_no_trade_dates(
