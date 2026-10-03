@@ -436,13 +436,27 @@ _UNSAFE_PATH_REGEXES = (
 
 def _is_unsafe_path(value: str) -> bool:
     """Return True for connection-string / URL / userinfo / query
-    markers. Inspects the raw (un-truncated, un-sanitized) value so
-    an unsafe marker placed past char 200 still triggers redaction.
+    markers, AND for any value that is not an absolute local POSIX
+    filesystem path. Inspects the raw (un-truncated, un-sanitized)
+    value so an unsafe marker placed past char 200 still triggers
+    redaction.
 
-    Real canonical ``/tmp/...`` style paths never carry ``://``,
-    ``?``, ``user:password@``, or ``key=value;key=value``; on any
-    of these we treat the value as a credential leak and redact.
+    Real writer lock paths are ALWAYS absolute: ``writer_lock_path``
+    runs ``Path(db_path).expanduser().resolve(strict=False)`` before
+    constructing the lock file name. A non-absolute value therefore
+    cannot be a real lock file — it is a malformed caller smuggling
+    something else (relative path, bare filename, URL, connection
+    string, userinfo, ...) into the diagnostic. The non-absolute
+    check runs first so it catches cases the literal substring /
+    regex markers miss (spaced userinfo, URL-encoded userinfo,
+    whitespace / control-char variants, a bare ``relative.db``
+    with no markers at all). Absolute paths are then checked for
+    the credential-shaped markers; a clean canonical ``/tmp/...``
+    path that happens to contain ``@`` or ``=`` in the filename
+    stays untouched.
     """
+    if not os.path.isabs(value):
+        return True
     if any(marker in value for marker in _UNSAFE_PATH_MARKERS):
         return True
     return any(rx.search(value) for rx in _UNSAFE_PATH_REGEXES)

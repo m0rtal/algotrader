@@ -311,6 +311,114 @@ def test_format_busy_defer_preserves_safe_filesystem_paths(tmp_path):
     assert "[REDACTED]" not in line
 
 
+# ------------------------------------------------------------------
+# RED (Task 5 absolute-path fix): every non-absolute local POSIX path
+# is unsafe — redact it before the existing URL/query/userinfo/ADO
+# checks have a chance to run. Real canonical writer lock paths are
+# always absolute (writer_lock_path() calls .resolve()).
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, secret_substring",
+    [
+        # Parent's exact reproduction: a space between username and
+        # colon defeats the existing [\w.+-]+:[\w.+-]+@ userinfo regex.
+        # The fix must catch it because the value is not a local
+        # absolute filesystem path.
+        ("alice: SYNTHETIC_SECRET@host/db", "SYNTHETIC_SECRET"),
+        # URL-encoded userinfo — also slips past the literal regex;
+        # also not absolute.
+        ("alice%3ASYNTHETIC_SECRET%40host%2Fdb", "SYNTHETIC_SECRET"),
+        # Leading whitespace before the colon.
+        ("alice :SYNTHETIC_SECRET@host/db", "SYNTHETIC_SECRET"),
+        # Control character between username and colon; the existing
+        # _sanitize replaces control chars with '?', but the resulting
+        # string is still not an absolute filesystem path.
+        ("alice:\x01SYNTHETIC_SECRET@host/db", "SYNTHETIC_SECRET"),
+        # Connection-string 'Server=...;...' shape that does NOT match
+        # the existing ';' ADO regex (no second ';' at the right
+        # position). Still not absolute.
+        ("Server=db.example.com;User Id=alice;Password=SYNTHETIC_SECRET",
+         "SYNTHETIC_SECRET"),
+        # Ordinary relative filesystem path with no markers at all —
+        # a malformed caller can pass anything here. The safe default
+        # for a non-absolute value is full redaction.
+        ("relative.db", "relative.db"),
+        ("./relative.db", "relative.db"),
+        # Relative path that happens to contain '@' but is not absolute
+        # and is not a real filesystem path.
+        ("user@host", "user@host"),
+    ],
+)
+def test_format_busy_defer_redacts_non_absolute_paths(
+    tmp_path, value, secret_substring
+):
+    """Every value that is NOT an absolute local POSIX filesystem path
+    is treated as a credential-bearing string and replaced wholesale
+    with ``[REDACTED]``.
+
+    A real writer lock path is always absolute
+    (``writer_lock_path()`` calls ``Path.resolve()``). A non-absolute
+    value therefore cannot be a real lock file — it is a malformed
+    caller smuggling something else into the diagnostic. The fix runs
+    the non-absolute check BEFORE the existing URL / query / userinfo
+    / ADO regexes so it catches the cases those checks miss (spaced
+    userinfo, URL-encoded userinfo, whitespace, control chars,
+    bare ``relative.db``).
+    """
+    lock = str((tmp_path / "real.db.writer.lock").resolve())
+    exc = _busy(value, lock)
+    line = format_busy_defer(exc)
+    assert secret_substring not in line, (
+        f"non-absolute path leaked: {value!r} -> {line!r}"
+    )
+    assert "database_path=[REDACTED]" in line, (
+        f"non-absolute path not wholesale-redacted: {line!r}"
+    )
+
+
+def test_format_busy_defer_redacts_non_absolute_lock_path(tmp_path):
+    """A non-absolute ``lock_path`` is also redacted wholesale — the
+    safe-default rule applies to both diagnostic fields symmetrically.
+    """
+    db = str((tmp_path / "real_state.db").resolve())
+    exc = _busy(db, "relative.db.writer.lock")
+    line = format_busy_defer(exc)
+    assert "relative.db" not in line
+    assert "lock_path=[REDACTED]" in line
+
+
+def test_format_busy_defer_keeps_absolute_path_with_at_and_equals(tmp_path):
+    """A safe absolute path containing ``@`` and ``=`` in the
+    filename (e.g. ``/tmp/has@and=chars.db``) stays untouched. The
+    fix must not over-trigger on legitimate absolute filenames that
+    contain characters that look suspicious in a non-path context.
+    """
+    db = "/tmp/has@and=chars.db"
+    lock = str((tmp_path / "real.db.writer.lock").resolve())
+    exc = _busy(db, lock)
+    line = format_busy_defer(exc)
+    assert f"database_path={db}" in line
+    assert "[REDACTED]" not in line
+
+
+def test_format_busy_defer_keeps_canonical_writer_lock_path(tmp_path):
+    """A canonical writer lock path (absolute, /tmp/... style) is the
+    shape the real formatter ALWAYS sees — ``writer_lock_path`` runs
+    ``Path(db_path).expanduser().resolve(strict=False)`` before
+    constructing the lock file name. The non-absolute guard must
+    leave these alone (after sanitize).
+    """
+    db = str((tmp_path / "real_state.db").resolve())
+    lock = str((tmp_path / "real_state.db.writer.lock").resolve())
+    exc = _busy(db, lock)
+    line = format_busy_defer(exc)
+    assert f"database_path={db}" in line
+    assert f"lock_path={lock}" in line
+    assert "[REDACTED]" not in line
+
+
 def test_format_busy_defer_no_payload_or_extra_attrs(tmp_path):
     """No payload-like key/value leaks into the rendered line.
 
