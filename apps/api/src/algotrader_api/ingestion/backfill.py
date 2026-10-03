@@ -559,8 +559,29 @@ def _fetch_year_moex_iter(
     required_cols = {"TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"}
     start = 0
     page_size = 500
+    # Hard cap on the number of HTTP pages the iterator will walk
+    # for a single year. MOEX never returns more than 500 rows per
+    # page, so a normal year finishes in 1 page and a busy year in
+    # 2. The cap exists to bound an upstream that fails to terminate
+    # (no cursor + full pages forever) or that breaks the page-size
+    # contract; without it a buggy upstream would loop indefinitely.
+    # A year of MOEX history is at most a few hundred trading days,
+    # so 20 pages is far more than any real year needs and acts as
+    # a circuit-breaker. On hit we mark ``partial`` (we have rows;
+    # we just couldn't certify) and return — never malformed, so
+    # the bar consumer keeps what it got.
+    max_pages = 20
+    pages_walked = 0
     prev_cursor_offset: int | None = None
+    prev_cursor_total: int | None = None
     while True:
+        pages_walked += 1
+        if pages_walked > max_pages:
+            # Cap reached. Yield the rows collected so far as
+            # ``partial`` (caller keeps the data; the outcome tells
+            # the evidence path to refuse).
+            yield ([], "partial")
+            return
         # Network failure: the iterator signals ``error`` exactly
         # once and stops — callers that care (the evidence path)
         # see it; bar consumers keep the partial list they already
@@ -578,26 +599,18 @@ def _fetch_year_moex_iter(
         except Exception:
             yield ([], "error")
             return
-        # Treat missing ``status_code`` as 200 (the previous bar-list
-        # contract never read it; legacy test doubles that just expose
-        # ``.json()`` keep working). A real ``requests.Response``
-        # always carries it.
-        status = getattr(response, "status_code", 200)
-        if status != 200:
-            yield ([], "malformed")
-            return
+        kept_rows: list[dict] = []
         try:
             data = response.json()
         except Exception:
-            yield ([], "malformed")
+            yield (kept_rows, "malformed")
             return
         cols = data.get("history", {}).get("columns", []) or []
         if not cols or not required_cols.issubset(set(cols)):
-            yield ([], "malformed")
+            yield (kept_rows, "malformed")
             return
         rows_raw = data.get("history", {}).get("data", []) or []
         page_outcome = "complete"
-        kept_rows: list[dict] = []
         for row in rows_raw:
             if len(row) != len(cols):
                 # Drop malformed rows; page_outcome stays whatever
@@ -621,11 +634,26 @@ def _fetch_year_moex_iter(
                 # VOLUME to be present (zero is a valid value).
                 page_outcome = _reduce_outcomes(page_outcome, "malformed")
                 continue
-            try:
-                volume = int(volume_raw or 0)
-            except (TypeError, ValueError):
+            # VOLUME must be an integer count of shares, not a
+            # fractional float. ``int(0.5) == 0`` would silently
+            # promote a 0.5 row into the zero-trade shape (false
+            # positive no-trade evidence); ``int(1000.5) == 1000``
+            # would silently corrupt a real bar. Reject any float
+            # that is not a whole number, plus any non-numeric type.
+            if isinstance(volume_raw, bool) or not isinstance(
+                volume_raw, (int, float),
+            ):
                 page_outcome = _reduce_outcomes(page_outcome, "malformed")
                 continue
+            if isinstance(volume_raw, float):
+                if not volume_raw.is_integer():
+                    page_outcome = _reduce_outcomes(
+                        page_outcome, "malformed",
+                    )
+                    continue
+                volume = int(volume_raw)
+            else:
+                volume = int(volume_raw)
             # Per-shape contract:
             #  * zero-volume rows MUST carry NUMTRADES == 0 AND VALUE == 0;
             #    missing/None on those counters is malformed.
@@ -661,6 +689,23 @@ def _fetch_year_moex_iter(
                 "_numtrades": d.get("NUMTRADES"),
                 "_value": d.get("VALUE"),
             })
+        # Spec line 53: HTTP ``status_code == 200`` is required for
+        # the page to be considered ``complete``. A missing
+        # ``status_code`` attribute is malformed (we cannot
+        # certify an unverified response), not 200-by-default.
+        # The check is done AFTER row parsing so the bar-list
+        # wrapper still gets the parsed rows (existing partial-
+        # bar tolerance is preserved); the outcome tag is the
+        # signal the evidence path uses to refuse.
+        # A real ``requests.Response`` always carries
+        # ``status_code``; a missing one means the test double
+        # is broken (or someone returned the wrong object).
+        if not hasattr(response, "status_code"):
+            yield (kept_rows, "malformed")
+            return
+        if response.status_code != 200:
+            yield (kept_rows, "malformed")
+            return
         # Cursor validation. The cursor MUST advance (or close) —
         # a repeated offset is a server-side loop / no-progress
         # condition we cannot trust.
@@ -702,6 +747,33 @@ def _fetch_year_moex_iter(
                 yield (kept_rows, page_outcome)
                 return
             if total_i <= 0:
+                # A non-positive server-reported ``total`` is
+                # malformed (spec line 33): we cannot reason
+                # about pagination completeness without a valid
+                # upper bound.
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            if (prev_cursor_total is not None
+                    and total_i != prev_cursor_total):
+                # The cursor's ``total`` must be stable across
+                # pages (a real MOEX session reports a single
+                # value). A change mid-walk means the upstream
+                # is shifting its count — a contract-less state
+                # we cannot certify. Spec line 30-31 (consistency
+                # check).
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            prev_cursor_total = total_i
+            if len(kept_rows) > srv_page_size_i:
+                # Spec line 30-31: page_size consistency check
+                # on the high side. The server reported a
+                # page_size, but the response carried MORE rows
+                # than that — the loop cannot trust a server
+                # that doesn't even keep its own page-size
+                # contract (the low side is the short-page-no-
+                # cursor / partial case handled below).
                 page_outcome = _reduce_outcomes(page_outcome, "malformed")
                 yield (kept_rows, page_outcome)
                 return
