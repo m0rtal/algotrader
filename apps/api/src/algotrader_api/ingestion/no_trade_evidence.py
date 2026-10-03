@@ -46,12 +46,23 @@ import json
 import sqlite3
 import urllib.parse
 from datetime import date, timedelta
+from typing import Literal
 
 # Default expiry windows. Recent evidence is cheap to re-fetch and must
 # be revalidated frequently; historical evidence is trusted for longer
 # because the upstream source itself treats those sessions as settled.
 RECENT_EVIDENCE_EXPIRY = timedelta(days=7)
 HISTORICAL_EVIDENCE_EXPIRY = timedelta(days=365)
+
+# Fetch outcome emitted by ``_fetch_year_moex_outcome``. Decision
+# rule (see ADDED Requirement in
+# openspec/changes/persist-historical-moex-evidence): one value per
+# fetch, worst-severity across pages. This is a ``Literal`` alias,
+# NOT a runtime constructor — callers compare with
+# ``outcome == "complete"`` and friends.
+MOEXFetchOutcome = Literal[
+    "complete", "partial", "error", "malformed", "identity_mismatch",
+]
 
 # Bounded lock-acquisition timeout for both public evidence wrappers
 # (record + reconcile). Default 30 s mirrors the bar-writer timeout;

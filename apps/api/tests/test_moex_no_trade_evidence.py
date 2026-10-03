@@ -968,3 +968,556 @@ def test_populate_script_ignores_listed_till_before_listing(tmp_path):
         _date.today() - _td(days=1),
     )
     assert value == want, f"expected_bars={value}, want {want} (guard must ignore 2020 listed_till)"
+
+
+# -- MOEXFetchOutcome (Task 1) -------------------------------------------
+
+
+def test_fetch_year_moex_outcome_complete_full_pagination():
+    """Single-page full cursor yields outcome == 'complete'."""
+    from algotrader_api.ingestion import backfill
+    from algotrader_api.ingestion.no_trade_evidence import (
+        MOEXFetchOutcome,
+    )
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0],
+                ["2025-09-30", "GAZP", "TQBR",
+                 100, 102, 99, 101, 1000, 5, 100000],
+            ],
+        },
+        # cursor: offset 0, total 2, page_size 2 (loop asked for 500,
+        # the loop is satisfied because 0 + 2 >= 2).
+        "history.cursor": {"data": [[0, 2, 2]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "complete"
+    assert len(rows) == 2
+    assert rows[0]["_secid"] == "GAZP"
+
+
+def test_fetch_year_moex_outcome_error_on_network_failure():
+    """requests.get raising -> outcome == 'error', rows == []."""
+    from algotrader_api.ingestion import backfill
+    from algotrader_api.ingestion.no_trade_evidence import (
+        MOEXFetchOutcome,
+    )
+
+    import unittest.mock as _mock
+
+    def boom(*a, **kw):
+        raise ConnectionError("net")
+
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=boom):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "error"
+    assert rows == []
+
+
+def test_fetch_year_moex_outcome_malformed_missing_tradedate():
+    """history.columns missing TRADEDATE -> 'malformed'."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["SECID", "BOARDID", "OPEN", "CLOSE"],
+            "data": [["GAZP", "TQBR", 100, 101]],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+    assert rows == []
+
+
+def test_fetch_year_moex_outcome_short_page_no_cursor_is_malformed():
+    """No cursor + short page cannot certify completeness."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID"],
+            "data": [["2025-09-29", "GAZP", "TQBR"]],
+        },
+        # No history.cursor; len(rows) < page_size (500).
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+
+
+def test_fetch_year_moex_outcome_partial_incomplete_cursor():
+    """True 2-page partial: cursor advances on page 1, the final page's
+    ``offset + len(rows) < total`` makes the per-fetch outcome ``partial``.
+
+    Genuine incomplete pagination — the cursor MUST advance (the spec
+    forbids repeated offsets; the dedicated repeated-offset test below
+    pins that rule separately). The first page returns a full 100 rows
+    with offset 0; the second page advances to offset 100 and returns
+    only 50 rows against a promised total of 300. The per-fetch
+    outcome becomes ``partial`` because the final page can't close the
+    loop.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    page1 = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [["2025-09-29", "GAZP", "TQBR",
+                      100, 102, 99, 101, 1000, 5, 100000]] * 100,
+        },
+        # offset 0, total 300, page_size 100 — full first page, more
+        # to come.
+        "history.cursor": {"data": [[0, 300, 100]]},
+    }
+    page2 = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [["2025-09-30", "GAZP", "TQBR",
+                      100, 102, 99, 101, 1000, 5, 100000]] * 50,
+        },
+        # offset 100 (advanced), total 300, page_size 100 — 50 rows
+        # returned, 100+50=150 < 300 → partial final page.
+        "history.cursor": {"data": [[100, 300, 100]]},
+    }
+    responses = [page1, page2]
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(responses.pop(0))):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "partial"
+    assert len(rows) == 150
+    assert responses == [], "loop did not advance past page 2"
+
+
+def test_fetch_year_moex_outcome_multipage_complete():
+    """True multi-page completion: ≥2 pages with advancing cursor that
+    closes the loop on the final page.
+
+    Distinct from ``test_fetch_year_moex_outcome_complete_full_pagination``
+    (which is single-page disguised — 2 rows returned, cursor closes
+    immediately). This test forces the loop to actually walk past page 1
+    and verify it terminates on the final page with a full
+    ``offset + len(rows) == total`` close.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    page1 = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [["2025-09-29", "GAZP", "TQBR",
+                      100, 102, 99, 101, 1000, 5, 100000]] * 100,
+        },
+        # offset 0, total 200, page_size 100 — full first page, more
+        # to come.
+        "history.cursor": {"data": [[0, 200, 100]]},
+    }
+    page2 = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [["2025-09-30", "GAZP", "TQBR",
+                      100, 102, 99, 101, 1000, 5, 100000]] * 100,
+        },
+        # offset 100 (advanced), total 200, page_size 100 — 100 rows
+        # returned, 100+100=200 >= 200 → loop closes, outcome complete.
+        "history.cursor": {"data": [[100, 200, 100]]},
+    }
+    responses = [page1, page2]
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(responses.pop(0))):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "complete"
+    assert len(rows) == 200
+    assert responses == [], "loop did not advance past page 2"
+
+
+def test_fetch_year_moex_outcome_identity_mismatch_poisons_batch():
+    """A single cross-listed mirror row poisons the whole fetch."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 100, 102, 99, 101, 1000, 5, 100000],
+                # identity mismatch — single row, batch poisoned.
+                ["2025-09-30", "SBER", "TQBR",
+                 200, 202, 199, 201, 2000, 10, 200000],
+            ],
+        },
+        "history.cursor": {"data": [[0, 2, 2]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "identity_mismatch"
+    assert len(rows) == 2
+
+
+def test_fetch_year_moex_outcome_worst_severity_wins():
+    """First page error forces outcome == 'error' even if subsequent
+    pages parse.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    call_count = {"n": 0}
+
+    def fake_get(url, params=None, timeout=None):  # noqa: ARG001
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ConnectionError("net")
+        return _FakeResp({
+            "history": {
+                "columns": ["TRADEDATE", "SECID", "BOARDID"],
+                "data": [["2025-09-29", "GAZP", "TQBR"]],
+            },
+            "history.cursor": {"data": [[0, 1, 1]]},
+        })
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=fake_get):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "error"
+    assert rows == []
+
+
+def test_fetch_year_moex_outcome_non_200_status_is_malformed():
+    """HTTP 500 is malformed, not complete, even if body parses."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 500
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID"],
+            "data": [["2025-09-29", "GAZP", "TQBR"]],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+    assert rows == []
+
+
+def test_fetch_year_moex_outcome_initial_cursor_offset_mismatch_is_malformed():
+    """Loop asks for start=0, server reports offset=2 -> malformed."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID"],
+            "data": [["2025-09-29", "GAZP", "TQBR"]],
+        },
+        # offset 2, total 3, page_size 1 -> loop asked start=0.
+        "history.cursor": {"data": [[2, 3, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+
+
+def test_fetch_year_moex_outcome_repeated_cursor_offset_is_malformed():
+    """Two pages with the same cursor offset -> malformed."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    page = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID"],
+            "data": [["2025-09-29", "GAZP", "TQBR"]],
+        },
+        # Same offset on every page — no progress, malformed.
+        "history.cursor": {"data": [[0, 999, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(page)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+
+
+def test_fetch_year_moex_outcome_missing_ohlc_nonzero_volume_is_malformed():
+    """OPEN/HIGH/LOW/CLOSE absent on a non-zero VOLUME row -> malformed."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    # Columns list includes all OHLC + VOLUME, but the row is short
+    # on the OHLC side (None) AND has a non-zero VOLUME.
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 None, None, None, None, 1000, 5, 100000],
+            ],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+
+
+def test_fetch_year_moex_outcome_zero_trade_missing_counters_is_malformed():
+    """VOLUME=0 row without explicit NUMTRADES=0/VALUE=0 -> malformed."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                # NUMTRADES / VALUE missing (None) on a zero-volume
+                # row — must be malformed, not complete.
+                ["2025-09-29", "GAZP", "TQBR",
+                 None, None, None, None, 0, None, None],
+            ],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+
+
+# -- bar-list compatibility (Step 2 / Step 3) --------------------------
+
+
+def test_fetch_year_moex_list_only_signature_preserved_positional():
+    """The existing list-only path keeps the
+    positional-or-keyword ``last_trading_day`` signature; callers
+    can pass it positionally or by keyword.
+    """
+    from algotrader_api.ingestion import backfill
+    import datetime as _dt
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0],
+            ],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        # last_trading_day passed POSITIONALLY (legacy call style).
+        rows = backfill._fetch_year_moex(
+            "shares", "TQBR", "GAZP", 2025, _dt.date(2025, 9, 29),
+        )
+    assert len(rows) == 1
+    assert rows[0]["_secid"] == "GAZP"
+    assert rows[0]["_boardid"] == "TQBR"
+
+
+def test_fetch_year_moex_outcome_emits_raw_columns_per_dict():
+    """Regression: the existing raw-columns test must still pass after
+    the outcome addition; the outcome variant agrees on shape.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0],
+            ],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "complete"
+    assert rows[0]["_secid"] == "GAZP"
+    assert rows[0]["_numtrades"] == 0

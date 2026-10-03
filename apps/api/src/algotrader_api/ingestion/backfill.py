@@ -29,6 +29,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+from collections.abc import Iterator
 import requests
 import requests.adapters  # HTTPAdapter lives here, not on requests namespace
 from dataclasses import dataclass, field
@@ -39,6 +40,7 @@ from typing import Any, Awaitable, Callable, Iterable
 
 from ..observability.logging import get_logger
 from .closed_candles import is_closed_candle
+from .no_trade_evidence import MOEXFetchOutcome  # noqa: F401  (re-exported)
 # Imported lazily inside the call sites that need it; this keeps the
 # module-level import surface minimal — `_backfill_one_moex` is the
 # only path that calls ``fetch_issuer_identity`` directly (the other
@@ -467,13 +469,36 @@ def _tinkoff_breaker_record_success(db_path: str, figi: str) -> None:
 _TINKOFF_BREAKER_OPEN_HOURS_GLOBAL = 24
 
 
-def _fetch_year_moex(
+def _reduce_outcomes(prev: str, new: str) -> str:
+    """Return the more-severe of two ``MOEXFetchOutcome`` values.
+
+    Severity order (most-severe first): ``error`` > ``malformed`` >
+    ``partial`` > ``identity_mismatch`` > ``complete``.
+
+    Used to collapse per-page outcomes into a single per-fetch value:
+    callers only see the worst thing the upstream did during the
+    walk, regardless of how many pages preceded the bad one.
+    """
+    order = {
+        "error": 5,
+        "malformed": 4,
+        "partial": 3,
+        "identity_mismatch": 2,
+        "complete": 1,
+    }
+    if order.get(new, 0) > order.get(prev, 0):
+        return new
+    return prev
+
+
+def _fetch_year_moex_iter(
     market: str,
     board: str,
     ticker: str,
     year: int,
+    *,
     last_trading_day: date | None = None,
-) -> list[dict]:
+) -> Iterator[tuple[list[dict], str]]:
     """Walk MOEX ISS /iss/history/.../securities/{ticker}.json for ``year``.
 
     MOEX caps a single response at 500 bars; for a year with >500
@@ -490,11 +515,10 @@ def _fetch_year_moex(
     dated after the last published trading day. Earlier years are
     unaffected.
 
-    The parameter is positional-or-keyword (no ``*`` separator) so
-    existing tests that mock via ``side_effect=callable`` with the
-    4-arg signature keep working unchanged — they just get
-    ``last_trading_day=None`` and the function falls back to
-    ``year-12-31``.
+    The iterator yields ``(page_rows, page_outcome)`` after every
+    page. The legacy ``_fetch_year_moex`` simply concatenates the
+    rows; ``_fetch_year_moex_outcome`` folds the per-page outcomes
+    into a single worst-severity value via ``_reduce_outcomes``.
 
     Each emitted dict carries the raw MOEX columns the no-trade
     evidence helper needs (``SECID``, ``BOARDID``, ``NUMTRADES``,
@@ -502,8 +526,28 @@ def _fetch_year_moex(
     row without a second HTTP round-trip. Empty OHLC values are kept
     as ``None`` — the bars writer already drops such rows, but the
     evidence helper relies on the explicit None shape.
+
+    Strict feed contract (Task 1) — for every page:
+
+    * HTTP ``status_code == 200`` else ``"malformed"`` and stop.
+    * ``history.columns`` must contain ``TRADEDATE``, the four OHLC
+      columns, and ``VOLUME``; otherwise ``"malformed"`` and stop.
+    * Each parsed row's length must equal the column-list length;
+      too-short rows are dropped silently.
+    * Zero-trade rows (``VOLUME == 0``) require ``NUMTRADES == 0``
+      AND ``VALUE == 0``; a missing counter on a zero-trade row is
+      ``"malformed"``.
+    * Non-zero-volume rows with missing OHLC are dropped, page
+      ``"malformed"``.
+    * Cursor block carries ``[offset, total, page_size]``. The
+      server-reported ``offset`` must equal the loop's requested
+      ``start``; mismatch → ``"malformed"`` and stop. Non-positive
+      ``total`` → ``"malformed"`` and stop. Repeated cursor offset
+      across two pages → ``"malformed"`` and stop.
+    * Identity: any row with ``SECID != ticker`` OR
+      ``BOARDID != board`` flips the page's outcome to
+      ``"identity_mismatch"`` (batch-poisoning; identity is per-batch).
     """
-    import requests
     base = (
         f"https://iss.moex.com/iss/history/engines/stock/markets/{market}/boards/{board}"
         f"/securities/{urllib.parse.quote(ticker)}.json"
@@ -512,12 +556,17 @@ def _fetch_year_moex(
         till = last_trading_day.isoformat()
     else:
         till = f"{year}-12-31"
-    out: list[dict] = []
+    required_cols = {"TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"}
     start = 0
     page_size = 500
+    prev_cursor_offset: int | None = None
     while True:
+        # Network failure: the iterator signals ``error`` exactly
+        # once and stops — callers that care (the evidence path)
+        # see it; bar consumers keep the partial list they already
+        # collected from prior pages.
         try:
-            data = requests.get(
+            response = requests.get(
                 base,
                 params={
                     "from": f"{year}-01-01",
@@ -525,25 +574,86 @@ def _fetch_year_moex(
                     "start": start,
                 },
                 timeout=30,
-            ).json()
+            )
         except Exception:
-            break
-        cols = data.get("history", {}).get("columns", [])
-        if not cols or "TRADEDATE" not in cols:
-            break
-        rows = data.get("history", {}).get("data", [])
-        if not rows:
-            break
-        for row in rows:
+            yield ([], "error")
+            return
+        # Treat missing ``status_code`` as 200 (the previous bar-list
+        # contract never read it; legacy test doubles that just expose
+        # ``.json()`` keep working). A real ``requests.Response``
+        # always carries it.
+        status = getattr(response, "status_code", 200)
+        if status != 200:
+            yield ([], "malformed")
+            return
+        try:
+            data = response.json()
+        except Exception:
+            yield ([], "malformed")
+            return
+        cols = data.get("history", {}).get("columns", []) or []
+        if not cols or not required_cols.issubset(set(cols)):
+            yield ([], "malformed")
+            return
+        rows_raw = data.get("history", {}).get("data", []) or []
+        page_outcome = "complete"
+        kept_rows: list[dict] = []
+        for row in rows_raw:
+            if len(row) != len(cols):
+                # Drop malformed rows; page_outcome stays whatever
+                # the cursor / identity checks determine (kept
+                # rows already passed the strict contract).
+                continue
             d = dict(zip(cols, row))
-            out.append({
+            # SECID/BOARDID identity check (per-batch poison).
+            if str(d.get("SECID") or "") != ticker \
+                    or str(d.get("BOARDID") or "") != board:
+                page_outcome = _reduce_outcomes(
+                    page_outcome, "identity_mismatch",
+                )
+                # Still keep the row — the bar consumer sees the
+                # data they already accepted today; the outcome is
+                # the signal the evidence path uses to refuse.
+            volume_raw = d.get("VOLUME")
+            if volume_raw is None:
+                # VOLUME column present but row's value is missing
+                # — treat as malformed. The strict contract requires
+                # VOLUME to be present (zero is a valid value).
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                continue
+            try:
+                volume = int(volume_raw or 0)
+            except (TypeError, ValueError):
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                continue
+            # Per-shape contract:
+            #  * zero-volume rows MUST carry NUMTRADES == 0 AND VALUE == 0;
+            #    missing/None on those counters is malformed.
+            #  * non-zero rows MUST have all four OHLC columns present;
+            #    missing/None on OHLC when VOLUME > 0 is malformed.
+            if volume == 0:
+                if d.get("NUMTRADES") != 0 or d.get("VALUE") != 0:
+                    page_outcome = _reduce_outcomes(
+                        page_outcome, "malformed",
+                    )
+                    continue
+            else:
+                if (d.get("OPEN") is None
+                        or d.get("HIGH") is None
+                        or d.get("LOW") is None
+                        or d.get("CLOSE") is None):
+                    page_outcome = _reduce_outcomes(
+                        page_outcome, "malformed",
+                    )
+                    continue
+            kept_rows.append({
                 "figi": None,  # filled by caller
                 "ts": d.get("TRADEDATE"),
                 "open": d.get("OPEN"),
                 "high": d.get("HIGH"),
                 "low": d.get("LOW"),
                 "close": d.get("CLOSE"),
-                "volume": int(d.get("VOLUME") or 0),
+                "volume": volume,
                 "source": "moex",
                 # No-trade evidence: raw upstream columns, kept verbatim.
                 "_secid": d.get("SECID"),
@@ -551,22 +661,158 @@ def _fetch_year_moex(
                 "_numtrades": d.get("NUMTRADES"),
                 "_value": d.get("VALUE"),
             })
-        # history.cursor rows: [offset, total, page_size]. When
-        # offset + len(rows) >= total, we've seen everything.
+        # Cursor validation. The cursor MUST advance (or close) —
+        # a repeated offset is a server-side loop / no-progress
+        # condition we cannot trust.
         cursor_rows = data.get("history.cursor", {}).get("data") or []
         if cursor_rows:
             try:
                 offset, total, _srv_page_size = cursor_rows[0][:3]
-                if offset is not None and total is not None and offset + len(rows) >= total:
-                    break
             except (TypeError, ValueError):
-                pass
-        else:
-            # No cursor at all: fall back to "short page = last".
-            if len(rows) < page_size:
-                break
-        start += len(rows)
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            if offset is None or total is None:
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            try:
+                offset_i = int(offset)
+                total_i = int(total)
+            except (TypeError, ValueError):
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            try:
+                srv_page_size_i = int(_srv_page_size)
+            except (TypeError, ValueError):
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            if srv_page_size_i <= 0:
+                # A non-positive server-reported page_size is
+                # malformed — we cannot reason about "short page"
+                # without a valid denominator. Same severity as a
+                # non-positive ``total`` (spec line 33).
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            if offset_i != start:
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            if total_i <= 0:
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            if prev_cursor_offset is not None and offset_i == prev_cursor_offset:
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            prev_cursor_offset = offset_i
+            # Decide between final-page-yield and intermediate-yield:
+            # the per-page outcome stays whatever this page's data
+            # determined; the ``partial`` tag is reserved for the
+            # final-page case (cursor closed but offset+len<total).
+            if offset_i + len(kept_rows) >= total_i:
+                yield (kept_rows, page_outcome)
+                return
+            # A short page (len(kept_rows) < server-reported
+            # page_size) with a consistent cursor that still
+            # promises more rows is the spec's "final page" signal
+            # — the server is wrapping up. Mark this per-fetch
+            # ``partial``: the data we have is fine, the loop
+            # just couldn't reach ``total``. The next request
+            # would either return the same offset (repeated →
+            # malformed) or advance (this branch would be
+            # skipped, we'd walk the next page).
+            # We use the server-reported page_size (from the
+            # cursor) rather than the loop's requested 500,
+            # because MOEX may serve fewer rows per response
+            # than we asked for; a server-full page (e.g. 100
+            # rows when the cursor reports page_size=100) is
+            # still a full page from MOEX's perspective.
+            if len(kept_rows) < srv_page_size_i:
+                page_outcome = _reduce_outcomes(page_outcome, "partial")
+                yield (kept_rows, page_outcome)
+                return
+            # Intermediate page — data parsed cleanly and the
+            # loop has more to walk. Yield with the per-page
+            # outcome (which is ``complete`` if this page's data
+            # was clean).
+            yield (kept_rows, page_outcome)
+            start += len(kept_rows)
+            continue
+        # No cursor at all.
+        if len(kept_rows) == 0 and len(rows_raw) == 0:
+            # Empty response — nothing more to do; this is not
+            # necessarily an error (the year genuinely may have no
+            # data). Yield once with whatever outcome we have so
+            # callers can record it, then stop.
+            yield (kept_rows, page_outcome)
+            return
+        if len(rows_raw) < page_size:
+            # Short page, no cursor → cannot certify completeness;
+            # the strict contract marks this ``malformed``.
+            page_outcome = _reduce_outcomes(page_outcome, "malformed")
+            yield (kept_rows, page_outcome)
+            return
+        # Full page, no cursor → not malformed per se, but we
+        # cannot certify pagination completeness without a cursor.
+        # Mark ``partial`` so the outcome reflects "we don't know
+        # if this is everything".
+        page_outcome = _reduce_outcomes(page_outcome, "partial")
+        yield (kept_rows, page_outcome)
+        start += len(kept_rows)
+
+
+def _fetch_year_moex(
+    market: str,
+    board: str,
+    ticker: str,
+    year: int,
+    last_trading_day: date | None = None,
+) -> list[dict]:
+    """Bar-list wrapper around :func:`_fetch_year_moex_iter`.
+
+    Signature preserved (positional-or-keyword ``last_trading_day``,
+    no ``*`` separator) so existing callers keep working unchanged —
+    they just get ``last_trading_day=None`` and the function falls
+    back to ``year-12-31``.
+    """
+    out: list[dict] = []
+    for page_rows, _outcome in _fetch_year_moex_iter(
+        market, board, ticker, year,
+        last_trading_day=last_trading_day,
+    ):
+        out.extend(page_rows)
     return out
+
+
+def _fetch_year_moex_outcome(
+    market: str,
+    board: str,
+    ticker: str,
+    year: int,
+    last_trading_day: date | None = None,
+) -> tuple[list[dict], str]:
+    """Same walk as :func:`_fetch_year_moex` but returns an outcome.
+
+    Returns ``(rows, outcome)``. ``outcome`` is one of the values in
+    the ``MOEXFetchOutcome`` literal declared in
+    :mod:`no_trade_evidence` (re-exported here for callers that
+    already imported it from this module). The outcome is the
+    worst-severity per-page outcome across the whole walk.
+    """
+    out: list[dict] = []
+    overall = "complete"
+    for page_rows, page_outcome in _fetch_year_moex_iter(
+        market, board, ticker, year,
+        last_trading_day=last_trading_day,
+    ):
+        out.extend(page_rows)
+        overall = _reduce_outcomes(overall, page_outcome)
+    return out, overall
 
 
 def _fetch_moex_range(
