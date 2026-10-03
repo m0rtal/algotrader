@@ -57,6 +57,10 @@ from algotrader_api.ingestion.backfill import (  # noqa: E402
     _last_trading_day,
 )
 from algotrader_api.ingestion.no_trade_evidence import fetch_issuer_identity  # noqa: E402
+from algotrader_api.ingestion.writer_lock import (  # noqa: E402
+    WriterLockBusy,
+    format_busy_defer,
+)
 
 DEFAULT_DB = "/home/hermes/algotrader/apps/api/data/state.db"
 DEFAULT_CACHE = "/home/hermes/algotrader/apps/api/data/moex_board_cache.json"
@@ -238,6 +242,18 @@ def main() -> int:
                                           replace=False, source="moex")
                     last_err = None
                     break
+                except WriterLockBusy as exc:
+                    # Coordination (Task 5): the shared writer
+                    # lock is acquired INSIDE
+                    # ``replace_bars_for_figi``; when it times
+                    # out the helper raises ``WriterLockBusy``.
+                    # Catch at this CLI boundary and exit 75
+                    # with a bounded DEFER line. Other
+                    # ``WriterLockError`` (invalid role/phase,
+                    # unsafe lock path) is a real failure and
+                    # propagates.
+                    print(format_busy_defer(exc))
+                    return 75
                 except sqlite3.OperationalError as e:
                     last_err = e
                     time.sleep(5 * (attempt + 1))

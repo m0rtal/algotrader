@@ -50,6 +50,10 @@ from algotrader_api.ingestion.backfill import (  # noqa: E402
     _last_trading_day,
 )
 from algotrader_api.ingestion.client import make_client  # noqa: E402
+from algotrader_api.ingestion.writer_lock import (  # noqa: E402
+    WriterLockBusy,
+    format_busy_defer,
+)
 
 DEFAULT_DB = "/home/hermes/algotrader/apps/api/data/state.db"
 DEFAULT_DAYS = 90
@@ -170,16 +174,24 @@ async def run(db_path: str, limit: int, dry_run: bool, sleep_s: float,
                       f"({bars[0]['ts']}..{bars[-1]['ts']})")
                 written += len(bars)
                 continue
-            # The nightly worker writes concurrently; a write collision
-            # ("database is locked" past the busy_timeout) must not kill
-            # the whole sweep. Retry with backoff, then skip the figi —
-            # the next run picks it up.
+            # Coordination (Task 5): the shared writer lock is
+            # acquired INSIDE ``replace_bars_for_figi``; when it
+            # times out the helper raises ``WriterLockBusy`` (a
+            # subclass of ``WriterLockError``, not the regular
+            # SQLite busy). We catch it at this CLI boundary
+            # and exit 75 with a bounded DEFER line. Other
+            # ``WriterLockError`` (invalid role/phase, unsafe
+            # lock path) is a real failure and propagates — it
+            # must never be turned into a silent deferral.
             last_err = None
             for attempt in range(6):
                 try:
                     replace_bars_for_figi(db_path, figi, bars, replace=False)
                     last_err = None
                     break
+                except WriterLockBusy as exc:
+                    print(format_busy_defer(exc))
+                    return 75
                 except sqlite3.OperationalError as e:
                     last_err = e
                     time.sleep(5 * (attempt + 1))

@@ -1641,7 +1641,9 @@ class BackfillRunner:
             # HTTP response can rely on the same upstream confirmation.
             # Errors here are logged but never abort the bar write:
             # a missing evidence row is "unknown", not a fail-closed
-            # block on the bars path.
+            # block on the bars path. Task 3: pass the explicit
+            # ``db_path`` so the evidence lock uses the same
+            # namespace as the bar lock.
             try:
                 from .no_trade_evidence import (
                     record_no_trade_evidence,
@@ -1657,6 +1659,7 @@ class BackfillRunner:
                     inst_isin = inst_row["isin"] if inst_row else ""
                     record_no_trade_evidence(
                         get_connection(self.db_path),
+                        db_path=self.db_path,
                         figi=figi,
                         rows=zero_rows,
                         board=meta["board"],
@@ -2585,11 +2588,49 @@ async def _async_backfill_impl(
     properly awaiting ``rl.acquire("get_historical_bonds")`` here in
     the async context. Existing sync tests still pass because they
     patch ``acquire`` with a MagicMock that returns non-awaitable.
+
+    Writer-coordination (Task 2, SDD brief):
+    * No raw ``INSERT INTO bars`` / ``conn.commit()`` remains on the
+      path. Missing candles for each FIGI are filtered out of the
+      fetched batch (a single batched ``SELECT figi, ts FROM bars
+      WHERE figi = ? AND ts IN (...)`` outside the lock), deduped
+      in-batch, and the remaining missing candles are handed to the
+      coordinated common writer
+      ``replace_bars_for_figi(..., replace=False, source="tinkoff")``
+      which owns ``<db>.writer.lock`` for the bar transaction.
+      ``bars_added`` and the per-FIGI log ``after`` count ONLY the
+      newly-inserted rows (the original raw-INSERT semantic).
+    * The file-backed DB path is resolved explicitly:
+      - When ``conn`` is None (production worker entry), use
+        ``get_settings().sqlite_path`` directly.
+      - When a ``conn`` is injected (tests, manual backfill),
+        read ``PRAGMA database_list`` to get the on-disk main
+        database path. The production writer path
+        (``replace_bars_for_figi``) needs a real file so the
+        shared writer lock can be opened; reject ``:memory:``
+        loudly instead of silently degrading the contract.
+    * Per-FIGI ``figis_processed`` / ``skipped`` / ``errors``
+      counters are preserved so callers and operators see the
+      same accounting as before.
     """
+    from algotrader_api.db.bars_sqlite import (
+        replace_bars_for_figi_with_rowcount,
+    )
+
     if conn is None:
+        # Production path: derive the path from settings and open
+        # the shared connection. The writer lock uses this same
+        # path so the kernel-level namespace matches.
         from algotrader_api.config import get_settings
         from algotrader_api.db.sqlite import get_connection
-        conn = get_connection(get_settings().sqlite_path)
+        sqlite_path = get_settings().sqlite_path
+        conn = get_connection(sqlite_path)
+    else:
+        # A connection was injected. The bar writer needs a
+        # file-backed path (the shared ``<db>.writer.lock`` and
+        # the SQLite WAL depend on it). Read ``PRAGMA database_list``
+        # to learn the on-disk path; reject ``:memory:`` loudly.
+        sqlite_path = _resolve_db_path_from_connection(conn)
 
     # Find all tradable bond figis
     rows = conn.execute(
@@ -2633,42 +2674,142 @@ async def _async_backfill_impl(
             candles = await client.get_candles(
                 figi=figi, date_from=from_date, date_to=to_date
             )
-
-            added_this_figi = 0
-            for c in candles:
-                # RealTinkoffClient.get_candles returns list[dict] via
-                # _candle_to_dict; access via keys, not attributes.
-                if isinstance(c, dict):
-                    c_figi = c["figi"]
-                    c_ts = c["ts"]
-                    c_open = c["open"]
-                    c_high = c["high"]
-                    c_low = c["low"]
-                    c_close = c["close"]
-                    c_volume = c["volume"]
-                else:
-                    c_figi = c.figi
-                    c_ts = c.ts
-                    c_open = c.open
-                    c_high = c.high
-                    c_low = c.low
-                    c_close = c.close
-                    c_volume = c.volume
-                cur = conn.execute(
-                    "SELECT 1 FROM bars WHERE figi=? AND ts=?",
-                    (c_figi, c_ts),
-                ).fetchone()
-                if cur:
-                    continue
-                conn.execute(
-                    """INSERT INTO bars
-                       (figi, ts, open, high, low, close, volume, source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, 'tinkoff')""",
-                    (c_figi, c_ts, c_open, c_high, c_low, c_close, c_volume),
+            if not candles:
+                # Nothing to write; record the no-op in the
+                # ``bars_added`` accounting so operators see the
+                # figi was processed (consistent with the prior
+                # raw-INSERT path which also added zero here).
+                logger.info(
+                    "bond_depth_backfill",
+                    extra={
+                        "event": "bond_depth_backfill",
+                        "figi": figi,
+                        "ticker": ticker,
+                        "before": current,
+                        "after": current,
+                        "added": 0,
+                    },
                 )
-                added_this_figi += 1
+                continue
 
-            conn.commit()
+            # Pre-filter the fetched batch to ONLY the candles that
+            # are actually missing from the DB. The original raw-INSERT
+            # path counted only newly-inserted rows in
+            # ``bars_added`` / log ``after``; restoring that accounting
+            # here is the Task 2 brief's "Restore pre-write
+            # missing-candle filtering" requirement. Filtering runs
+            # outside the lock (it is a read-only DB query + a Python
+            # set diff) so the writer-lock window stays bounded to
+            # the bar transaction only.
+            #
+            # Steps:
+            #   1. Normalize every fetched candle into
+            #      ``(c_figi, c_ts)`` plus the original candle for
+            #      re-use; dedupe in-batch by ``(c_figi, c_ts)`` so
+            #      the broker never double-counts a repeated key.
+            #   2. Query the DB once for the existing keys (single
+            #      batched SELECT) — outside the lock.
+            #   3. Hand only the missing candles to the coordinated
+            #      common writer. ``replace_bars_for_figi`` returns
+            #      the number of rows actually inserted, which is
+            #      the canonical "added" count.
+            seen_keys: set[tuple[str, str]] = set()
+            ordered: list[tuple[tuple[str, str], object]] = []
+            for c in candles:
+                if isinstance(c, dict):
+                    c_figi = c.get("figi") or figi
+                    c_ts = c.get("ts")
+                else:
+                    c_figi = getattr(c, "figi", None) or figi
+                    c_ts = getattr(c, "ts", None)
+                if c_ts is None:
+                    # No timestamp → nothing we can dedupe or
+                    # write; drop silently (matches the original
+                    # behavior of "no ts → no row written").
+                    continue
+                key = (c_figi, c_ts)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                ordered.append((key, c))
+
+            if not ordered:
+                # No usable keys in the fetched batch (all were
+                # missing ``ts``). Mirror the empty-candles log
+                # line above so operators see the figi was
+                # processed and nothing was added.
+                logger.info(
+                    "bond_depth_backfill",
+                    extra={
+                        "event": "bond_depth_backfill",
+                        "figi": figi,
+                        "ticker": ticker,
+                        "before": current,
+                        "after": current,
+                        "added": 0,
+                    },
+                )
+                continue
+
+            # Single bounded SELECT for all (figi, ts) pairs in
+            # this figi's batch — one query, no IN placeholder
+            # expansion. SQLite caps the number of bound
+            # parameters per statement (default 999 / 32766
+            # depending on the build); an unbounded
+            # ``WHERE ts IN (?, ?, ...)`` over a huge broker
+            # batch trips ``too many SQL variables`` and the
+            # whole backfill dies. The bounded path reads the
+            # stored (figi, ts) set ONCE for this loop figi
+            # and filters in Python. The DB is read-only here;
+            # no lock is held.
+            existing_rows = conn.execute(
+                "SELECT ts FROM bars WHERE figi = ?",
+                (figi,),
+            ).fetchall()
+            existing_keys = {(r[0],) for r in existing_rows}
+            missing = [candle for key, candle in ordered if key not in existing_keys]
+
+            if not missing:
+                # Every fetched candle is already in the DB. Log
+                # ``added=0`` and continue — the per-FIGI accounting
+                # reflects the original "we wrote zero new rows"
+                # semantic.
+                logger.info(
+                    "bond_depth_backfill",
+                    extra={
+                        "event": "bond_depth_backfill",
+                        "figi": figi,
+                        "ticker": ticker,
+                        "before": current,
+                        "after": current,
+                        "added": 0,
+                    },
+                )
+                continue
+
+            # Delegate the bar write to the coordinated common
+            # writer. It owns ``<db>.writer.lock`` for the bar
+            # transaction and re-uses the existing
+            # ``replace=False, source='tinkoff'`` semantic. The
+            # ``_with_rowcount`` variant returns the actual
+            # ``executemany`` cursor ``rowcount`` — the public
+            # ``replace_bars_for_figi`` preserves the legacy
+            # ``len(normalized rows)`` contract, which is wrong
+            # for this path: the prefilter is not proof a
+            # concurrent writer did not insert the same key
+            # between the SELECT and the locked INSERT, and the
+            # brief requires ``bars_added`` count only what the
+            # locked ``executemany`` actually committed. Counts
+            # only ``bars`` insertions — never the
+            # ``instrument_metadata`` aggregate or the
+            # reconciliation hook.
+            added_this_figi = replace_bars_for_figi_with_rowcount(
+                sqlite_path,
+                figi,
+                missing,
+                replace=False,
+                source="tinkoff",
+            )
             bars_added += added_this_figi
             logger.info(
                 "bond_depth_backfill",
@@ -2700,6 +2841,60 @@ async def _async_backfill_impl(
         "skipped": skipped,
         "errors": errors,
     }
+
+
+def _resolve_db_path_from_connection(conn: sqlite3.Connection) -> str:
+    """Return the file-backed main database path of ``conn``.
+
+    The production bar writer (``replace_bars_for_figi``) needs a
+    real file to open ``<db>.writer.lock`` and to run SQLite WAL.
+    ``PRAGMA database_list`` returns one row per attached database
+    with the form ``(seq, name, file)``; the first row is the main
+    database. If the main database is ``:memory:`` (or empty)
+    the function raises :class:`RuntimeError` so the caller can
+    surface a fail-closed diagnostic instead of silently
+    degrading the bar write contract.
+
+    Tests that need to drive the public function with an
+    injected connection must use a file-backed temp DB (the
+    existing ``test_backfill_bonds_to_depth`` fixture already
+    does this). New code should never pass ``:memory:`` here.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except Exception as exc:  # noqa: BLE001 — defensive: surface as RuntimeError
+        raise RuntimeError(
+            f"cannot read PRAGMA database_list from injected connection: {exc!r}"
+        ) from exc
+    if not rows:
+        raise RuntimeError(
+            "injected connection has no PRAGMA database_list rows; "
+            "cannot resolve file-backed path for the bar writer"
+        )
+    # First row is the main database. Support both row access
+    # patterns (sqlite3.Row tuple and bare tuple) so we work
+    # with whatever the caller configured on the connection.
+    first = rows[0]
+    try:
+        # sqlite3.Row supports both index and key access.
+        file_path = first["file"]
+    except (KeyError, TypeError, IndexError):
+        try:
+            file_path = first[2]
+        except (IndexError, TypeError):
+            raise RuntimeError(
+                f"unexpected PRAGMA database_list row shape: {first!r}"
+            )
+    file_path = (file_path or "").strip()
+    if not file_path or file_path == ":memory:":
+        raise RuntimeError(
+            "production bar writer path requires a file-backed SQLite "
+            "database; injected connection is :memory: (the shared "
+            "<db>.writer.lock cannot be opened on an in-memory DB). "
+            "Open a temp file-backed DB or call without ``conn=`` so "
+            "settings.sqlite_path is used."
+        )
+    return file_path
 
 
 def backfill_bonds_to_depth(

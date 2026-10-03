@@ -310,7 +310,8 @@ def test_step_backfill_moex_ok(tmp_path):
 
     fake_runner = MagicMock()
 
-    async def _backfill_from_moex():
+    async def _backfill_from_moex(*, recent_tail_days: int):
+        assert recent_tail_days == 5
         conn = sqlite3.connect(db)
         conn.execute("INSERT INTO bars VALUES ('x', '2099-01-01')")
         conn.commit()
@@ -346,7 +347,8 @@ def test_step_backfill_moex_shrinks_on_db_via_runner(tmp_path):
 
     fake_runner = MagicMock()
 
-    async def _backfill_from_moex():
+    async def _backfill_from_moex(*, recent_tail_days: int):
+        assert recent_tail_days == 5
         # Simulate the runner deleting a row.
         conn = sqlite3.connect(db)
         conn.execute("DELETE FROM bars WHERE figi='y'")

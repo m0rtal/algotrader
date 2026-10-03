@@ -114,3 +114,115 @@ def test_hourly_job_retries_transient_sqlite_write_lock(sample_db: Path, tmp_pat
     value = expected(sample_db)
     assert value is not None and value > 0
     assert "success" in log.read_text().lower()
+
+
+def test_hourly_job_preserves_wrapper_local_lockfile(tmp_path: Path) -> None:
+    """The wrapper's local ``${DB}.expected-bars.lock`` is preserved
+    as duplicate-invocation protection; the Python writer
+    separately acquires the canonical ``${DB}.writer.lock``.
+
+    Two simultaneous wrapper invocations on the same database must
+    not run their Python children concurrently: the wrapper-local
+    ``flock`` is the gate. The canonical ``${DB}.writer.lock`` is
+    acquired by the Python child only AFTER the wrapper has
+    dropped into the retry loop, so it can never be held while
+    the wrapper-local lock is still held by an overlapping
+    invocation.
+    """
+    import sys as _sys
+
+    # Use a real schema so the Python child can run end-to-end.
+    from test_populate_expected_bars_lock import (
+        _migrate as _migrate_lock,
+    )
+    # Build a tmp dir with a real migrated DB. Reuse the helper
+    # from the lock-test module so we share the migration logic.
+    db = tmp_path / "state.db"
+    _migrate_lock(db)
+    # Insert at least one instrument so the Python child has
+    # something to update.
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "INSERT INTO instruments "
+            "(ticker, figi, class, name, currency, lot_size, isin, "
+            " source_updated_at) "
+            "VALUES ('AAA', 'FIGI-A', 'share', 'AAA', 'RUB', 1, 'X', "
+            "        '2020-01-02')"
+        )
+        conn.commit()
+    log_a = tmp_path / "a.log"
+    log_b = tmp_path / "b.log"
+
+    env = {**os.environ, "ALGOTRADER_EXPECTED_BARS_PYTHON": _sys.executable}
+    proc_a = subprocess.Popen(
+        ["bash", str(JOB), "--db", str(db), "--log", str(log_a)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    # Give proc_a a moment to acquire the wrapper-local lock.
+    time.sleep(0.3)
+    proc_b = subprocess.run(
+        ["bash", str(JOB), "--db", str(db), "--log", str(log_b)],
+        env=env, text=True, capture_output=True, timeout=30,
+    )
+    stdout_a, stderr_a = proc_a.communicate(timeout=30)
+    # proc_a should succeed (no holder).
+    assert proc_a.returncode == 0, (stdout_a, stderr_a)
+    # proc_b should have been refused by the wrapper-local lock
+    # (the brief: wrapper-local lock is preserved as
+    # duplicate-invocation protection). The wrapper logs
+    # ``ERROR locked: another expected-bars run is active`` and
+    # exits 75.
+    assert proc_b.returncode == 75, (
+        f"second wrapper should exit 75 (overlap refused), got "
+        f"{proc_b.returncode}: {proc_b.stderr!r}"
+    )
+    text_b = log_b.read_text()
+    assert "locked" in text_b.lower(), (
+        f"second wrapper log missing 'locked' marker: {text_b!r}"
+    )
+    # Direct invocation is still protected by the canonical
+    # ${DB}.writer.lock: a Python child invoked against this DB
+    # acquires and releases the canonical lock. We assert by
+    # running a one-shot script that records the lock path.
+    _API_SRC = Path(__file__).resolve().parent.parent / "src"
+    probe_script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(_API_SRC)!r})\n"
+        "from algotrader_api.ingestion.writer_lock import (\n"
+        "    writer_lock, writer_lock_path,\n"
+        ")\n"
+        f"db = {str(db)!r}\n"
+        "paths = []\n"
+        "def _record(p, **kw):\n"
+        "    paths.append(str(writer_lock_path(p)))\n"
+        "    from contextlib import contextmanager\n"
+        "    @contextmanager\n"
+        "    def cm():\n"
+        "        with writer_lock(p, role='expected-bars',\n"
+        "                         phase='expected-bars',\n"
+        "                         timeout_seconds=2.0):\n"
+        "            yield\n"
+        "    return cm()\n"
+        "with _record(Path(db)):\n"
+        "    pass\n"
+        "print(json.dumps({'paths': paths}))\n"
+    )
+    probe = subprocess.run(
+        [_sys.executable, "-c", probe_script],
+        env={"PATH": os.environ["PATH"],
+             "PYTHONPATH": str(_API_SRC),
+             "PYTHONHOME": ""},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert probe.returncode == 0, probe.stderr
+    import json
+    payload = json.loads(probe.stdout.strip())
+    assert payload["paths"] == [f"{db}.writer.lock"], payload
+    # The two lock files are distinct paths.
+    wrapper_lock = Path(f"{db}.expected-bars.lock")
+    canonical_lock = Path(payload["paths"][0])
+    assert wrapper_lock != canonical_lock, (
+        f"wrapper-local lock and canonical lock collide: "
+        f"{wrapper_lock} vs {canonical_lock}"
+    )
