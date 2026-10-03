@@ -5,10 +5,11 @@ Production bug (2026-10-03 worker smoke run):
     ``_async_backfill_impl`` resolved the canonical ``sqlite_path`` and
     forwarded it to ``make_client(sqlite_path=...)`` once per loop
     iteration — but it never called ``aclose()`` on the returned
-    client. Across 74 bond figis (one chain step) the worker leaked
-    74 gRPC channels and their backing HTTP/2 connections; the
-    sandbox's connection-tracking surface maxed out and the daily
-    cycle stalled.
+    client. The code-owned defect is the missing ``aclose`` per
+    iteration: the per-FIGI client lifetime was unbounded. The
+    per-step figi count and downstream effect on the
+    connection-tracking surface were not measured as part of
+    this fix and are not asserted here.
 
 Fix contract (the test file is the spec):
     * Per-FIGI factory client MUST be closed exactly once, AFTER the
@@ -588,4 +589,129 @@ def test_async_backfill_impl_closes_client_before_writer_lock_acquisition(
     )
     assert order_log.index("aclose_start") < order_log.index("writer_lock_enter"), (
         f"aclose must complete BEFORE writer_lock entry; got {order_log!r}"
+    )
+
+
+# ─── secret-safe close diagnostics (review C1) ─────────────────────
+#
+# A close failure must never log the raw exception text. The gRPC
+# stack (Tinkoff SDK + grpc.aio) routinely embeds the bearer token,
+# the SQL path the worker resolved, and HTTP/2 trailer bytes into
+# ``str(exc)`` — the old ``error: str(close_exc)[:200]`` field put
+# every one of those into the structured log. The fix: the only
+# close-exc field that lands in the log is the exception type name
+# (bounded, ASCII, no payload). The synthetic sentinel below mimics
+# what the SDK would carry without including any real credentials.
+
+
+SENTINEL_SECRET_LIKE = "t.fake_TOKEN_no_realsecret_AAA111"  # synthetic, not a real secret
+SENTINEL_CTRL_CHARS = "\x00\x07\x1b[31mRED\x1b[0m"  # control chars / ANSI escapes
+
+
+class SecretLikeCloseFailure(RuntimeError):
+    """Synthetic close failure carrying a sentinel payload.
+
+    The production failure path is an SDK-internal exception
+    (``AioRpcError``, gRPC trailer strings, transport-level
+    ``RuntimeError``) whose ``str()`` may embed the bearer token,
+    the resolved ``sqlite_path``, or HTTP/2 trailer bytes. This
+    fake carries a recognisable synthetic string so the test can
+    assert that the structured log does NOT contain the payload.
+    """
+
+
+def test_async_backfill_impl_close_failure_logs_exception_type_only(
+    tmp_path, monkeypatch, capsys
+):
+    """Close failure must log only ``type(close_exc).__name__`` plus
+    the bounded figi/ticker/client_type fields. The synthetic
+    sentinel payload MUST NOT appear anywhere in the captured
+    stdout (no credential, no control characters, no ANSI escapes).
+    """
+    import io
+    import json as _json
+
+    from algotrader_api.ingestion import backfill
+
+    db_file, con = _make_db(tmp_path)
+    try:
+        _seed_bond(con, figi="BBG000BOND00", bars=0)
+        fake = FakeAsyncTinkoffClient(
+            aclose_fail_with=SecretLikeCloseFailure(
+                f"synthetic boom {SENTINEL_SECRET_LIKE} {SENTINEL_CTRL_CHARS}"
+            ),
+        )
+        _patch_client_factory(monkeypatch, fake)
+        _patch_rate_limit(monkeypatch)
+
+        # Drive a minimal structlog setup so the JSON renderer
+        # produces a structured event on stdout. We point the
+        # PrintLoggerFactory at our own buffer so the test can
+        # read back what the production code emitted.
+        import structlog
+
+        buf = io.StringIO()
+        structlog.configure(
+            processors=[
+                structlog.contextvars.merge_contextvars,
+                structlog.stdlib.add_log_level,
+                structlog.processors.JSONRenderer(),
+            ],
+            wrapper_class=structlog.make_filtering_bound_logger(logging.WARNING),
+            context_class=dict,
+            logger_factory=structlog.PrintLoggerFactory(file=buf),
+            cache_logger_on_first_use=False,
+        )
+
+        asyncio.run(
+            backfill._async_backfill_impl(target_days=30, conn=con),
+        )
+    finally:
+        con.close()
+
+    # Parse the JSON events from the captured buffer.
+    raw = buf.getvalue()
+    events = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(_json.loads(line))
+        except _json.JSONDecodeError:
+            continue
+
+    close_events = [
+        e for e in events
+        if e.get("event") == "bond_depth_client_close_failed"
+    ]
+    assert close_events, (
+        "no 'bond_depth_client_close_failed' event emitted; "
+        f"got events: {[e.get('event') for e in events]!r}\nraw={raw!r}"
+    )
+    record = close_events[-1]
+
+    # The structlog ``extra=`` payload lands under a nested
+    # ``extra`` key when stdlib ``add_log_level`` is the
+    # topmost processor (the test's minimal chain). Production
+    # setup runs the same chain — the field path is the same.
+    payload = record.get("extra", record)
+
+    # The only exception-derived field is the type name — bounded
+    # and free of the payload.
+    assert payload.get("error") == "SecretLikeCloseFailure", (
+        f"error field must equal type(close_exc).__name__; got {payload.get('error')!r}"
+    )
+    # Bounded identifiers only.
+    assert payload.get("figi") == "BBG000BOND00"
+    assert payload.get("ticker") == "BOND00"
+    assert payload.get("client_type") == "FakeAsyncTinkoffClient"
+
+    # The synthetic payload must NOT leak via any field.
+    blob = repr(record)
+    assert SENTINEL_SECRET_LIKE not in blob, (
+        f"synthetic credential-like string leaked into log record: {blob!r}"
+    )
+    assert SENTINEL_CTRL_CHARS not in blob, (
+        f"control characters / ANSI escapes leaked into log record: {blob!r}"
     )

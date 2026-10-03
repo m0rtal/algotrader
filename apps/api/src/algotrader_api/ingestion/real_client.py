@@ -82,6 +82,18 @@ logger = get_logger("algotrader_api.ingestion.real_client")
 # ``request_timeout`` constructor kwarg.
 DEFAULT_REQUEST_TIMEOUT: float = 30.0
 
+# Bounded per-FIGI close timeout (seconds). The per-FIGI
+# ``_async_backfill_impl`` loop awaits ``RealTinkoffClient.aclose``
+# in a ``finally`` block; if the gRPC close handshake hangs
+# (poisoned HTTP/2 connection), the close must not stall the
+# loop indefinitely. The bounded ``asyncio.wait_for`` in
+# ``aclose`` enforces this — the exception surfaces as
+# ``asyncio.TimeoutError`` and the caller's ``except Exception``
+# in ``backfill.py`` logs it. Tune via this constant; tests
+# monkeypatch to a small value to drive a real timeout without
+# sleeping for the production budget.
+BOND_CLIENT_CLOSE_TIMEOUT_SECONDS: float = 5.0
+
 # Retry policy for the Tinkoff SDK call layer on gRPC UNAVAILABLE
 # ("Connection reset by peer", "failed to connect to all addresses").
 # 3 total attempts (1 initial + up to 2 retries) with exponential
@@ -355,7 +367,20 @@ class RealTinkoffClient:
 
     async def aclose(self) -> None:
         if self._client is not None:
-            await self._client.__aexit__(None, None, None)
+            # Bounded close: ``__aexit__`` on a poisoned HTTP/2
+            # connection can hang (observed: >5 min before the
+            # daemon watchdog killed the worker). The bounded
+            # ``asyncio.wait_for`` caps the per-FIGI close at
+            # ``BOND_CLIENT_CLOSE_TIMEOUT_SECONDS`` so a stuck
+            # channel cannot stall the per-FIGI loop. The
+            # timeout surfaces as ``asyncio.TimeoutError`` and
+            # is logged at the caller (``backfill.py``) under
+            # ``bond_depth_client_close_failed`` with the
+            # exception type name.
+            await asyncio.wait_for(
+                self._client.__aexit__(None, None, None),
+                timeout=BOND_CLIENT_CLOSE_TIMEOUT_SECONDS,
+            )
             self._client = None
             self._services = None
 
