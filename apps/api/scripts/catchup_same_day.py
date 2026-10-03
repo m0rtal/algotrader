@@ -57,6 +57,23 @@ from algotrader_api.ingestion.backfill import (  # noqa: E402
     _last_trading_day,
 )
 from algotrader_api.ingestion.no_trade_evidence import fetch_issuer_identity  # noqa: E402
+from algotrader_api.ingestion.writer_lock import WriterLockBusy  # noqa: E402
+
+
+def _format_defer(exc: "WriterLockBusy") -> str:
+    """Render a single bounded ``DEFER writer-lock-busy ...`` line.
+
+    Carries only the safe metadata exposed by
+    :class:`WriterLockBusy` (role, phase, timeout, reason,
+    result). Must not include the database path, figi, ticker,
+    or any secret. Used by the CLI when the shared writer lock
+    acquisition times out inside ``replace_bars_for_figi``.
+    """
+    return (
+        f"DEFER writer-lock-busy role={exc.role} phase={exc.phase} "
+        f"reason={exc.reason} timeout={exc.timeout_seconds:g}s "
+        f"result={exc.result}"
+    )
 
 DEFAULT_DB = "/home/hermes/algotrader/apps/api/data/state.db"
 DEFAULT_CACHE = "/home/hermes/algotrader/apps/api/data/moex_board_cache.json"
@@ -238,6 +255,18 @@ def main() -> int:
                                           replace=False, source="moex")
                     last_err = None
                     break
+                except WriterLockBusy as exc:
+                    # Coordination (Task 5): the shared writer
+                    # lock is acquired INSIDE
+                    # ``replace_bars_for_figi``; when it times
+                    # out the helper raises ``WriterLockBusy``.
+                    # Catch at this CLI boundary and exit 75
+                    # with a bounded DEFER line. Other
+                    # ``WriterLockError`` (invalid role/phase,
+                    # unsafe lock path) is a real failure and
+                    # propagates.
+                    print(_format_defer(exc))
+                    return 75
                 except sqlite3.OperationalError as e:
                     last_err = e
                     time.sleep(5 * (attempt + 1))
