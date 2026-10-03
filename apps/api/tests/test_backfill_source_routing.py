@@ -37,7 +37,7 @@ def runner(tmp_path):
     )
 
 
-def test_auto_routes_long_window_to_moex_year_walker(runner, tmp_path):
+def test_auto_routes_long_window_to_moex_year_walker(runner, tmp_path, monkeypatch):
     """A 5-year window must call _fetch_year_moex for each year, NOT get_candles."""
     # Pre-populate the MOEX metadata cache so `_resolve_source` sees
     # this ticker as MOEX-tradable. Production callers do this via
@@ -102,9 +102,9 @@ def test_auto_routes_long_window_to_moex_year_walker(runner, tmp_path):
     # ``fetch_issuer_identity`` for the figi's expected MOEX ISIN.
     # Stub it to match the seeded ``TEST0000000`` ISIN.
     from algotrader_api.ingestion import no_trade_evidence as _nte
-    _nte.fetch_issuer_identity = lambda ticker: {
+    monkeypatch.setattr(_nte, "fetch_issuer_identity", lambda ticker: {
         "board": "TQBR", "isin": "TEST0000000",
-    }
+    })
 
     # 5-year span: 2021..2026 — should produce 5 MOEX year calls, plus
     # 0 Tinkoff calls (the trailing 9m is empty since MOEX covers it).
@@ -223,7 +223,7 @@ def test_skipped_marker_NOT_set_on_empty_moex_response(runner):
     assert skipped == [], f"MOEX-empty path set skipped marker: {skipped}"
 
 
-def test_moex_year_exception_is_swallowed(runner):
+def test_moex_year_exception_is_swallowed(runner, monkeypatch):
     """A failing `_fetch_year_moex` for one year must not abort the figi.
 
     The MOEX year walker continues to the next year after logging a
@@ -256,9 +256,9 @@ def test_moex_year_exception_is_swallowed(runner):
     con.commit()
     con.close()
     from algotrader_api.ingestion import no_trade_evidence as _nte
-    _nte.fetch_issuer_identity = lambda ticker: {
+    monkeypatch.setattr(_nte, "fetch_issuer_identity", lambda ticker: {
         "board": "TQBR", "isin": "BOOM0000000",
-    }
+    })
 
     def boom_moex(market, board, ticker, year, last_trading_day=None):
         raise ConnectionError("MOEX ISS down")
@@ -322,7 +322,7 @@ def test_prefetch_moex_meta_skips_cached_and_empty_tickers(runner):
     assert runner._moex_meta.get("FRESH") is None
 
 
-def test_walker_partial_outcome_writes_no_evidence_but_keeps_bars(runner):
+def test_walker_partial_outcome_writes_no_evidence_but_keeps_bars(runner, monkeypatch):
     """Partial historical fetch leaves moex_no_trade_evidence
     untouched; the real bar (returned by the partial response) is
     still written to the bars table.
@@ -349,9 +349,9 @@ def test_walker_partial_outcome_writes_no_evidence_but_keeps_bars(runner):
     con.commit()
     con.close()
     from algotrader_api.ingestion import no_trade_evidence as _nte
-    _nte.fetch_issuer_identity = lambda ticker: {
+    monkeypatch.setattr(_nte, "fetch_issuer_identity", lambda ticker: {
         "board": "TQBR", "isin": "RU0007661625",
-    }
+    })
 
     real_partial_row = [{
         "figi": None, "ts": "2024-01-15", "open": 100, "high": 102,
@@ -419,7 +419,7 @@ def test_per_ticker_walker_passes_exact_requested_window(runner, monkeypatch):
         assert con.execute('SELECT COUNT(*) FROM bars').fetchone()[0] == 0
 
 
-def test_walker_complete_outcome_writes_evidence_for_business_dates(runner):
+def test_walker_complete_outcome_writes_evidence_for_business_dates(runner, monkeypatch):
     """Complete historical fetch records zero-trade evidence for the
     business dates in the response, real-bar-wins, and keeps the bar
     write.
@@ -439,9 +439,9 @@ def test_walker_complete_outcome_writes_evidence_for_business_dates(runner):
     con.commit()
     con.close()
     from algotrader_api.ingestion import no_trade_evidence as _nte
-    _nte.fetch_issuer_identity = lambda ticker: {
+    monkeypatch.setattr(_nte, "fetch_issuer_identity", lambda ticker: {
         "board": "TQBR", "isin": "RU0007661625",
-    }
+    })
 
     # 2024-01-15 is a Monday, 2024-01-16 is a Tuesday, 2024-01-13 is a
     # Saturday. All three are zero-trade rows; only the weekdays
@@ -492,7 +492,7 @@ def test_walker_complete_outcome_writes_evidence_for_business_dates(runner):
     ], f"expected Mon+Tue only, got {n_evidence}"
 
 
-def test_walker_evidence_failure_does_not_undo_bars(runner):
+def test_walker_evidence_failure_does_not_undo_bars(runner, monkeypatch):
     """R1: when the evidence helper fails (e.g. ``WriterLockBusy``)
     after the bar write has already committed, the bar write
     MUST NOT be rolled back. The walker swallows the evidence
@@ -515,9 +515,9 @@ def test_walker_evidence_failure_does_not_undo_bars(runner):
     con.commit()
     con.close()
     from algotrader_api.ingestion import no_trade_evidence as _nte
-    _nte.fetch_issuer_identity = lambda ticker: {
+    monkeypatch.setattr(_nte, "fetch_issuer_identity", lambda ticker: {
         "board": "TQBR", "isin": "RU0007661625",
-    }
+    })
 
     # One business date zero-trade row + one real bar. The bar
     # write goes through ``replace_bars_for_figi`` (committed);
@@ -600,7 +600,7 @@ def test_walker_evidence_failure_does_not_undo_bars(runner):
 
 
 def test_public_backfill_from_moex_persists_evidence_for_complete_outcome(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
     """R1: the public ``BackfillRunner.backfill_from_moex(...)``
     walker (not just ``_backfill_one``) MUST drive the historical
@@ -667,48 +667,41 @@ def test_public_backfill_from_moex_persists_evidence_for_complete_outcome(
     async def _noop_discover(self):  # noqa: ARG001
         return 1
 
-    import algotrader_api.ingestion.backfill as _backfill_mod
-    BackfillRunner._fetch_year_moex_outcome = staticmethod(_outcome)
-    BackfillRunner._get_meta_moex = staticmethod(_get_meta)
-    BackfillRunner.prefetch_moex_meta = _noop_self
-    BackfillRunner._discover_universe = _noop_discover
+    monkeypatch.setattr(BackfillRunner, "_fetch_year_moex_outcome", staticmethod(_outcome))
+    monkeypatch.setattr(BackfillRunner, "_get_meta_moex", staticmethod(_get_meta))
+    monkeypatch.setattr(BackfillRunner, "prefetch_moex_meta", _noop_self)
+    monkeypatch.setattr(BackfillRunner, "_discover_universe", _noop_discover)
+    from algotrader_api.ingestion import no_trade_evidence as nte
+    monkeypatch.setattr(nte, "fetch_issuer_identity", lambda ticker: {
+        "board": "TQBR", "isin": isin,
+    })
 
     async def _noop_sink(_ev):
         return None
 
-    try:
-        runner = BackfillRunner(
-            client=MagicMock(), db_path=db_file,
-            event_sink=_noop_sink, run_id=0,
-        )
-        # Drive the real public walker.
-        import asyncio as _asyncio
-        _asyncio.run(
-            runner.backfill_from_moex(today=date(2024, 12, 31)),
-        )
+    runner = BackfillRunner(
+        client=MagicMock(), db_path=db_file,
+        event_sink=_noop_sink, run_id=0,
+    )
+    # Drive the real public walker.
+    import asyncio as _asyncio
+    _asyncio.run(
+        runner.backfill_from_moex(today=date(2024, 12, 31)),
+    )
 
-        con2 = sqlite3.connect(db_file)
-        try:
-            evidence_rows = con2.execute(
-                "SELECT figi, session_date, board, isin "
-                "FROM moex_no_trade_evidence WHERE figi = ? "
-                "ORDER BY session_date",
-                (figi,),
-            ).fetchall()
-        finally:
-            con2.close()
-        assert evidence_rows == [
-            (figi, "2024-01-15", "TQBR", isin),
-        ], (
-            f"public walker must persist 1 evidence row for "
-            f"complete-outcome fetch, got {evidence_rows!r}"
-        )
+    con2 = sqlite3.connect(db_file)
+    try:
+        evidence_rows = con2.execute(
+            "SELECT figi, session_date, board, isin "
+            "FROM moex_no_trade_evidence WHERE figi = ? "
+            "ORDER BY session_date",
+            (figi,),
+        ).fetchall()
     finally:
-        # Restore the class bindings so other tests in the run
-        # are not affected by our monkeypatch.
-        BackfillRunner._fetch_year_moex_outcome = staticmethod(
-            _backfill_mod._fetch_year_moex_outcome,
-        )
-        BackfillRunner._get_meta_moex = staticmethod(
-            _backfill_mod._get_meta_moex,
-        )
+        con2.close()
+    assert evidence_rows == [
+        (figi, "2024-01-15", "TQBR", isin),
+    ], (
+        f"public walker must persist 1 evidence row for "
+        f"complete-outcome fetch, got {evidence_rows!r}"
+    )

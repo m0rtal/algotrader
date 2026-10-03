@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -71,9 +72,12 @@ def test_run_live_mode_runs_cycle_then_sleeps(monkeypatch):
     # Capture every time.sleep call so we can assert on the interval used
     # after a successful cycle.
     sleeps: list[float] = []
+    # Replace worker's reference only: shared time.sleep also serves
+    # migration retries and background tasks in other modules.
     monkeypatch.setattr(
-        worker.time, "sleep", lambda s: sleeps.append(float(s)), raising=False
+        worker, "time", SimpleNamespace(sleep=lambda s: sleeps.append(float(s)))
     )
+    monkeypatch.setattr(worker, "_heartbeat_loop", lambda *args: None)
 
     # Mock the daily chain — return 0 (success) once, then have the loop
     # exit by raising SystemExit on the second call.
@@ -149,9 +153,12 @@ def test_run_live_mode_retries_on_failure_with_backoff(monkeypatch):
     monkeypatch.setattr(worker, "setup_logging", lambda **kw: None, raising=False)
 
     sleeps: list[float] = []
+    # Replace worker's reference only: shared time.sleep also serves
+    # migration retries and background tasks in other modules.
     monkeypatch.setattr(
-        worker.time, "sleep", lambda s: sleeps.append(float(s)), raising=False
+        worker, "time", SimpleNamespace(sleep=lambda s: sleeps.append(float(s)))
     )
+    monkeypatch.setattr(worker, "_heartbeat_loop", lambda *args: None)
 
     # Cycle 1 -> rc=1 (failure), cycle 2 -> rc=0 (success) then SystemExit
     cycle_results = iter([1, 0])
@@ -206,9 +213,8 @@ def test_run_live_mode_writes_pipeline_runs_row(monkeypatch):
     monkeypatch.setattr(worker, "get_settings", lambda: _stub_settings(), raising=False)
     monkeypatch.setattr(worker, "setup_logging", lambda **kw: None, raising=False)
 
-    monkeypatch.setattr(
-        worker.time, "sleep", lambda s: None, raising=False
-    )
+    monkeypatch.setattr(worker, "time", SimpleNamespace(sleep=lambda s: None))
+    monkeypatch.setattr(worker, "_heartbeat_loop", lambda *args: None)
 
     captured: dict = {}
 

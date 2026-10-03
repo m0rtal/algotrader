@@ -19,6 +19,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -80,31 +81,31 @@ def supervisor(tmp_path):
     db_dir.mkdir()
     db_path = db_dir / "state.db"
 
-    # Override STATE_DB / pidfile paths by editing the script? Easier:
-    # spawn the script with env vars that redirect its log + pidfile.
-    # The script hardcodes both, so we use sed to write a copy.
-    src = Path("/home/hermes/algotrader/scripts/algotrader-api-supervisor.sh").read_text()
-    # Patch the log path
-    src = src.replace(
-        'LOG="/home/hermes/.hermes/logs/${NAME}.log"',
-        f'LOG="{log_path}"',
-    )
-    # Patch the pidfile path
-    src = src.replace(
-        'PIDFILE="/home/hermes/algotrader/apps/api/data/${NAME}.pid"',
-        f'PIDFILE="{pidfile}"',
-    )
-    # Patch the health port (via env override already supported)
+    api_root = Path(__file__).resolve().parents[2]
+    repo_root = api_root.parents[1]
+    # Keep startup CWD temporary, so a checkout .env cannot redirect this DB.
+    uvicorn = tmp_path / "uvicorn"
+    uvicorn.write_text(f'#!/bin/bash\nexec "{sys.executable}" -m uvicorn "$@"\n')
+    uvicorn.chmod(0o755)
+    src = (repo_root / "scripts/algotrader-api-supervisor.sh").read_text()
+    replacements = {
+        'LOG="/home/hermes/.hermes/logs/${NAME}.log"': f'LOG="{log_path}"',
+        'PIDFILE="/home/hermes/algotrader/apps/api/data/${NAME}.pid"': f'PIDFILE="{pidfile}"',
+        'APPS_API="/home/hermes/algotrader/apps/api"': f'APPS_API="{tmp_path}"',
+        'UVICORN="${APPS_API}/.venv/bin/uvicorn"': f'UVICORN="{uvicorn}"',
+    }
+    for old, new in replacements.items():
+        assert src.count(old) == 1, f"supervisor fixture substitution missing: {old}"
+        src = src.replace(old, new)
     custom = tmp_path / "supervisor.sh"
     custom.write_text(src)
     custom.chmod(0o755)
 
     env = os.environ.copy()
     env["ALGOTRADER_API_BIND"] = f"127.0.0.1:{port}"
-    # The test fixture creates a fake DB so the api can boot its
-    # health endpoint. The health endpoint queries bars_count, so we
-    # need a real-looking state.db.
-    env_db = db_path  # used by uvicorn via the env var the app reads
+    env["ALGOTRADER_DATA_DIR"] = str(db_dir)
+    env["ALGOTRADER_SQLITE_PATH"] = str(db_path)
+    env["PYTHONPATH"] = os.pathsep.join([str(api_root / "src"), str(api_root), env.get("PYTHONPATH", "")])
 
     proc = subprocess.Popen(
         ["bash", str(custom)],
@@ -118,6 +119,8 @@ def supervisor(tmp_path):
         if not _wait_ready(port, timeout_s=30):
             pytest.fail(f"supervisor /health never came up on port {port}; "
                         f"log:\n{log_path.read_text() if log_path.exists() else '(no log)'}")
+        assert db_path.is_file(), "API startup did not create the fixture DB"
+        assert str(db_path) in log_path.read_text(), "API did not use the fixture DB"
         yield port, log_path, pidfile, proc
     finally:
         # Tear down: kill the whole process group

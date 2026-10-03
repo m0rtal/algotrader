@@ -153,18 +153,41 @@ def test_hourly_job_preserves_wrapper_local_lockfile(tmp_path: Path) -> None:
     log_a = tmp_path / "a.log"
     log_b = tmp_path / "b.log"
 
-    env = {**os.environ, "ALGOTRADER_EXPECTED_BARS_PYTHON": _sys.executable}
+    # Hold the test-owned Python launcher after wrapper flock acquisition.
+    # A readiness marker proves overlap; machine speed cannot finish A first.
+    ready = tmp_path / "child-ready"
+    release = tmp_path / "child-release"
+    launcher = tmp_path / "python-launcher"
+    launcher.write_text(
+        "#!/bin/bash\n"
+        f"touch '{ready}'\n"
+        f"while [[ ! -f '{release}' ]]; do sleep 0.05; done\n"
+        f"exec '{_sys.executable}' \"$@\"\n"
+    )
+    launcher.chmod(0o755)
+    env = {**os.environ, "ALGOTRADER_EXPECTED_BARS_PYTHON": str(launcher)}
     proc_a = subprocess.Popen(
         ["bash", str(JOB), "--db", str(db), "--log", str(log_a)],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    # Give proc_a a moment to acquire the wrapper-local lock.
-    time.sleep(0.3)
-    proc_b = subprocess.run(
-        ["bash", str(JOB), "--db", str(db), "--log", str(log_b)],
-        env=env, text=True, capture_output=True, timeout=30,
-    )
-    stdout_a, stderr_a = proc_a.communicate(timeout=30)
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists():
+            assert proc_a.poll() is None, "first wrapper exited before child readiness"
+            assert time.monotonic() < deadline, "first wrapper never reached child"
+            time.sleep(0.05)
+        proc_b = subprocess.run(
+            ["bash", str(JOB), "--db", str(db), "--log", str(log_b)],
+            env=env, text=True, capture_output=True, timeout=10,
+        )
+    finally:
+        release.touch()
+        try:
+            stdout_a, stderr_a = proc_a.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc_a.kill()
+            proc_a.communicate(timeout=5)
+            raise
     # proc_a should succeed (no holder).
     assert proc_a.returncode == 0, (stdout_a, stderr_a)
     # proc_b should have been refused by the wrapper-local lock
