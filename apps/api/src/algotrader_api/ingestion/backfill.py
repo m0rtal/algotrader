@@ -2660,7 +2660,15 @@ async def _async_backfill_impl(
 
             # Use the existing Tinkoff client (production target)
             from algotrader_api.ingestion.client import make_client
-            client = make_client()
+            # Forward the already-resolved file-backed ``sqlite_path``
+            # so the token lookup uses the same app-local DB the
+            # writer path uses. Without this, ``make_client`` falls
+            # back to ``ALGOTRADER_SQLITE_PATH`` which the worker
+            # process never exports — production smoke run on
+            # 2026-10-03 logged ``tinkoff.token.sqlite_path_unset``
+            # and the bonds_depth step returned processed=74,
+            # errors=0, bars_added=0.
+            client = make_client(sqlite_path=sqlite_path)
             # ADAPT-4: was a sync rl.acquire() call that silently bypassed
             # the AsyncLimiter. Now properly awaited in async context so
             # Tinkoff's 600 req/min cap is honored on bonds backfill.
