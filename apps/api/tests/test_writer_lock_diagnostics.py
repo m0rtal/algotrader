@@ -173,6 +173,112 @@ def test_format_busy_defer_redacts_userinfo(tmp_path):
     assert "[REDACTED]" in line
 
 
+# -------------------------------------------------------------------
+# RED (Task 5): generic userinfo leak — must redact arbitrary
+# 'username:password@host' syntax (parent reproduced this exact
+# reproduction: 'alice:SYNTHETIC_SECRET@host/db' leaked the secret).
+# -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, secret_substring",
+    [
+        # Different username & password — the literal 'user:pass@'
+        # sentinel must NOT be the only thing caught.
+        ("alice:SYNTHETIC_SECRET@host/db", "SYNTHETIC_SECRET"),
+        ("bob:hunter2@db.example.com/db", "hunter2"),
+        # Long prefix pushes the unsafe marker beyond _MAX_FIELD (200).
+        # Sanitize() truncates to 200 chars BEFORE the marker, so a
+        # naive sanitize-then-test order silently passes. The fix must
+        # inspect the raw value first.
+        ("/" + "a" * 300 + "alice:SYNTHETIC_SECRET@host/db",
+         "SYNTHETIC_SECRET"),
+        # Connection-string 'key=value;' syntax — also unsafe.
+        ("Server=db.example.com;User Id=alice;Password=SYNTHETIC_SECRET;"
+         "Database=mydb", "SYNTHETIC_SECRET"),
+        # Generic username:password@host with digits in password.
+        ("svc_user:pa55w0rd@db.internal:5432/prod",
+         "pa55w0rd"),
+    ],
+)
+def test_format_busy_defer_redacts_generic_userinfo(
+    tmp_path, value, secret_substring
+):
+    """Any ``user:password@host`` / ``key=value`` / URL-style marker
+    must redact — not just the literal ``user:pass@`` substring or
+    a value that fits inside the first 200 chars. Parent reproduced
+    ``alice:SYNTHETIC_SECRET@host/db`` leaking the secret verbatim;
+    the fix must catch the general userinfo pattern, including an
+    unsafe marker placed past char 200 in the input.
+    """
+    lock = str((tmp_path / "real.db.writer.lock").resolve())
+    exc = _busy(value, lock)
+    line = format_busy_defer(exc)
+    # The exact secret fragment must never appear in the rendered
+    # diagnostic, no matter where the unsafe marker sits in the
+    # input.
+    assert secret_substring not in line, (
+        f"redaction failed for {value!r}: {line!r}"
+    )
+    # And the value must have been replaced wholesale with the
+    # redaction sentinel — not partially leaked.
+    assert "database_path=[REDACTED]" in line
+    assert "alice" not in line
+    assert "bob" not in line
+    assert "svc_user" not in line
+
+
+def test_format_busy_defer_inspects_raw_before_sanitize(tmp_path):
+    """An unsafe marker placed AFTER char 200 must still redact.
+
+    ``_sanitize`` truncates to ``_MAX_FIELD`` (200 chars). If the
+    formatter sanitizes first and then checks for unsafe markers, a
+    marker placed at char 300 is silently dropped on the floor and
+    the upstream 200 chars leak. The fix must inspect the raw
+    ``database_path`` / ``lock_path`` BEFORE truncation/control
+    sanitization; control chars may still be sanitized as the
+    existing bounded test expects.
+    """
+    # Build a long prefix that contains no unsafe markers; the
+    # unsafe marker sits well past char 200.
+    prefix_safe = "/" + "x" * 300
+    db = prefix_safe + "alice:SYNTHETIC_SECRET@host/db"
+    lock = str((tmp_path / "real.db.writer.lock").resolve())
+    exc = _busy(db, lock)
+    line = format_busy_defer(exc)
+    assert "SYNTHETIC_SECRET" not in line, (
+        f"unsafe marker past char 200 leaked: {line!r}"
+    )
+    assert "database_path=[REDACTED]" in line
+
+
+def test_format_busy_defer_preserves_safe_paths_after_fix(tmp_path):
+    """Genuine absolute local filesystem paths must remain
+    untouched (after sanitize). The fix cannot be so aggressive
+    that an operator loses the ability to tell which DB contended.
+    """
+    db = str((tmp_path / "real_state.db").resolve())
+    lock = str((tmp_path / "real_state.db.writer.lock").resolve())
+    exc = _busy(db, lock)
+    line = format_busy_defer(exc)
+    assert f"database_path={db}" in line
+    assert f"lock_path={lock}" in line
+    assert "[REDACTED]" not in line
+
+
+def test_format_busy_defer_eight_fields_still_single_line(tmp_path):
+    """The fix cannot regress the 8-field single-line contract."""
+    db = str(tmp_path / "x.db")
+    lock = str(tmp_path / "x.db.writer.lock")
+    exc = _busy(db, lock)
+    line = format_busy_defer(exc)
+    assert "\n" not in line
+    assert line.startswith("DEFER writer-lock-busy ")
+    for k in ("role", "phase", "pid", "database_path",
+              "lock_path", "timeout", "reason", "result"):
+        assert f"{k}=" in line, f"field {k!r} missing: {line!r}"
+
+
 def test_format_busy_defer_redacts_query_string(tmp_path):
     """A path carrying a '?' query string is redacted.
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 import fcntl
 import math
 import os
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -108,6 +109,21 @@ class WriterLockBusy(WriterLockError):
         self.reason = _sanitize(reason)
         self.result = _sanitize(result)
         self.pid = os.getpid()
+        # Preserve the RAW (un-truncated) database_path / lock_path
+        # so the formatter can detect an unsafe marker placed past
+        # ``_MAX_FIELD`` (200 chars). The truncated public attributes
+        # remain the source of truth for any direct read of
+        # ``busy.database_path`` / ``busy.lock_path``; the formatter
+        # is the only consumer of the raw values, and it applies
+        # the bounded redaction rule before rendering.
+        self._raw_database_path = (
+            database_path if isinstance(database_path, str)
+            else str(database_path)
+        )
+        self._raw_lock_path = (
+            lock_path if isinstance(lock_path, str)
+            else str(lock_path)
+        )
         super().__init__(
             f"writer lock busy: role={self.role} phase={self.phase} "
             f"reason={self.reason}"
@@ -385,20 +401,51 @@ def _sanitize(value: str) -> str:
 # exception themselves.
 
 _REDACTED = "[REDACTED]"
-# Markers that are not filesystem-path syntax. Any path carrying
-# one is replaced wholesale with ``[REDACTED]`` — we cannot tell a
-# real path from a credential string by filename alone, so the
-# safe default for non-filesystem values is full redaction.
-_UNSAFE_PATH_MARKERS = ("://", "user:pass@", "?")  # query string
+# Unsafe-marker detectors applied to the RAW (un-truncated, un-sanitized)
+# value of ``database_path`` / ``lock_path``. A genuine absolute local
+# filesystem path (``/tmp/foo.db``, ``/home/x/state.db.writer.lock``)
+# never carries any of these; on a hit we treat the value as a
+# credential-bearing string and redact it wholesale. We cannot tell a
+# real path from a connection string by filename alone, so the safe
+# default for any non-filesystem value is full redaction.
+#
+# Order matters only for readability; all three are checked.
+_UNSAFE_PATH_MARKERS = (
+    # URI scheme separator — anything that looks like ``scheme://``.
+    "://",
+    # Query string marker.
+    "?",
+)
+# Generic userinfo / connection-string syntax. Applied as a regex
+# against the raw input so an attacker placing the marker past the
+# first 200 chars cannot bypass truncation. The literal
+# ``user:pass@`` substring was too narrow: ``alice:secret@host/db``
+# is the same shape with a different username/password.
+_UNSAFE_PATH_REGEXES = (
+    # ``username:password@host`` URI userinfo — letters/digits/
+    # underscore in user and password, host follows.
+    re.compile(r"[\w.+-]+:[\w.+-]+@"),
+    # Connection-string ``key=value`` separator — catches
+    # ``Server=...;User Id=...;Password=...;Database=...`` shapes.
+    # Only flagged when ``=`` appears more than once; a single ``=``
+    # is too common in absolute paths (none in practice on Linux,
+    # but cheap to over-trigger for safety).
+    re.compile(r"[\w\s]+=[\w./:+\-]+;.*="),
+)
 
 
 def _is_unsafe_path(value: str) -> bool:
     """Return True for connection-string / URL / userinfo / query
-    markers. Real canonical ``/tmp/...`` style paths never carry
-    ``://`` or ``user:pass@`` or ``?``; on any of these we treat
-    the value as a credential leak and redact it.
+    markers. Inspects the raw (un-truncated, un-sanitized) value so
+    an unsafe marker placed past char 200 still triggers redaction.
+
+    Real canonical ``/tmp/...`` style paths never carry ``://``,
+    ``?``, ``user:password@``, or ``key=value;key=value``; on any
+    of these we treat the value as a credential leak and redact.
     """
-    return any(marker in value for marker in _UNSAFE_PATH_MARKERS)
+    if any(marker in value for marker in _UNSAFE_PATH_MARKERS):
+        return True
+    return any(rx.search(value) for rx in _UNSAFE_PATH_REGEXES)
 
 
 def format_busy_defer(exc: "WriterLockBusy") -> str:
@@ -412,12 +459,20 @@ def format_busy_defer(exc: "WriterLockBusy") -> str:
     sanitized (control characters stripped, length bounded) so
     the line is safe to print to a terminal or capture in a log.
     """
-    db = _sanitize(exc.database_path)
-    lock = _sanitize(exc.lock_path)
-    if _is_unsafe_path(db):
-        db = _REDACTED
-    if _is_unsafe_path(lock):
-        lock = _REDACTED
+    # Inspect the RAW value BEFORE sanitization. ``_sanitize``
+    # truncates to ``_MAX_FIELD`` (200 chars); if we sanitized
+    # first, an unsafe marker placed past char 200 would silently
+    # slip through and the upstream prefix would leak. Control
+    # characters are still sanitized after the unsafe check so the
+    # existing bounded-control test continues to pass. The raw
+    # values are stashed on the exception at construction time so
+    # we can detect markers past the 200-char truncation point
+    # without changing the public ``database_path`` / ``lock_path``
+    # contract (those remain the sanitized forms).
+    raw_db = getattr(exc, "_raw_database_path", exc.database_path)
+    raw_lock = getattr(exc, "_raw_lock_path", exc.lock_path)
+    db = _REDACTED if _is_unsafe_path(raw_db) else _sanitize(exc.database_path)
+    lock = _REDACTED if _is_unsafe_path(raw_lock) else _sanitize(exc.lock_path)
     return (
         f"DEFER writer-lock-busy role={_sanitize(exc.role)} "
         f"phase={_sanitize(exc.phase)} pid={int(exc.pid)} "
