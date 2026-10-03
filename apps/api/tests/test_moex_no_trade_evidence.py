@@ -1844,3 +1844,265 @@ def test_fetch_year_moex_outcome_emits_raw_columns_per_dict():
     assert outcome == "complete"
     assert rows[0]["_secid"] == "GAZP"
     assert rows[0]["_numtrades"] == 0
+
+
+# -- record_historical_no_trade_evidence (Task 2) -------------------------
+
+
+def test_record_historical_no_trade_evidence_rejects_partial(tmp_path):
+    """Partial outcome short-circuits and writes nothing."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
+    ]
+    written = record_historical_no_trade_evidence(
+        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU000GAZP",
+        outcome="partial",
+    )
+    assert written == 0
+    n = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence"
+    ).fetchone()[0]
+    assert n == 0
+
+
+def test_record_historical_no_trade_evidence_rejects_error(tmp_path):
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    written = record_historical_no_trade_evidence(
+        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=[{"ts": "2025-09-29"}], board="TQBR", isin="RU",
+        outcome="error",
+    )
+    assert written == 0
+
+
+def test_record_historical_no_trade_evidence_rejects_malformed(tmp_path):
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    written = record_historical_no_trade_evidence(
+        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=[{"ts": "2025-09-29"}], board="TQBR", isin="RU",
+        outcome="malformed",
+    )
+    assert written == 0
+
+
+def test_record_historical_no_trade_evidence_rejects_identity_mismatch(tmp_path):
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    rows = [{"ts": "2025-09-29", "_secid": "SBER", "_boardid": "TQBR"}]
+    written = record_historical_no_trade_evidence(
+        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU",
+        outcome="identity_mismatch",
+    )
+    assert written == 0
+
+
+def test_is_business_date_for_evidence_weekday_not_holiday(tmp_path):
+    """A plain weekday with no holiday row is a business date."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        _is_business_date_for_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    # 2025-09-29 is a Monday.
+    assert _is_business_date_for_evidence(
+        con, "2025-09-29",
+    )
+
+
+def test_is_business_date_for_evidence_saturday_is_not(tmp_path):
+    """2025-09-27 is a Saturday."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        _is_business_date_for_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    assert not _is_business_date_for_evidence(
+        con, "2025-09-27",
+    )
+
+
+def test_is_business_date_for_evidence_holiday_is_not(tmp_path):
+    """A weekday that is in moex_holidays is not a business date."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        _is_business_date_for_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    con.execute(
+        "INSERT INTO moex_holidays(date, name) VALUES ('2025-09-29', 'X')"
+    )
+    con.commit()
+    assert not _is_business_date_for_evidence(
+        con, "2025-09-29",
+    )
+
+
+def test_is_business_date_for_evidence_malformed_ts_is_not(tmp_path):
+    from algotrader_api.ingestion.no_trade_evidence import (
+        _is_business_date_for_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    assert not _is_business_date_for_evidence(con, "garbage")
+    assert not _is_business_date_for_evidence(con, "")
+    assert not _is_business_date_for_evidence(con, "2025-9-29")
+
+
+def test_record_historical_no_trade_evidence_complete_filters_non_business(
+    tmp_path,
+):
+    """Complete outcome + mixed business / non-business rows -> only
+    business-date rows are persisted."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    con.execute(
+        "INSERT INTO moex_holidays(date, name) VALUES ('2025-09-29', 'X')"
+    )
+    con.commit()
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},  # holiday
+        {"ts": "2025-09-27", "_secid": "GAZP", "_boardid": "TQBR"},  # Sat
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR"},  # Tue ok
+        {"ts": "garbage",   "_secid": "GAZP", "_boardid": "TQBR"},  # bad
+    ]
+    written = record_historical_no_trade_evidence(
+        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU",
+        outcome="complete",
+    )
+    assert written == 1
+    rows_db = con.execute(
+        "SELECT session_date FROM moex_no_trade_evidence WHERE figi='FIGI1'"
+    ).fetchall()
+    assert [r["session_date"] for r in rows_db] == ["2025-09-30"]
+
+
+def test_record_historical_no_trade_evidence_complete_keeps_ttl_semantics(
+    tmp_path,
+):
+    """Recent row gets 7-day expiry, historical row gets 365-day
+    expiry."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        RECENT_EVIDENCE_EXPIRY,
+        HISTORICAL_EVIDENCE_EXPIRY,
+        record_historical_no_trade_evidence,
+    )
+    import datetime as _dt
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    today = _dt.date(2026, 9, 30)
+    # 2026-09-25 is a Friday (recent), 2026-08-03 is a Monday (historical).
+    # Brief fixture 2026-08-01 was a Saturday — helper correctly rejects
+    # non-business dates per the ADDED Requirement; replace with a
+    # business-date sibling that still spans the recent/historical
+    # TTL cut-off (14 days from `today`).
+    rows = [
+        {"ts": "2026-09-25", "_secid": "GAZP", "_boardid": "TQBR"},
+        {"ts": "2026-08-03", "_secid": "GAZP", "_boardid": "TQBR"},
+    ]
+    record_historical_no_trade_evidence(
+        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU",
+        outcome="complete", today=today,
+    )
+    recent = con.execute(
+        "SELECT expires_at FROM moex_no_trade_evidence "
+        "WHERE session_date = '2026-09-25'"
+    ).fetchone()[0]
+    historical = con.execute(
+        "SELECT expires_at FROM moex_no_trade_evidence "
+        "WHERE session_date = '2026-08-03'"
+    ).fetchone()[0]
+    assert recent == (today + RECENT_EVIDENCE_EXPIRY).isoformat()
+    assert historical == (today + HISTORICAL_EVIDENCE_EXPIRY).isoformat()
+
+
+def test_record_historical_no_trade_evidence_complete_respects_real_bar(
+    tmp_path,
+):
+    """A real bar for the same date suppresses the evidence row."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    _insert_bar(con, "FIGI1", "2025-09-30", close=100)
+    rows = [
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR"},
+    ]
+    written = record_historical_no_trade_evidence(
+        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU",
+        outcome="complete",
+    )
+    assert written == 0
+    n = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence"
+    ).fetchone()[0]
+    assert n == 0
+
+
+def test_record_historical_no_trade_evidence_uses_explicit_ticker_not_rows_zero(
+    tmp_path,
+):
+    """The helper MUST use the explicit ``ticker`` argument, not
+    ``rows[0].get("_secid")``. A batch whose first row is a mirror
+    SECID and whose every other row matches the caller's ticker is
+    rejected — the helper is end-to-end, not zero-trust."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    rows = [
+        # First row is a mirror (would mislead a "guess from rows[0]"
+        # implementation). Every other row is identity-correct.
+        {"ts": "2025-09-29", "_secid": "SBER", "_boardid": "TQBR"},
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR"},
+    ]
+    written = record_historical_no_trade_evidence(
+        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU",
+        outcome="complete",
+    )
+    # The SBER row is dropped (it does not match the caller's ticker),
+    # but the GAZP row is persisted.
+    assert written == 1
+    rows_db = con.execute(
+        "SELECT session_date FROM moex_no_trade_evidence "
+        "WHERE figi='FIGI1' ORDER BY session_date"
+    ).fetchall()
+    assert [r["session_date"] for r in rows_db] == ["2025-09-30"]

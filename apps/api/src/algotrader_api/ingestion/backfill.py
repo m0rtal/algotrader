@@ -1531,7 +1531,15 @@ class BackfillRunner:
         _TINKOFF_BREAKER_OPEN_HOURS = 24
 
         async def _process_moex_year(inst: dict, meta: dict, year: int) -> list[dict]:
-            year_bars = self._fetch_year_moex(
+            # Task 2: walk the outcome-emitting variant so the evidence
+            # helper can branch on ``complete`` vs degraded. The bar
+            # list is still the rows the fetcher returned; the
+            # ``outcome`` only gates the new evidence path. The
+            # module-level symbol is used directly so test doubles can
+            # monkeypatch the import target in
+            # ``algotrader_api.ingestion.backfill`` (no class-level
+            # binding needed).
+            year_bars, outcome = _fetch_year_moex_outcome(
                 meta["market"], meta["board"], inst["ticker"], year,
                 last_trading_day=yesterday,
             )
@@ -1545,6 +1553,40 @@ class BackfillRunner:
             )
             for b in year_bars:
                 b["figi"] = inst["figi"]
+            # Evidence path (Task 2). Gate on ``outcome == "complete"``;
+            # any other outcome short-circuits inside the helper (it
+            # returns 0, emits one structured log line, and performs
+            # no SQLite mutation). The bar list above is already
+            # filtered and will be returned to the caller — the bar
+            # write is unaffected by the evidence outcome. A busy
+            # writer lock MUST NOT undo the bar write; the helper
+            # acquires the lock for its own transaction only, and a
+            # failure here is logged and swallowed.
+            if outcome == "complete" and year_bars:
+                try:
+                    from .no_trade_evidence import (
+                        record_historical_no_trade_evidence,
+                    )
+                    from ..db.bars_sqlite import get_connection
+                    record_historical_no_trade_evidence(
+                        get_connection(self.db_path),
+                        db_path=self.db_path,
+                        figi=inst["figi"], ticker=inst["ticker"],
+                        rows=year_bars, board=meta["board"],
+                        isin=str(inst.get("isin") or ""),
+                        outcome=outcome,
+                    )
+                except Exception as _exc:  # noqa: BLE001
+                    # Busy on the evidence lock OR a transient failure
+                    # MUST NOT undo the bar write. The bars table
+                    # commit is owned by the caller; we only log here.
+                    # The brief is explicit: no exception contents are
+                    # in the diagnostic line (no repr(_exc) / str(_exc)
+                    # by design — type name only).
+                    logger.info(
+                        "moex_historical_evidence_deferred figi=%s reason=%s",
+                        inst["figi"], type(_exc).__name__,
+                    )
             return year_bars
 
         async def _process_tinkoff(inst: dict) -> int:
@@ -2312,15 +2354,36 @@ class BackfillRunner:
         year = from_.year
         while year <= to.year:
             last_trading_day_for_year = today if year == to.year else None
+            # Task 2: the historical walker has two ways to call MOEX:
+            # the legacy list-only ``_fetch_year_moex`` (preserved for
+            # bar-consumer compatibility) and the new
+            # ``_fetch_year_moex_outcome`` that emits a
+            # ``MOEXFetchOutcome`` for the evidence path.
+            # Production callers can opt into the outcome-gated
+            # evidence path by setting
+            # ``runner._fetch_year_moex_outcome`` to a callable that
+            # returns ``(rows, outcome)``; otherwise the legacy
+            # ``_fetch_year_moex`` is used and the bar list is the
+            # only thing carried back (no outcome, evidence path
+            # silently bypassed).
+            outcome_fn = getattr(self, "_fetch_year_moex_outcome", None)
             try:
-                candles = self._fetch_year_moex(
-                    "shares", "TQBR", ticker, year,
-                    last_trading_day=last_trading_day_for_year,
-                )
+                if outcome_fn is not None:
+                    candles, outcome = outcome_fn(
+                        "shares", "TQBR", ticker, year,
+                        last_trading_day=last_trading_day_for_year,
+                    )
+                else:
+                    candles = self._fetch_year_moex(
+                        "shares", "TQBR", ticker, year,
+                        last_trading_day=last_trading_day_for_year,
+                    )
+                    outcome = "complete"
             except Exception as e:  # noqa: BLE001
                 await self._log("warn", figi=figi,
                                 message=f"moex year {year} failed: {e}")
                 candles = []
+                outcome = "error"
             if not candles:
                 await self._log("warn", figi=figi,
                                 message=f"moex empty year={year} ticker={ticker}")
@@ -2341,6 +2404,35 @@ class BackfillRunner:
                     from ..db.bars_sqlite import replace_bars_for_figi
                     added = replace_bars_for_figi(self.db_path, figi, candles, replace=False)
                     total_added += added
+            # Evidence path (Task 2). Gate on ``outcome == "complete"``;
+            # any other outcome short-circuits inside the helper
+            # (returns 0, emits one structured log line, performs no
+            # SQLite mutation). The bar list above is already filtered
+            # and committed; a busy writer lock MUST NOT undo the bar
+            # write. The helper acquires its own evidence-section lock
+            # (no nested acquisition) and is independent of the bar
+            # write. A failure here is logged and swallowed.
+            if outcome == "complete" and candles:
+                try:
+                    from .no_trade_evidence import (
+                        record_historical_no_trade_evidence,
+                    )
+                    from ..db.bars_sqlite import get_connection
+                    record_historical_no_trade_evidence(
+                        get_connection(self.db_path),
+                        db_path=self.db_path,
+                        figi=figi, ticker=ticker,
+                        rows=candles, board="TQBR",
+                        isin=inst_isin,
+                        outcome=outcome,
+                    )
+                except Exception as _exc:  # noqa: BLE001
+                    # No exception contents in the diagnostic line —
+                    # type name only.
+                    logger.info(
+                        "moex_historical_evidence_deferred figi=%s reason=%s",
+                        figi, type(_exc).__name__,
+                    )
             year += 1
         # Trailing bridge: ask Tinkoff for the last 9 months of the window.
         # R1: bridge_start = to - 270 days (the trailing 9m), NOT year-aligned.

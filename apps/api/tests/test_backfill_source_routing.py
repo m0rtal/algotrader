@@ -270,3 +270,149 @@ def test_prefetch_moex_meta_skips_cached_and_empty_tickers(runner):
     asyncio.run(runner.prefetch_moex_meta(instruments))
     assert call_count["n"] == 1, f"only FRESH should be probed; calls={call_count}"
     assert runner._moex_meta.get("FRESH") is None
+
+
+def test_walker_partial_outcome_writes_no_evidence_but_keeps_bars(runner):
+    """Partial historical fetch leaves moex_no_trade_evidence
+    untouched; the real bar (returned by the partial response) is
+    still written to the bars table.
+
+    The bar consumer sees a real-looking 1-page row for 2024-01-15,
+    but the page reports ``total=2`` while only 1 row is returned
+    → outcome ``partial``. The bar consumer writes the row it has;
+    the evidence helper sees ``partial`` and short-circuits.
+    """
+    # Pre-cache MOEX meta so ``_resolve_source`` routes to MOEX.
+    runner._moex_meta["GAZP"] = {
+        "market": "shares", "board": "TQBR",
+        "listed_from": date(2024, 1, 1),
+        "isin": "RU0007661625",
+    }
+    # Seed the instrument with a matching ISIN.
+    import sqlite3
+    con = sqlite3.connect(runner.db_path)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin) "
+        "VALUES ('GAZP', '00000000-0000-0000-0000-000000000999', "
+        "'share', 'Gazp', 'rub', 10, 'RU0007661625')"
+    )
+    con.commit()
+    con.close()
+    from algotrader_api.ingestion import no_trade_evidence as _nte
+    _nte.fetch_issuer_identity = lambda ticker: {
+        "board": "TQBR", "isin": "RU0007661625",
+    }
+
+    real_partial_row = [{
+        "figi": None, "ts": "2024-01-15", "open": 100, "high": 102,
+        "low": 99, "close": 101, "volume": 1000, "source": "moex",
+        "_secid": "GAZP", "_boardid": "TQBR",
+        "_numtrades": 5, "_value": 100000,
+    }]
+
+    def partial_outcome(market, board, ticker, year,
+                        last_trading_day=None):  # noqa: ARG001
+        return (real_partial_row, "partial")
+
+    runner._fetch_year_moex_outcome = partial_outcome
+    # Stub Tinkoff so the trailing 9m bridge is a no-op.
+    from unittest.mock import AsyncMock
+    runner.client.get_candles = AsyncMock(return_value=[])
+
+    import asyncio
+    asyncio.run(runner._backfill_one(
+        figi="00000000-0000-0000-0000-000000000999",
+        ticker="GAZP",
+        from_=date(2024, 1, 1),
+        to=date(2024, 12, 31),
+        source="moex",
+    ))
+
+    con = sqlite3.connect(runner.db_path)
+    n_bars = con.execute(
+        "SELECT COUNT(*) FROM bars "
+        "WHERE figi='00000000-0000-0000-0000-000000000999' "
+        "AND ts='2024-01-15'"
+    ).fetchone()[0]
+    n_evidence = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence "
+        "WHERE figi='00000000-0000-0000-0000-000000000999'"
+    ).fetchone()[0]
+    con.close()
+    assert n_bars == 1, f"partial bar must still be written, got {n_bars}"
+    assert n_evidence == 0, (
+        f"partial outcome must NOT record evidence, got {n_evidence}"
+    )
+
+
+def test_walker_complete_outcome_writes_evidence_for_business_dates(runner):
+    """Complete historical fetch records zero-trade evidence for the
+    business dates in the response, real-bar-wins, and keeps the bar
+    write.
+    """
+    runner._moex_meta["GAZP"] = {
+        "market": "shares", "board": "TQBR",
+        "listed_from": date(2024, 1, 1),
+        "isin": "RU0007661625",
+    }
+    import sqlite3
+    con = sqlite3.connect(runner.db_path)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin) "
+        "VALUES ('GAZP', '00000000-0000-0000-0000-000000000998', "
+        "'share', 'Gazp', 'rub', 10, 'RU0007661625')"
+    )
+    con.commit()
+    con.close()
+    from algotrader_api.ingestion import no_trade_evidence as _nte
+    _nte.fetch_issuer_identity = lambda ticker: {
+        "board": "TQBR", "isin": "RU0007661625",
+    }
+
+    # 2024-01-15 is a Monday, 2024-01-16 is a Tuesday, 2024-01-13 is a
+    # Saturday. All three are zero-trade rows; only the weekdays
+    # pass the business-date filter.
+    zero_rows = [
+        {"figi": None, "ts": "2024-01-13", "open": None, "high": None,
+         "low": None, "close": None, "volume": 0, "source": "moex",
+         "_secid": "GAZP", "_boardid": "TQBR",
+         "_numtrades": 0, "_value": 0},
+        {"figi": None, "ts": "2024-01-15", "open": None, "high": None,
+         "low": None, "close": None, "volume": 0, "source": "moex",
+         "_secid": "GAZP", "_boardid": "TQBR",
+         "_numtrades": 0, "_value": 0},
+        {"figi": None, "ts": "2024-01-16", "open": None, "high": None,
+         "low": None, "close": None, "volume": 0, "source": "moex",
+         "_secid": "GAZP", "_boardid": "TQBR",
+         "_numtrades": 0, "_value": 0},
+    ]
+
+    def complete_outcome(market, board, ticker, year,
+                         last_trading_day=None):  # noqa: ARG001
+        return (list(zero_rows), "complete")
+
+    runner._fetch_year_moex_outcome = complete_outcome
+    from unittest.mock import AsyncMock
+    runner.client.get_candles = AsyncMock(return_value=[])
+
+    import asyncio
+    asyncio.run(runner._backfill_one(
+        figi="00000000-0000-0000-0000-000000000998",
+        ticker="GAZP",
+        from_=date(2024, 1, 1),
+        to=date(2024, 12, 31),
+        source="moex",
+    ))
+
+    con = sqlite3.connect(runner.db_path)
+    con.row_factory = sqlite3.Row
+    n_evidence = con.execute(
+        "SELECT session_date FROM moex_no_trade_evidence "
+        "WHERE figi='00000000-0000-0000-0000-000000000998' "
+        "ORDER BY session_date"
+    ).fetchall()
+    con.close()
+    # Two business dates (Mon + Tue), no Saturday.
+    assert [r["session_date"] for r in n_evidence] == [
+        "2024-01-15", "2024-01-16",
+    ], f"expected Mon+Tue only, got {n_evidence}"

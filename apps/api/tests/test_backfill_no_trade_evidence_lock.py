@@ -422,20 +422,20 @@ def test_cli_listed_till_uses_separate_lock_from_evidence(tmp_path, monkeypatch)
     monkeypatch.setattr(
         mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
     )
-    # Patch _fetch_moex_range to return a single zero-trade row so
-    # the evidence write path is exercised. The downstream
-    # ``record_no_trade_evidence`` then acquires the second
-    # ``no-trade-evidence / evidence`` lock.
-    def _fake_fetch(market, board, ticker, lo, hi, last_trading_day=None):  # noqa: ARG001
-        return [{
+    # Patch _fetch_year_moex_outcome (Task 2) to return a single
+    # zero-trade row so the evidence write path is exercised. The
+    # downstream ``record_historical_no_trade_evidence`` then
+    # acquires the second ``no-trade-evidence / evidence`` lock.
+    def _fake_fetch(market, board, ticker, year, last_trading_day=None):  # noqa: ARG001
+        return ([{
             "ts": "2026-09-08",
             "open": None, "high": None, "low": None, "close": None,
             "volume": 0,
             "_secid": ticker, "_boardid": board,
             "_numtrades": 0, "_value": 0,
             "figi": None, "source": "moex",
-        }]
-    monkeypatch.setattr(mod, "_fetch_moex_range", _fake_fetch)
+        }], "complete")
+    monkeypatch.setattr(mod, "_fetch_year_moex_outcome", _fake_fetch)
 
     # Patch time.sleep inside the loaded CLI module so we can detect
     # whether the lock is held during the sleep.
@@ -518,7 +518,7 @@ def test_cli_busy_exits_75_and_emits_one_defer_line(tmp_path, monkeypatch):
     monkeypatch.setattr(
         mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
     )
-    monkeypatch.setattr(mod, "_fetch_moex_range", lambda *a, **kw: [])
+    monkeypatch.setattr(mod, "_fetch_year_moex_outcome", lambda *a, **kw: ([], "complete"))
 
     def _busy_always(db_path, **kw):
         # Every writer_lock acquisition is immediately refused.
@@ -595,7 +595,7 @@ def test_cli_dry_run_does_not_acquire_writer_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(
         mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
     )
-    monkeypatch.setattr(mod, "_fetch_moex_range", lambda *a, **kw: [])
+    monkeypatch.setattr(mod, "_fetch_year_moex_outcome", lambda *a, **kw: ([], "complete"))
 
     acquisitions: list[dict] = []
     real_cm = wl_mod.writer_lock

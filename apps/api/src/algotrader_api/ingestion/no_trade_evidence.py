@@ -43,6 +43,7 @@ Coordination (writer-coordination spec, Task 3):
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import urllib.parse
 from datetime import date, timedelta
@@ -239,6 +240,109 @@ def fetch_no_trade_rows(
     lo = from_d.isoformat()
     hi = to_d.isoformat()
     return [r for r in out if lo <= r["ts"] <= hi]
+
+
+def _is_business_date_for_evidence(
+    conn: sqlite3.Connection,
+    ts: str,
+    *,
+    today: date | None = None,
+) -> bool:
+    """True iff ``ts`` is an ISO date, a weekday, and not in
+    ``moex_holidays``.
+
+    Pure SQL helper. Does NOT acquire the writer lock; callers that
+    persist rows must already hold it. Operates on the caller's open
+    connection so a single transaction sees both the holiday table
+    and the evidence table.
+    """
+    try:
+        d = date.fromisoformat((ts or "")[:10])
+    except ValueError:
+        return False
+    if d.weekday() >= 5:  # Saturday / Sunday.
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM moex_holidays WHERE date = ?",
+        (d.isoformat(),),
+    ).fetchone()
+    return row is None
+
+
+def record_historical_no_trade_evidence(
+    conn: sqlite3.Connection,
+    *,
+    db_path: str,
+    figi: str,
+    ticker: str,
+    rows: list[dict],
+    board: str,
+    isin: str,
+    outcome: MOEXFetchOutcome,
+    today: date | None = None,
+) -> int:
+    """Persist zero-trade evidence for a historical MOEX walk.
+
+    Outcome gate:
+      * ``outcome == "complete"`` — proceed to the
+        business-date / identity filter and delegate to
+        :func:`record_no_trade_evidence`.
+      * any other outcome — return ``0`` immediately, perform no
+        SQLite mutation, and emit one structured log line.
+
+    Filter rule (after outcome gate):
+      * keep rows whose ``_secid`` matches the explicit ``ticker``
+        argument (the caller threads the ticker through from the
+        ``instruments`` row — the helper MUST NOT guess the
+        ticker from ``rows[0].get("_secid")``);
+      * keep rows whose ``_boardid`` matches ``board``;
+      * keep rows whose ``ts`` is a valid ISO date AND a
+        business date per :func:`_is_business_date_for_evidence`.
+
+    Writer lock: acquired exactly once through
+    :func:`record_no_trade_evidence` (the existing public wrapper
+    already takes the lock with ``role="no-trade-evidence"`` and
+    ``phase="evidence"``). No new lock path; no nested acquisition.
+
+    Delegation: the actual ``INSERT ... ON CONFLICT`` is performed
+    by the existing :func:`record_no_trade_evidence` so TTL,
+    recent-vs-historical expiry branching, real-bar-wins filtering,
+    and ON CONFLICT refresh behaviour stay verbatim.
+    """
+    if outcome != "complete":
+        logging.getLogger("algotrader.ingestion").info(
+            "moex_historical_evidence_rejected figi=%s reason=%s rows=%s",
+            figi, outcome, len(rows),
+        )
+        return 0
+    if not rows:
+        return 0
+    accepted: list[dict] = []
+    for r in rows:
+        if str(r.get("_secid") or "") != ticker:
+            continue
+        if str(r.get("_boardid") or "") != board:
+            continue
+        ts = (r.get("ts") or "")[:10]
+        if not _is_business_date_for_evidence(conn, ts, today=today):
+            continue
+        accepted.append({"ts": ts})
+    if not accepted:
+        logging.getLogger("algotrader.ingestion").info(
+            "moex_historical_evidence_rejected figi=%s "
+            "reason=non_business_date rows=%s",
+            figi, len(rows),
+        )
+        return 0
+    return record_no_trade_evidence(
+        conn,
+        db_path=db_path,
+        figi=figi,
+        rows=accepted,
+        board=board,
+        isin=isin,
+        now=today,
+    )
 
 
 def _record_no_trade_evidence_tx(
