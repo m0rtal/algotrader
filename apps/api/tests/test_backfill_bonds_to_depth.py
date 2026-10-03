@@ -97,6 +97,12 @@ def _make_candle(figi: str, ts: str):
     # extraction). The coordinated bar writer (Task 2) runs
     # every fetched candle through ``_row``, so the test fixture
     # must produce candle objects with literal attribute values.
+    # The figi field MUST match the loop figi — the writer's
+    # foreign-FIGI guard (Task 2 correction) raises ValueError
+    # when a candle names a different figi (the same class of
+    # bug as the T/DIOD/ROST cross-pollution). Test authors
+    # who need a candle "for figi X" should pass X here AND
+    # wire the loop figi to X via the same-figi fixture.
     from types import SimpleNamespace
     return SimpleNamespace(
         figi=figi,
@@ -113,12 +119,22 @@ def test_sparse_bond_is_brought_to_target_depth(db_with_bonds):
     """Bond with 15 bars should be brought to >=30 after backfill."""
     from algotrader_api.ingestion.backfill import backfill_bonds_to_depth
 
-    # Mock Tinkoff to return 20 new bars for BOND15
-    new_candles = [_make_candle('BBG000BOND15', f'2025-01-{i+1:02d}') for i in range(20)]
+    # Mock Tinkoff to return 20 new bars for BOND15 and 30 for
+    # BOND00 (0 bars). The dispatch is keyed on the figi arg so
+    # the foreign-FIGI guard (Task 2 correction) sees candles
+    # whose figi matches the loop figi.
+    candles_by_figi = {
+        'BBG000BOND15': [_make_candle('BBG000BOND15', f'2025-01-{i+1:02d}') for i in range(20)],
+        'BBG000BOND00': [_make_candle('BBG000BOND00', f'2025-02-{i+1:02d}') for i in range(30)],
+    }
+
+    async def _dispatch(*, figi, **_kw):
+        return candles_by_figi.get(figi, [])
+
     with patch('algotrader_api.ingestion.client.make_client') as mock_client_factory, \
          patch('algotrader_api.ingestion.rate_limit.get_global') as mock_rl:
         mock_client = MagicMock()
-        mock_client.get_candles = AsyncMock(return_value=new_candles)
+        mock_client.get_candles = AsyncMock(side_effect=_dispatch)
         mock_client_factory.return_value = mock_client
         mock_rl.return_value.acquire = AsyncMock()
 
@@ -136,10 +152,17 @@ def test_full_bond_is_skipped(db_with_bonds):
     """Bond with 250 bars should NOT trigger a Tinkoff fetch."""
     from algotrader_api.ingestion.backfill import backfill_bonds_to_depth
 
+    # Empty per-figi dispatch keeps the foreign-FIGI guard
+    # happy. BOND30 (250 bars) must be skipped — decide_strategy
+    # returns 'skip' before we ever call get_candles for it.
+    async def _dispatch(*, figi, **_kw):
+        return []
+
     with patch('algotrader_api.ingestion.client.make_client') as mock_client_factory, \
          patch('algotrader_api.ingestion.rate_limit.get_global') as mock_rl:
         mock_client = MagicMock()
         mock_client.get_historical_bonds = MagicMock(return_value=[])
+        mock_client.get_candles = AsyncMock(side_effect=_dispatch)
         mock_client_factory.return_value = mock_client
         mock_rl.return_value.acquire = AsyncMock()
 
@@ -161,11 +184,22 @@ def test_zero_bar_bond_is_fully_backfilled(db_with_bonds):
     """Bond with 0 bars should get >=30 bars after backfill."""
     from algotrader_api.ingestion.backfill import backfill_bonds_to_depth
 
-    new_candles = [_make_candle('BBG000BOND00', f'2025-02-{i+1:02d}') for i in range(30)]
+    # BOND00 has 0 bars and must be filled. BOND15 has 15 bars
+    # (under target) and would also fetch — dispatch by figi so
+    # the foreign-FIGI guard (Task 2 correction) sees a matching
+    # figi on every candle.
+    candles_by_figi = {
+        'BBG000BOND00': [_make_candle('BBG000BOND00', f'2025-02-{i+1:02d}') for i in range(30)],
+        'BBG000BOND15': [_make_candle('BBG000BOND15', f'2025-03-{i+1:02d}') for i in range(20)],
+    }
+
+    async def _dispatch(*, figi, **_kw):
+        return candles_by_figi.get(figi, [])
+
     with patch('algotrader_api.ingestion.client.make_client') as mock_client_factory, \
          patch('algotrader_api.ingestion.rate_limit.get_global') as mock_rl:
         mock_client = MagicMock()
-        mock_client.get_candles = AsyncMock(return_value=new_candles)
+        mock_client.get_candles = AsyncMock(side_effect=_dispatch)
         mock_client_factory.return_value = mock_client
         mock_rl.return_value.acquire = AsyncMock()
 
@@ -181,12 +215,24 @@ def test_duplicate_bars_are_skipped(db_with_bonds):
     """Re-running backfill with the same candles should not produce duplicates."""
     from algotrader_api.ingestion.backfill import backfill_bonds_to_depth
 
-    # First call: insert 5 new bars for BOND15 (which has 15)
+    # First call: insert 5 new bars for BOND15 (which has 15).
+    # BOND00 also needs fetching — dispatch by figi so the
+    # foreign-FIGI guard (Task 2 correction) sees a matching
+    # figi on every candle.
     new_candles = [_make_candle('BBG000BOND15', f'2025-03-{i+1:02d}') for i in range(5)]
+    bond00_candles = [_make_candle('BBG000BOND00', f'2025-04-{i+1:02d}') for i in range(30)]
+    candles_by_figi = {
+        'BBG000BOND15': new_candles,
+        'BBG000BOND00': bond00_candles,
+    }
+
+    async def _dispatch(*, figi, **_kw):
+        return candles_by_figi.get(figi, [])
+
     with patch('algotrader_api.ingestion.client.make_client') as mock_client_factory, \
          patch('algotrader_api.ingestion.rate_limit.get_global') as mock_rl:
         mock_client = MagicMock()
-        mock_client.get_candles = AsyncMock(return_value=new_candles)
+        mock_client.get_candles = AsyncMock(side_effect=_dispatch)
         mock_client_factory.return_value = mock_client
         mock_rl.return_value.acquire = AsyncMock()
 
@@ -617,4 +663,96 @@ def test_mixed_batch_existing_dup_new_reports_exactly_one_added(tmp_path):
     assert rows == [('2025-06-01',), ('2025-06-02',)], (
         f"DB must contain exactly the existing 2025-06-01 row plus "
         f"the new 2025-06-02 row; got {rows!r}"
+    )
+
+
+# ─── writer-coordination: bounded prefilter (Task 2 correction) ───────
+#
+# The Task 2 brief requires the raw backfill's existing-candle
+# prefilter to be bounded — SQLite has a SQLITE_LIMIT_VARIABLE_NUMBER
+# default cap (999 on older builds, 32766 on newer) and an unbounded
+# ``WHERE ts IN (?, ?, ?, ...)`` over a huge broker batch will trip it
+# with ``too many SQL variables``. The fix: read every existing
+# (figi, ts) pair for the loop figi in a single bounded query (no IN
+# clause), then filter in Python. The test below forces a tight
+# SQLITE_LIMIT_VARIABLE_NUMBER to prove the path stays bounded.
+
+
+def test_async_backfill_impl_prefilter_stays_under_sqlite_variable_limit(
+    tmp_path,
+):
+    """A 1000-candle batch must not blow the SQLite variable limit.
+
+    The old prefilter built ``WHERE ts IN (?, ?, ... ?)`` with one
+    placeholder per fetched candle. With SQLITE_LIMIT_VARIABLE_NUMBER
+    lowered to 50, the old path raised ``too many SQL variables``
+    inside the prefilter and the whole backfill died. The bounded
+    fix reads all existing (figi, ts) pairs for the loop figi in a
+    single query (no IN expansion) and filters in Python.
+    """
+    from algotrader_api.ingestion.backfill import backfill_bonds_to_depth
+
+    db_file = str(tmp_path / "limit.db")
+    con = sqlite3.connect(db_file)
+    con.executescript("""
+        CREATE TABLE instruments (
+            figi TEXT PRIMARY KEY, ticker TEXT, class TEXT
+        );
+        CREATE TABLE bars (
+            figi TEXT, ts TEXT,
+            open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+            source TEXT DEFAULT 'moex',
+            PRIMARY KEY (figi, ts)
+        );
+        CREATE TABLE instrument_metadata (
+            figi              TEXT PRIMARY KEY,
+            last_bar_ts       TEXT,
+            first_bar_ts      TEXT,
+            last_backfilled_at TEXT,
+            total_bars        INTEGER NOT NULL DEFAULT 0,
+            last_run_status   TEXT,
+            last_run_at       TEXT,
+            last_error        TEXT
+        );
+        INSERT INTO instruments VALUES ('BBG000BOND00', 'BOND00', 'bond');
+    """)
+    con.commit()
+    con.close()
+
+    # SQLITE_LIMIT_VARIABLE_NUMBER == 9. Lower it on the test
+    # connection BEFORE the prefilter runs. 50 is well below the
+    # 1000-candle batch the broker will return, so the old
+    # ``WHERE ts IN (?, ...)`` path would explode with "too many
+    # SQL variables". The bounded fix passes the test.
+    test_conn = sqlite3.connect(db_file)
+    try:
+        test_conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 50)
+        from types import SimpleNamespace
+        big_batch = [
+            SimpleNamespace(
+                figi='BBG000BOND00',
+                ts=f'2025-{(i // 28) + 7:02d}-{(i % 28) + 1:02d}',
+                open=100, high=101, low=99, close=100, volume=1000,
+            )
+            for i in range(1000)
+        ]
+
+        async def _dispatch(*, figi, **_kw):
+            return big_batch
+
+        with patch('algotrader_api.ingestion.client.make_client') as mcf, \
+             patch('algotrader_api.ingestion.rate_limit.get_global') as mrl:
+            mc = MagicMock()
+            mc.get_candles = AsyncMock(side_effect=_dispatch)
+            mcf.return_value = mc
+            mrl.return_value.acquire = AsyncMock()
+            result = backfill_bonds_to_depth(
+                target_days=30, conn=test_conn,
+            )
+    finally:
+        test_conn.close()
+
+    assert result["bars_added"] == 1000, (
+        f"1000 fetched candles must all be inserted; "
+        f"got bars_added={result['bars_added']!r}"
     )

@@ -76,7 +76,22 @@ def _row(c: dict | object) -> tuple:
             ts = ts[:10]
         else:
             ts = None
-    if not isinstance(ts, _date):
+    # ``datetime.datetime`` is a subclass of ``datetime.date`` and
+    # therefore passes the ``isinstance(ts, _date)`` test above. We
+    # always reduce the timestamp to a bare ``_date`` so the bars PK
+    # matches the rest of the codebase's pre-write dedup keys
+    # (which compare against the YYYY-MM-DD string the writer
+    # persists). Without this, a naive ``datetime(2026, 9, 2,
+    # 7, 0, 0)`` would land in the bars table as
+    # ``"2026-09-02T07:00:00"`` and silently break dedup against
+    # the seed rows stored as ``"2026-09-02"``.
+    from datetime import date as _pure_date, datetime as _datetime
+    if isinstance(ts, _datetime):
+        ts = ts.date()
+    if not isinstance(ts, _pure_date):
+        # datetime.datetime / datetime.time / other — always reduce
+        # to YYYY-MM-DD so the bars PK (figi, ts) matches the rest
+        # of the codebase's pre-write dedup keys.
         ts_str = str(ts)[:10] if ts else None
     else:
         ts_str = ts.isoformat()
@@ -134,6 +149,13 @@ def _replace_bars_for_figi_tx(
     the public function assembled BEFORE acquiring the lock; the
     public function also filters out rows with missing OHLC values
     so the transaction never sees None.
+
+    Returns the raw ``executemany`` cursor ``rowcount`` so callers
+    that need the actual number of rows inserted (e.g. the
+    coordinated raw backfill path that wants a true "added"
+    count, not "rows attempted") can read it. The public
+    ``replace_bars_for_figi`` ignores this and returns
+    ``len(rows)`` to preserve the legacy contract.
     """
     if not rows:
         return 0
@@ -149,7 +171,13 @@ def _replace_bars_for_figi_tx(
             "INSERT OR IGNORE INTO bars (figi, ts, open, high, low, close, volume, source) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
-    conn.executemany(insert_sql, rows)
+    cur = conn.executemany(insert_sql, rows)
+    # ``executemany`` rowcount: SQLite aggregates per-statement
+    # rowcount. For ``INSERT OR IGNORE`` this is the number of
+    # rows ACTUALLY inserted (the OR IGNORE silently swallows
+    # UNIQUE-constraint violations, and the cursor reflects the
+    # kept rows). For plain ``INSERT`` it equals ``len(rows)``.
+    raw_added = cur.rowcount
     conn.execute(
         "UPDATE instrument_metadata SET "
         "  total_bars = (SELECT COUNT(*) FROM bars WHERE figi = ?), "
@@ -161,7 +189,7 @@ def _replace_bars_for_figi_tx(
         (figi, figi, figi, figi),
     )
     conn.commit()
-    return len(rows)
+    return raw_added
 
 
 def replace_bars_for_figi(
@@ -219,6 +247,24 @@ def replace_bars_for_figi(
     """
     rows = []
     for c in candles:
+        # Foreign-FIGI fail-closed: a candle that EXPLICITLY names
+        # a different figi must be rejected. Otherwise the raw
+        # backfill path could silently relabel another
+        # instrument's data on top of the loop figi (same class
+        # of bug as the T/DIOD/ROST cross-pollution). Candles
+        # that omit the `figi` field are fine — the loop figi is
+        # authoritative in that case. The check runs BEFORE any
+        # normalization so a foreign candle never touches the
+        # bars table.
+        c_figi = (
+            c.get("figi") if isinstance(c, dict)
+            else getattr(c, "figi", None)
+        )
+        if c_figi and c_figi != figi:
+            raise ValueError(
+                f"foreign-FIGI fail-closed: candle names {c_figi!r} "
+                f"but loop figi is {figi!r}; refusing to relabel"
+            )
         ts_str, o, h, l, cl, v = _row(c)
         # Skip rows with any None OHLC value — MOEX occasionally returns
         # trading sessions with no price data (illiquid instruments,
@@ -285,6 +331,85 @@ def replace_bars_for_figi(
         # computing synchronously.
         pass
     return len(rows)
+
+
+def replace_bars_for_figi_with_rowcount(
+    sqlite_path: str,
+    figi: str,
+    candles: Iterable[dict],
+    *,
+    replace: bool = True,
+    source: str = "tinkoff",
+) -> int:
+    """Variant of :func:`replace_bars_for_figi` that returns the
+    actual ``executemany`` cursor ``rowcount`` instead of
+    ``len(normalized rows)``.
+
+    The public ``replace_bars_for_figi`` preserves the legacy
+    ``len(normalized rows)`` contract — useful for callers that
+    want a stable "rows attempted" counter. This variant is for
+    the raw backfill path which has already filtered out
+    existing candles in a pre-lock step and needs a true
+    "rows actually inserted" count under the writer lock (the
+    prefilter is not proof that a concurrent writer did not
+    insert the same key between the SELECT and the locked
+    INSERT).
+
+    Same locking, normalization, and post-commit hooks as the
+    public function; the only difference is the return value.
+    Counts only ``bars`` insertions — never the
+    ``instrument_metadata`` aggregate or the reconciliation
+    hook, both of which the brief rules out.
+    """
+    rows = []
+    for c in candles:
+        c_figi = (
+            c.get("figi") if isinstance(c, dict)
+            else getattr(c, "figi", None)
+        )
+        if c_figi and c_figi != figi:
+            raise ValueError(
+                f"foreign-FIGI fail-closed: candle names {c_figi!r} "
+                f"but loop figi is {figi!r}; refusing to relabel"
+            )
+        ts_str, o, h, l, cl, v = _row(c)
+        if o is None or h is None or l is None or cl is None:
+            continue
+        rows.append((figi, ts_str, float(o), float(h), float(l), float(cl), int(v), source))
+
+    if not rows:
+        return 0
+
+    conn = get_connection(sqlite_path)
+    with writer_lock(
+        sqlite_path,
+        role="bar-writer",
+        phase="bars",
+        timeout_seconds=LOCK_TIMEOUT_SECONDS,
+    ):
+        try:
+            added = _replace_bars_for_figi_tx(
+                conn, figi, rows, replace=replace, source=source,
+            )
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+    # Post-commit hooks identical to the public function. They are
+    # run OUTSIDE the bar lock and never affect the return value.
+    try:
+        from ..ingestion.no_trade_evidence import reconcile_no_trade_evidence
+        reconcile_no_trade_evidence(conn)
+    except Exception:
+        pass
+    try:
+        from ..ui_snapshot import maybe_refresh
+        maybe_refresh(sqlite_path=sqlite_path)
+    except Exception:
+        pass
+    return added
 
 
 def resolve_figi_for_ticker(sqlite_path: str, symbol: str) -> str | None:

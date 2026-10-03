@@ -2610,7 +2610,9 @@ async def _async_backfill_impl(
       counters are preserved so callers and operators see the
       same accounting as before.
     """
-    from algotrader_api.db.bars_sqlite import replace_bars_for_figi
+    from algotrader_api.db.bars_sqlite import (
+        replace_bars_for_figi_with_rowcount,
+    )
 
     if conn is None:
         # Production path: derive the path from settings and open
@@ -2746,16 +2748,22 @@ async def _async_backfill_impl(
                 )
                 continue
 
-            # Single batched SELECT for all (figi, ts) pairs in this
-            # figi's batch — one query, not N. The DB is read-only
-            # here; no lock is held.
-            placeholders = ",".join("?" for _ in ordered)
+            # Single bounded SELECT for all (figi, ts) pairs in
+            # this figi's batch — one query, no IN placeholder
+            # expansion. SQLite caps the number of bound
+            # parameters per statement (default 999 / 32766
+            # depending on the build); an unbounded
+            # ``WHERE ts IN (?, ?, ...)`` over a huge broker
+            # batch trips ``too many SQL variables`` and the
+            # whole backfill dies. The bounded path reads the
+            # stored (figi, ts) set ONCE for this loop figi
+            # and filters in Python. The DB is read-only here;
+            # no lock is held.
             existing_rows = conn.execute(
-                f"SELECT figi, ts FROM bars "
-                f"WHERE figi = ? AND ts IN ({placeholders})",
-                (figi, *(key[1] for key, _candle in ordered)),
+                "SELECT ts FROM bars WHERE figi = ?",
+                (figi,),
             ).fetchall()
-            existing_keys = {(r[0], r[1]) for r in existing_rows}
+            existing_keys = {(r[0],) for r in existing_rows}
             missing = [candle for key, candle in ordered if key not in existing_keys]
 
             if not missing:
@@ -2779,16 +2787,20 @@ async def _async_backfill_impl(
             # Delegate the bar write to the coordinated common
             # writer. It owns ``<db>.writer.lock`` for the bar
             # transaction and re-uses the existing
-            # ``replace=False, source='tinkoff'`` semantic. Because
-            # ``missing`` is a strict subset of the fetched batch
-            # and is internally deduped, every row in ``missing``
-            # becomes a new ``bars`` row, so
-            # ``replace_bars_for_figi``'s return value equals the
-            # number of rows actually inserted. The private
-            # ``_replace_bars_for_figi_tx`` helper (called by the
-            # public function) is the single, fail-closed bar
-            # writer — no raw INSERT remains in this function.
-            added_this_figi = replace_bars_for_figi(
+            # ``replace=False, source='tinkoff'`` semantic. The
+            # ``_with_rowcount`` variant returns the actual
+            # ``executemany`` cursor ``rowcount`` — the public
+            # ``replace_bars_for_figi`` preserves the legacy
+            # ``len(normalized rows)`` contract, which is wrong
+            # for this path: the prefilter is not proof a
+            # concurrent writer did not insert the same key
+            # between the SELECT and the locked INSERT, and the
+            # brief requires ``bars_added`` count only what the
+            # locked ``executemany`` actually committed. Counts
+            # only ``bars`` insertions — never the
+            # ``instrument_metadata`` aggregate or the
+            # reconciliation hook.
+            added_this_figi = replace_bars_for_figi_with_rowcount(
                 sqlite_path,
                 figi,
                 missing,

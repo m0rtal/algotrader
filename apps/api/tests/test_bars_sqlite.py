@@ -601,10 +601,10 @@ def test_replace_bars_for_figi_reconcile_runs_outside_bar_lock(
     )
 
     def _fake_reconcile(_conn):
-        # Run a subprocess that must acquire the bar lock. If
-        # the bar lock is still held (regression), the
-        # subprocess raises ``WriterLockBusy`` and the sentinel
-        # is never written.
+        # 1. Lock acquisition check: run a subprocess that must
+        #    acquire the bar lock. If the bar lock is still held
+        #    (regression), the subprocess raises ``WriterLockBusy``
+        #    and the sentinel is never written.
         proc = subprocess.run(
             [sys.executable, "-c", script],
             env={
@@ -617,14 +617,44 @@ def test_replace_bars_for_figi_reconcile_runs_outside_bar_lock(
             timeout=5.0,
         )
         if proc.returncode != 0:
-            # Surface the failure so the test message names the
-            # actual lock-busy / fork error if the boundary
-            # regressed.
             raise AssertionError(
                 f"subprocess could not acquire the bar lock while "
                 f"reconcile ran — boundary regressed. "
                 f"rc={proc.returncode} stderr={proc.stderr!r}"
             )
+        # 2. Visibility check: the just-committed bar row AND the
+        #    instrument_metadata aggregate must be visible to a
+        #    fresh separate connection at hook entry. This proves
+        #    the bar write COMMITTED before reconcile ran (not
+        #    just that the lock was released). SQLite's WAL means
+        #    a fresh connection on the same file sees the latest
+        #    committed snapshot, so a new sqlite3.connect()
+        #    immediately reads the committed row.
+        viewer = sqlite3.connect(bars_db)
+        try:
+            row = viewer.execute(
+                "SELECT ts FROM bars WHERE figi = ?",
+                ("FIGI-RECONCILE",),
+            ).fetchone()
+            if row is None or row[0] != "2026-09-01":
+                raise AssertionError(
+                    f"newly committed bar row not visible to a "
+                    f"separate connection at reconcile hook entry: "
+                    f"got {row!r} (expected ('2026-09-01',))"
+                )
+            meta = viewer.execute(
+                "SELECT total_bars, first_bar_ts, last_bar_ts "
+                "FROM instrument_metadata WHERE figi = ?",
+                ("FIGI-RECONCILE",),
+            ).fetchone()
+            if meta is None or meta[0] != 1:
+                raise AssertionError(
+                    f"instrument_metadata aggregate not visible to "
+                    f"a separate connection at reconcile hook entry: "
+                    f"got {meta!r}"
+                )
+        finally:
+            viewer.close()
         return 0
 
     # The public function imports ``reconcile_no_trade_evidence``
@@ -714,4 +744,214 @@ def test_replace_bars_for_figi_metadata_aggregate_updates_atomically(bars_db):
         con.close()
     assert cnt == 1, (
         f"second write leaked bars: {cnt} rows for FIGI-AGG (expected 1)"
+    )
+
+
+# ─── writer-coordination: foreign-FIGI fail-closed (Task 2 correction) ──
+#
+# The SDD brief requires the bar writer to reject any candle that
+# names a figi different from the loop's figi argument. Otherwise
+# the raw backfill path could silently relabel another instrument's
+# data — the same class of bug as the T/DIOD/ROST cross-pollution.
+
+
+def test_replace_bars_for_figi_rejects_candles_naming_other_figi(bars_db):
+    """A candle whose figi attribute differs from the loop figi must
+    be rejected fail-closed. The writer must NEVER relabel another
+    instrument's data by stamping the loop figi on a candle that
+    carries a different figi.
+    """
+    candles = [
+        # Loop figi is FIGI-LOOP but this candle names FIGI-OTHER.
+        {"figi": "FIGI-OTHER", "ts": "2026-09-01",
+         "open": 100, "high": 110, "low": 95, "close": 105, "volume": 1000},
+    ]
+    with pytest.raises(ValueError):
+        replace_bars_for_figi(bars_db, "FIGI-LOOP", candles)
+    # Zero rows leaked for either figi.
+    con = sqlite3.connect(bars_db)
+    try:
+        loop_count = con.execute(
+            "SELECT COUNT(*) FROM bars WHERE figi = ?", ("FIGI-LOOP",),
+        ).fetchone()[0]
+        other_count = con.execute(
+            "SELECT COUNT(*) FROM bars WHERE figi = ?", ("FIGI-OTHER",),
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert loop_count == 0
+    assert other_count == 0
+
+
+def test_replace_bars_for_figi_rejects_native_candle_naming_other_figi(bars_db):
+    """A native gRPC-shaped candle whose `figi` attribute disagrees
+    with the loop figi must also be rejected. The figi field can
+    come either as a dict key (SDK output) or as a dataclass
+    attribute (raw gRPC); both must be checked.
+    """
+    from types import SimpleNamespace
+    bad = SimpleNamespace(
+        figi="FIGI-OTHER",  # wrong figi
+        time=SimpleNamespace(year=2026, month=9, day=1),
+        open=SimpleNamespace(units=100, nano=0),
+        high=SimpleNamespace(units=110, nano=0),
+        low=SimpleNamespace(units=95, nano=0),
+        close=SimpleNamespace(units=105, nano=0),
+        volume=1000,
+    )
+    with pytest.raises(ValueError):
+        replace_bars_for_figi(bars_db, "FIGI-LOOP", [bad])
+    con = sqlite3.connect(bars_db)
+    try:
+        other_count = con.execute(
+            "SELECT COUNT(*) FROM bars WHERE figi = ?", ("FIGI-OTHER",),
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert other_count == 0, (
+        "foreign candle leaked into bars; the writer must not "
+        "relabel FIGI-OTHER's data with FIGI-LOOP"
+    )
+
+
+def test_replace_bars_for_figi_accepts_candle_with_no_figi_attribute(bars_db):
+    """Candles that omit the `figi` field are fine — the loop figi
+    is used. The fail-closed check applies only when the candle
+    explicitly names a DIFFERENT figi, never when it names the
+    loop figi or no figi at all.
+    """
+    candles = [
+        {"ts": "2026-09-01", "open": 100, "high": 110, "low": 95,
+         "close": 105, "volume": 1000},
+    ]
+    written = replace_bars_for_figi(bars_db, "FIGI-OK", candles)
+    assert written == 1
+
+
+def test_replace_bars_for_figi_accepts_full_iso_timestamp(bars_db):
+    """A candle with a full ISO timestamp ("2026-09-01T07:00:00Z")
+    must be normalized to YYYY-MM-DD before INSERT, just like the
+    common writer's _row. The pre-write dedup in
+    _async_backfill_impl relies on this normalization to compare
+    against the stored YYYY-MM-DD key.
+    """
+    from datetime import datetime
+    candles = [
+        # full ISO with time + tz
+        {"ts": "2026-09-01T07:00:00+00:00",
+         "open": 100, "high": 110, "low": 95, "close": 105, "volume": 1000},
+        # datetime object
+        {"ts": datetime(2026, 9, 2, 7, 0, 0),
+         "open": 100, "high": 110, "low": 95, "close": 105, "volume": 1000},
+        # date object
+        {"ts": date(2026, 9, 3),
+         "open": 100, "high": 110, "low": 95, "close": 105, "volume": 1000},
+    ]
+    written = replace_bars_for_figi(bars_db, "FIGI-ISO", candles)
+    assert written == 3, f"all 3 timestamp shapes must normalize; got {written}"
+
+    con = sqlite3.connect(bars_db)
+    try:
+        rows = con.execute(
+            "SELECT ts FROM bars WHERE figi = ? ORDER BY ts",
+            ("FIGI-ISO",),
+        ).fetchall()
+    finally:
+        con.close()
+    assert [r[0] for r in rows] == ["2026-09-01", "2026-09-02", "2026-09-03"]
+
+
+def test_replace_bars_for_figi_with_rowcount_reports_actual_inserts(bars_db):
+    """The with-rowcount variant must report the actual
+    ``executemany`` cursor rowcount — the same as the public
+    function when no races are involved, since all 3 rows are
+    fresh.
+    """
+    from algotrader_api.db.bars_sqlite import replace_bars_for_figi_with_rowcount
+
+    candles = [
+        {"ts": "2026-09-01", "open": 100, "high": 110, "low": 95,
+         "close": 105, "volume": 1000},
+        {"ts": "2026-09-02", "open": 100, "high": 110, "low": 95,
+         "close": 105, "volume": 1000},
+        {"ts": "2026-09-03", "open": 100, "high": 110, "low": 95,
+         "close": 105, "volume": 1000},
+    ]
+    added = replace_bars_for_figi_with_rowcount(
+        bars_db, "FIGI-RC", candles, replace=False, source="tinkoff",
+    )
+    assert added == 3
+
+    con = sqlite3.connect(bars_db)
+    try:
+        rows = con.execute(
+            "SELECT ts FROM bars WHERE figi = ? ORDER BY ts", ("FIGI-RC",),
+        ).fetchall()
+    finally:
+        con.close()
+    assert [r[0] for r in rows] == ["2026-09-01", "2026-09-02", "2026-09-03"]
+
+
+def test_replace_bars_for_figi_with_rowcount_under_race_reports_zero(bars_db, monkeypatch):
+    """Deterministic race test: a concurrent writer inserts the
+    same keys AFTER the pre-lock prefilter ran but BEFORE the
+    locked mutation. The with-rowcount variant must report
+    ``added == 0`` because every row collided with the racer's
+    INSERT OR IGNORE (UNIQUE constraint on (figi, ts)).
+    """
+    from algotrader_api.db.bars_sqlite import replace_bars_for_figi_with_rowcount
+    from algotrader_api.db import bars_sqlite
+    from algotrader_api.ingestion import writer_lock as wl_mod
+
+    # Patch the private transaction helper so the moment it is
+    # invoked — after prefilter, after lock acquisition — the
+    # racer inserts the same keys first. The public function
+    # would then attempt INSERT OR IGNORE and get rowcount == 0.
+    real_tx = bars_sqlite._replace_bars_for_figi_tx
+
+    def _racing_tx(conn, figi, rows, **kw):
+        # Pre-existing rows for every key. The locked mutation
+        # then attempts INSERT OR IGNORE → all rows ignored →
+        # rowcount == 0.
+        existing = [
+            (figi, r[1], 0, 0, 0, 0, 0, "racer")
+            for r in rows
+        ]
+        cur = conn.executemany(
+            "INSERT OR IGNORE INTO bars (figi, ts, open, high, low, close, volume, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            existing,
+        )
+        conn.commit()
+        return real_tx(conn, figi, rows, **kw)
+
+    # Use monkeypatch to ensure the patched helper is restored
+    # even if the test fails — otherwise subsequent tests see a
+    # global monkey-patched module attribute and silently change
+    # the production path.
+    monkeypatch.setattr(bars_sqlite, "_replace_bars_for_figi_tx", _racing_tx)
+
+    candles = [
+        {"ts": "2026-09-01", "open": 100, "high": 110, "low": 95,
+         "close": 105, "volume": 1000},
+        {"ts": "2026-09-02", "open": 100, "high": 110, "low": 95,
+         "close": 105, "volume": 1000},
+    ]
+    added = replace_bars_for_figi_with_rowcount(
+        bars_db, "FIGI-RACE", candles, replace=False, source="tinkoff",
+    )
+    assert added == 0, (
+        f"with-rowcount variant must report 0 inserts when a "
+        f"racer beat the locked mutation; got {added}"
+    )
+    # And the bars must belong to the racer, not us.
+    con = sqlite3.connect(bars_db)
+    try:
+        rows = con.execute(
+            "SELECT source FROM bars WHERE figi = ?", ("FIGI-RACE",),
+        ).fetchall()
+    finally:
+        con.close()
+    assert all(r[0] == "racer" for r in rows), (
+        f"all rows for FIGI-RACE must belong to the racer; got {rows!r}"
     )
