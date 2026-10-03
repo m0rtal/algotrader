@@ -2669,19 +2669,53 @@ async def _async_backfill_impl(
             # and the bonds_depth step returned processed=74,
             # errors=0, bars_added=0.
             client = make_client(sqlite_path=sqlite_path)
-            # ADAPT-4: was a sync rl.acquire() call that silently bypassed
-            # the AsyncLimiter. Now properly awaited in async context so
-            # Tinkoff's 600 req/min cap is honored on bonds backfill.
-            #
-            # autonomous-data-pipeline Task B.1: call get_candles (the
-            # method that exists on RealTinkoffClient) — not the
-            # non-existent get_historical_bonds. The previous call site
-            # was unreachable in production because RealTinkoffClient has
-            # only get_candles (see coverage-and-quality ADAPT-1).
-            await rl.acquire("get_candles")
-            candles = await client.get_candles(
-                figi=figi, date_from=from_date, date_to=to_date
-            )
+            # Per-FIGI client lifecycle (fix/bond-client-lifecycle):
+            # the gRPC channel built by ``make_client`` is owned by
+            # this loop iteration; without an explicit ``aclose``
+            # the worker leaked one channel per figi (74 channels
+            # on a single chain step). The close is bounded:
+            # ``try/finally`` wraps ONLY ``rl.acquire`` and
+            # ``get_candles`` so the prefilter + bar write stay
+            # outside the close call. A close failure is logged
+            # but never masks the fetch error or the per-FIGI
+            # ``bars_added`` accounting.
+            try:
+                # ADAPT-4: was a sync rl.acquire() call that silently bypassed
+                # the AsyncLimiter. Now properly awaited in async context so
+                # Tinkoff's 600 req/min cap is honored on bonds backfill.
+                #
+                # autonomous-data-pipeline Task B.1: call get_candles (the
+                # method that exists on RealTinkoffClient) — not the
+                # non-existent get_historical_bonds. The previous call site
+                # was unreachable in production because RealTinkoffClient has
+                # only get_candles (see coverage-and-quality ADAPT-1).
+                await rl.acquire("get_candles")
+                candles = await client.get_candles(
+                    figi=figi, date_from=from_date, date_to=to_date
+                )
+            finally:
+                # Best-effort close. ``RealTinkoffClient.aclose`` is
+                # already bounded; an older double without ``aclose``
+                # (Protocol-only) is allowed — duck-test via
+                # ``getattr`` and skip the call. A close failure is
+                # logged with bounded metadata (no token, no
+                # password) so a real production outage shows up
+                # without leaking secrets.
+                aclose = getattr(client, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception as close_exc:  # noqa: BLE001 — best-effort cleanup
+                        logger.warning(
+                            "bond_depth_client_close_failed",
+                            extra={
+                                "event": "bond_depth_client_close_failed",
+                                "figi": figi,
+                                "ticker": ticker,
+                                "client_type": type(client).__name__,
+                                "error": str(close_exc)[:200],
+                            },
+                        )
             if not candles:
                 # Nothing to write; record the no-op in the
                 # ``bars_added`` accounting so operators see the
