@@ -2669,19 +2669,78 @@ async def _async_backfill_impl(
             # and the bonds_depth step returned processed=74,
             # errors=0, bars_added=0.
             client = make_client(sqlite_path=sqlite_path)
-            # ADAPT-4: was a sync rl.acquire() call that silently bypassed
-            # the AsyncLimiter. Now properly awaited in async context so
-            # Tinkoff's 600 req/min cap is honored on bonds backfill.
-            #
-            # autonomous-data-pipeline Task B.1: call get_candles (the
-            # method that exists on RealTinkoffClient) — not the
-            # non-existent get_historical_bonds. The previous call site
-            # was unreachable in production because RealTinkoffClient has
-            # only get_candles (see coverage-and-quality ADAPT-1).
-            await rl.acquire("get_candles")
-            candles = await client.get_candles(
-                figi=figi, date_from=from_date, date_to=to_date
-            )
+            # Per-FIGI client lifecycle (fix/bond-client-lifecycle):
+            # the gRPC channel built by ``make_client`` is owned
+            # by this loop iteration. The code-owned defect was
+            # the missing ``aclose`` — the per-FIGI client
+            # lifetime was unbounded. The per-step figi count
+            # and any downstream effect on the
+            # connection-tracking surface were not measured as
+            # part of this fix and are not asserted here. The
+            # close is bounded: ``try/finally`` wraps ONLY
+            # ``rl.acquire`` and ``get_candles`` so the prefilter
+            # + bar write stay outside the close call. A close
+            # failure is logged but never masks the fetch error
+            # or the per-FIGI ``bars_added`` accounting.
+            try:
+                # ADAPT-4: was a sync rl.acquire() call that silently bypassed
+                # the AsyncLimiter. Now properly awaited in async context so
+                # Tinkoff's 600 req/min cap is honored on bonds backfill.
+                #
+                # autonomous-data-pipeline Task B.1: call get_candles (the
+                # method that exists on RealTinkoffClient) — not the
+                # non-existent get_historical_bonds. The previous call site
+                # was unreachable in production because RealTinkoffClient has
+                # only get_candles (see coverage-and-quality ADAPT-1).
+                await rl.acquire("get_candles")
+                candles = await client.get_candles(
+                    figi=figi, date_from=from_date, date_to=to_date
+                )
+            finally:
+                # Best-effort close. ``RealTinkoffClient.aclose`` is
+                # already bounded by
+                # ``BOND_CLIENT_CLOSE_TIMEOUT_SECONDS``; an older
+                # double without ``aclose`` (Protocol-only) is
+                # allowed — duck-test via ``getattr`` and skip the
+                # call. A close failure is logged with bounded
+                # metadata (no token, no password) so a real
+                # production outage shows up without leaking
+                # secrets: only the exception type name is
+                # recorded, never the message (gRPC trailer
+                # strings routinely embed the bearer token, the
+                # resolved sqlite_path, and HTTP/2 trailer
+                # bytes).
+                #
+                # Observability: log-only. The close-failure
+                # path is intentionally NOT surfaced via the
+                # ``errors`` counter (which counts fetch and
+                # insertion failures) and there is no public
+                # ``aclose_errors`` metric. The reasoning: a
+                # close that times out or raises after a
+                # successful fetch does not represent data loss
+                # or a missed obligation — the candles are
+                # already written, the gRPC channel is
+                # ephemeral, and the next iteration rebuilds
+                # the channel via ``make_client``. The
+                # structured log is the only signal. Operators
+                # alert on the log event name
+                # (``bond_depth_client_close_failed``), not on
+                # a counter.
+                aclose = getattr(client, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception as close_exc:  # noqa: BLE001 — best-effort cleanup
+                        logger.warning(
+                            "bond_depth_client_close_failed",
+                            extra={
+                                "event": "bond_depth_client_close_failed",
+                                "figi": figi,
+                                "ticker": ticker,
+                                "client_type": type(client).__name__,
+                                "error": type(close_exc).__name__,
+                            },
+                        )
             if not candles:
                 # Nothing to write; record the no-op in the
                 # ``bars_added`` accounting so operators see the
