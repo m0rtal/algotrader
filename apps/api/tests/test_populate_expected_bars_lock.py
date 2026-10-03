@@ -435,6 +435,34 @@ def _stub_writer_path(tmp_path: Path, rc: int, stdout: str) -> Path:
     return stub
 
 
+def _counting_stub_writer_path(
+    tmp_path: Path, rc: int, stdout: str,
+) -> tuple[Path, Path]:
+    """Like ``_stub_writer_path`` but the stub appends one line per
+    invocation to ``<tmp_path>/stub_calls.log`` so call-count evidence
+    is independent of wrapper log formatting. Returns
+    ``(stub_path, calls_log_path)``.
+    """
+    calls_log = tmp_path / "stub_calls.log"
+    stub = tmp_path / "stub_writer.py"
+    body = (
+        "import sys\n"
+        f"open({str(calls_log)!r}, 'a').write('called\\n')\n"
+        f"sys.stdout.write({stdout!r})\n"
+        f"sys.stdout.flush()\n"
+        f"sys.exit({rc})\n"
+    )
+    stub.write_text(body)
+    return stub, calls_log
+
+
+def _stub_calls(calls_log: Path) -> int:
+    """Number of times the counting stub has been invoked."""
+    if not calls_log.exists():
+        return 0
+    return sum(1 for line in calls_log.read_text().splitlines() if line == "called")
+
+
 def _run_wrapper_with_stub(
     db: Path, log: Path, stub: Path, *,
     wrapper: Path = JOB, timeout: int = 60,
@@ -569,135 +597,70 @@ def test_wrapper_retries_database_is_locked_non75_child(tmp_path, monkeypatch):
     """A non-75 child failure whose output contains
     ``database is locked`` must enter the three-attempt retry loop.
     The third SQLite-busy failure stays rc=1.
+
+    Exercises the REAL ``cron_expected_bars.sh`` via
+    ``_run_wrapper_with_stub`` (no inline wrapper copy). Stub
+    call-count evidence is independent of wrapper log formatting.
+    Real wrapper sleeps 2 seconds between retries, so 3 attempts
+    take ~4 seconds; the test timeout covers that.
     """
     log = tmp_path / "expected-bars.log"
     db = tmp_path / "state.db"
-    db.write_text("")
-    # Stub: rc=1 with output containing "database is locked".
-    stub = _stub_writer_path(
+    db.write_text("")  # existence check passes
+    stub, calls_log = _counting_stub_writer_path(
         tmp_path, 1, "ERROR: database is locked\n"
     )
-    job = tmp_path / "fake_job.sh"
-    job.write_text(
-        "#!/usr/bin/env bash\n"
-        f"set -eu\n"
-        f"umask 077\n"
-        f"_log() {{ printf '[%s] %s\\n' \"$(date -Is)\" \"$*\" >> \"$LOG\"; }}\n"
-        f"if [[ ! -f \"$DB\" || ! -x \"$PY\" || ! -f \"$SCRIPT\" ]]; then\n"
-        f"    _log \"ERROR expected-bars prerequisites missing\"\n"
-        f"    exit 2\n"
-        f"fi\n"
-        f"exec 9>>\"${{DB}}.expected-bars.lock\"\n"
-        f"if ! flock -n 9; then\n"
-        f"    _log \"ERROR locked: another expected-bars run is active\"\n"
-        f"    exit 75\n"
-        f"fi\n"
-        f"for attempt in 1 2 3; do\n"
-        f"    if output=$(\"$PY\" \"$SCRIPT\" --db \"$DB\" 2>&1); then\n"
-        f"        if [[ \"$output\" == *\"OK:\"* ]]; then\n"
-        f"            _log \"SUCCESS expected-bars processed=0 attempt=$attempt\"\n"
-        f"            exit 0\n"
-        f"        fi\n"
-        f"        _log \"ERROR unexpected writer output despite rc=0\"\n"
-        f"        exit 1\n"
-        f"    fi\n"
-        f"    rc=$?\n"
-        f"    if (( rc == 75 )); then\n"
-        f"        _log \"DEFER writer-lock-busy attempt=$attempt\"\n"
-        f"        exit 0\n"
-        f"    fi\n"
-        f"    if [[ \"$output\" == *\"database is locked\"* && \"$attempt\" -lt 3 ]]; then\n"
-        f"        _log \"RETRY SQLite database is locked attempt=$attempt\"\n"
-        f"        sleep 1\n"
-        f"        continue\n"
-        f"    fi\n"
-        f"    _log \"ERROR expected-bars refresh failed attempt=$attempt\"\n"
-        f"    exit 1\n"
-        f"done\n"
-    )
-    job.chmod(0o755)
 
-    result = subprocess.run(
-        ["bash", str(job), "--db", str(db), "--log", str(log)],
-        env={**os.environ, "ALGOTRADER_EXPECTED_BARS_PYTHON": sys.executable,
-             "PY": sys.executable, "SCRIPT": str(stub),
-             "DB": str(db), "LOG": str(log)},
-        text=True, capture_output=True, timeout=30,
-    )
+    result = _run_wrapper_with_stub(db, log, stub, timeout=30)
     assert result.returncode == 1, (
         f"wrapper should exit 1 on third SQLite-busy failure, got "
         f"{result.returncode}: {result.stderr!r}"
     )
+    # Stub call-count: exactly three attempts.
+    assert _stub_calls(calls_log) == 3, (
+        f"expected 3 stub invocations (3 attempts, 2 retries + 1 final), "
+        f"got {_stub_calls(calls_log)}"
+    )
     text = log.read_text()
+    # Two retry log lines (attempts 1 and 2); the third attempt
+    # produces the final ERROR line.
     assert "retry sqlite database is locked attempt=1" in text.lower()
     assert "retry sqlite database is locked attempt=2" in text.lower()
-    # Exactly two retries (attempts 1 and 2) — the third attempt
-    # produces the final ERROR line.
-    assert text.lower().count("retry sqlite database is locked") == 2
+    assert text.lower().count("retry sqlite database is locked") == 2, (
+        f"expected exactly 2 RETRY lines, got "
+        f"{text.lower().count('retry sqlite database is locked')}: {text!r}"
+    )
+    assert "defer writer-lock-busy" not in text.lower()
 
 
 def test_wrapper_non_busy_failure_does_not_retry(tmp_path, monkeypatch):
     """A non-75 child failure whose output does NOT contain
     ``database is locked`` exits 1 on the first attempt. No retry
     loop.
+
+    Exercises the REAL ``cron_expected_bars.sh`` via
+    ``_run_wrapper_with_stub`` (no inline wrapper copy). Stub
+    call-count evidence is independent of wrapper log formatting.
     """
     log = tmp_path / "expected-bars.log"
     db = tmp_path / "state.db"
     db.write_text("")
-    stub = _stub_writer_path(
+    stub, calls_log = _counting_stub_writer_path(
         tmp_path, 1, "ERROR: schema missing\n"
     )
-    job = tmp_path / "fake_job.sh"
-    job.write_text(
-        "#!/usr/bin/env bash\n"
-        f"set -eu\n"
-        f"umask 077\n"
-        f"_log() {{ printf '[%s] %s\\n' \"$(date -Is)\" \"$*\" >> \"$LOG\"; }}\n"
-        f"if [[ ! -f \"$DB\" || ! -x \"$PY\" || ! -f \"$SCRIPT\" ]]; then\n"
-        f"    _log \"ERROR expected-bars prerequisites missing\"\n"
-        f"    exit 2\n"
-        f"fi\n"
-        f"exec 9>>\"${{DB}}.expected-bars.lock\"\n"
-        f"if ! flock -n 9; then\n"
-        f"    _log \"ERROR locked: another expected-bars run is active\"\n"
-        f"    exit 75\n"
-        f"fi\n"
-        f"for attempt in 1 2 3; do\n"
-        f"    if output=$(\"$PY\" \"$SCRIPT\" --db \"$DB\" 2>&1); then\n"
-        f"        if [[ \"$output\" == *\"OK:\"* ]]; then\n"
-        f"            _log \"SUCCESS expected-bars processed=0 attempt=$attempt\"\n"
-        f"            exit 0\n"
-        f"        fi\n"
-        f"        _log \"ERROR unexpected writer output despite rc=0\"\n"
-        f"        exit 1\n"
-        f"    fi\n"
-        f"    rc=$?\n"
-        f"    if (( rc == 75 )); then\n"
-        f"        _log \"DEFER writer-lock-busy attempt=$attempt\"\n"
-        f"        exit 0\n"
-        f"    fi\n"
-        f"    if [[ \"$output\" == *\"database is locked\"* && \"$attempt\" -lt 3 ]]; then\n"
-        f"        _log \"RETRY SQLite database is locked attempt=$attempt\"\n"
-        f"        sleep 1\n"
-        f"        continue\n"
-        f"    fi\n"
-        f"    _log \"ERROR expected-bars refresh failed attempt=$attempt\"\n"
-        f"    exit 1\n"
-        f"done\n"
-    )
-    job.chmod(0o755)
 
-    result = subprocess.run(
-        ["bash", str(job), "--db", str(db), "--log", str(log)],
-        env={**os.environ, "ALGOTRADER_EXPECTED_BARS_PYTHON": sys.executable,
-             "PY": sys.executable, "SCRIPT": str(stub),
-             "DB": str(db), "LOG": str(log)},
-        text=True, capture_output=True, timeout=30,
-    )
+    result = _run_wrapper_with_stub(db, log, stub, timeout=30)
     assert result.returncode == 1, (
         f"wrapper should exit 1 on non-busy failure, got "
         f"{result.returncode}: {result.stderr!r}"
     )
+    # Stub call-count: exactly one attempt; no retry loop entered.
+    assert _stub_calls(calls_log) == 1, (
+        f"expected 1 stub invocation (no retry on non-busy failure), "
+        f"got {_stub_calls(calls_log)}"
+    )
     text = log.read_text()
-    assert "retry sqlite database is locked" not in text.lower()
+    assert "retry sqlite database is locked" not in text.lower(), (
+        f"wrapper entered SQLite-busy retry loop on non-busy failure: {text!r}"
+    )
     assert "defer writer-lock-busy" not in text.lower()
