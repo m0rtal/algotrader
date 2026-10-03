@@ -25,6 +25,7 @@ with the persistent backfill lifecycle.
 from __future__ import annotations
 
 import asyncio
+import math
 import sqlite3
 import threading
 import time
@@ -572,7 +573,6 @@ def _fetch_year_moex_iter(
     # the bar consumer keeps what it got.
     max_pages = 20
     pages_walked = 0
-    prev_cursor_offset: int | None = None
     prev_cursor_total: int | None = None
     while True:
         pages_walked += 1
@@ -605,11 +605,21 @@ def _fetch_year_moex_iter(
         except Exception:
             yield (kept_rows, "malformed")
             return
-        cols = data.get("history", {}).get("columns", []) or []
-        if not cols or not required_cols.issubset(set(cols)):
+        if not isinstance(data, dict) or not isinstance(data.get("history"), dict):
             yield (kept_rows, "malformed")
             return
-        rows_raw = data.get("history", {}).get("data", []) or []
+        history = data["history"]
+        cols = history.get("columns")
+        if (not isinstance(cols, list) or not cols
+                or not all(isinstance(c, str) for c in cols)
+                or len(set(cols)) != len(cols)
+                or not required_cols.issubset(set(cols))):
+            yield (kept_rows, "malformed")
+            return
+        rows_raw = history.get("data")
+        if not isinstance(rows_raw, list):
+            yield (kept_rows, "malformed")
+            return
         page_outcome = "complete"
         for row in rows_raw:
             # Strict feed contract: every raw row MUST match the
@@ -622,13 +632,7 @@ def _fetch_year_moex_iter(
             # Without the poison: cursor-close on a kept-only count
             # would certify a fetch that actually contained a bad row
             # (parent repro, round 2).
-            row_ok = False
-            try:
-                if len(row) == len(cols):
-                    row_ok = True
-            except TypeError:
-                # Non-sequence row (None, str, dict, scalar) — malformed.
-                row_ok = False
+            row_ok = isinstance(row, list) and len(row) == len(cols)
             if not row_ok:
                 page_outcome = _reduce_outcomes(page_outcome, "malformed")
                 continue
@@ -669,6 +673,13 @@ def _fetch_year_moex_iter(
                 volume = int(volume_raw)
             else:
                 volume = int(volume_raw)
+            if volume < 0 or any(
+                v is not None and (type(v) not in (int, float)
+                                   or v < 0 or (isinstance(v, float) and not math.isfinite(v)))
+                for v in (d.get(k) for k in ("OPEN", "HIGH", "LOW", "CLOSE", "NUMTRADES", "VALUE"))
+            ):
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                continue
             # Per-shape contract:
             #  * zero-volume rows MUST carry NUMTRADES == 0 AND VALUE == 0;
             #    missing/None on those counters is malformed.
@@ -724,43 +735,34 @@ def _fetch_year_moex_iter(
         # Cursor validation. The cursor MUST advance (or close) —
         # a repeated offset is a server-side loop / no-progress
         # condition we cannot trust.
-        cursor_rows = data.get("history.cursor", {}).get("data") or []
-        if cursor_rows:
-            try:
-                offset, total, _srv_page_size = cursor_rows[0][:3]
-            except (TypeError, ValueError):
-                page_outcome = _reduce_outcomes(page_outcome, "malformed")
-                yield (kept_rows, page_outcome)
+        cursor_rows = []
+        if "history.cursor" in data:
+            cursor = data["history.cursor"]
+            if (not isinstance(cursor, dict)
+                    or not isinstance(cursor.get("data"), list)
+                    or ("columns" in cursor and (
+                        not isinstance(cursor["columns"], list)
+                        or not all(isinstance(c, str) for c in cursor["columns"])))):
+                yield (kept_rows, "malformed")
                 return
-            if offset is None or total is None:
-                page_outcome = _reduce_outcomes(page_outcome, "malformed")
-                yield (kept_rows, page_outcome)
+            cursor_rows = cursor["data"]
+            if cursor_rows and (len(cursor_rows) != 1
+                    or not isinstance(cursor_rows[0], list)
+                    or len(cursor_rows[0]) != 3):
+                yield (kept_rows, "malformed")
+                return
+        if cursor_rows:
+            offset, total, _srv_page_size = cursor_rows[0]
+            # Strict integer values (including decimal strings), never bool/float.
+            if any(type(v) not in (int, str) for v in (offset, total, _srv_page_size)):
+                yield (kept_rows, "malformed")
                 return
             try:
                 offset_i = int(offset)
                 total_i = int(total)
-            except (TypeError, ValueError):
-                page_outcome = _reduce_outcomes(page_outcome, "malformed")
-                yield (kept_rows, page_outcome)
-                return
-            try:
                 srv_page_size_i = int(_srv_page_size)
-            except (TypeError, ValueError):
-                page_outcome = _reduce_outcomes(page_outcome, "malformed")
-                yield (kept_rows, page_outcome)
-                return
-            # Reject non-strict-integer cursor values: ``bool`` is a
-            # subclass of ``int`` (``int(True) == 1``); a ``float``
-            # silently truncates (``int(0.5) == 0``). The strict feed
-            # contract demands an integer offset/total/page_size; any
-            # other type is malformed.
-            if (isinstance(offset, bool) or isinstance(total, bool)
-                    or isinstance(_srv_page_size, bool)
-                    or isinstance(offset, float)
-                    or isinstance(total, float)
-                    or isinstance(_srv_page_size, float)):
-                page_outcome = _reduce_outcomes(page_outcome, "malformed")
-                yield (kept_rows, page_outcome)
+            except ValueError:
+                yield (kept_rows, "malformed")
                 return
             if srv_page_size_i <= 0:
                 # A non-positive server-reported page_size is
@@ -805,11 +807,6 @@ def _fetch_year_moex_iter(
                 page_outcome = _reduce_outcomes(page_outcome, "malformed")
                 yield (kept_rows, page_outcome)
                 return
-            if prev_cursor_offset is not None and offset_i == prev_cursor_offset:
-                page_outcome = _reduce_outcomes(page_outcome, "malformed")
-                yield (kept_rows, page_outcome)
-                return
-            prev_cursor_offset = offset_i
             # Decide between final-page-yield and intermediate-yield:
             # the per-page outcome stays whatever this page's data
             # determined; the ``partial`` tag is reserved for the
@@ -1544,7 +1541,9 @@ class BackfillRunner:
         _TINKOFF_BREAKER_THRESHOLD = 3
         _TINKOFF_BREAKER_OPEN_HOURS = 24
 
-        async def _process_moex_year(inst: dict, meta: dict, year: int) -> list[dict]:
+        async def _process_moex_year(
+            inst: dict, meta: dict, year: int, from_d: date, to_d: date,
+        ) -> list[dict]:
             # Task 2 (R1 fix): call through the ``self._fetch_year_moex_outcome``
             # binding so the class-level staticmethod (which is the
             # production default) is used, and so test doubles
@@ -1596,7 +1595,9 @@ class BackfillRunner:
                         figi=inst["figi"], ticker=inst["ticker"],
                         rows=year_bars, board=meta["board"],
                         isin=upstream_isin,
-                        outcome=outcome,
+                        outcome=outcome, today=today,
+                        from_d=max(from_d, date(year, 1, 1)),
+                        to_d=min(to_d, date(year, 12, 31)),
                     )
                 except Exception as _exc:  # noqa: BLE001
                     # Busy on the evidence lock OR a transient failure
@@ -1780,7 +1781,7 @@ class BackfillRunner:
             # distributed across the Semaphore).
             years = list(range(from_d.year, to_d.year + 1))
             year_batches = await asyncio.gather(
-                *[_process_moex_year(inst, meta, y) for y in years],
+                *[_process_moex_year(inst, meta, y, from_d, to_d) for y in years],
                 return_exceptions=True,
             )
             all_bars: list[dict] = []
@@ -2469,7 +2470,9 @@ class BackfillRunner:
                         figi=figi, ticker=ticker,
                         rows=candles, board="TQBR",
                         isin=meta_isin,
-                        outcome=outcome,
+                        outcome=outcome, today=today,
+                        from_d=max(from_, date(year, 1, 1)),
+                        to_d=min(to, date(year, 12, 31)),
                     )
                 except Exception as _exc:  # noqa: BLE001
                     # No exception contents in the diagnostic line —

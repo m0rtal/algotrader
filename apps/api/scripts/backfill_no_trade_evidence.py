@@ -318,6 +318,7 @@ def main() -> int:
                     rows=all_rows, board=board,
                     isin=upstream_isin,
                     outcome=overall,
+                    from_d=lo, to_d=win_hi, today=date.today(),
                 )
             except WriterLockBusy as exc:
                 print(format_busy_defer(exc))

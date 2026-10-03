@@ -395,6 +395,30 @@ def test_walker_partial_outcome_writes_no_evidence_but_keeps_bars(runner):
     )
 
 
+def test_per_ticker_walker_passes_exact_requested_window(runner, monkeypatch):
+    from algotrader_api.ingestion import no_trade_evidence as nte
+    import asyncio
+
+    with sqlite3.connect(runner.db_path) as con:
+        con.execute(
+            "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin) "
+            "VALUES ('GAZP', 'WINDOW', 'share', 'Gazp', 'rub', 1, 'RU')"
+        )
+    monkeypatch.setattr(nte, 'fetch_issuer_identity', lambda *a: {'isin': 'RU'})
+    rows = [dict(figi=None, ts=ts, open=None, high=None, low=None, close=None,
+                 volume=0, source='moex', _secid='GAZP', _boardid='TQBR',
+                 _numtrades=0, _value=0)
+            for ts in ('2026-01-05', '2026-09-01', '2026-10-05', '2099-01-05')]
+    monkeypatch.setattr(runner, '_fetch_year_moex_outcome', lambda *a, **kw: (rows, 'complete'))
+    runner.client.get_candles = AsyncMock(return_value=[])
+    asyncio.run(runner._backfill_one_moex(
+        figi='WINDOW', ticker='GAZP', from_=date(2026, 9, 1), to=date(2026, 9, 30),
+    ))
+    with sqlite3.connect(runner.db_path) as con:
+        assert con.execute('SELECT session_date FROM moex_no_trade_evidence').fetchall() == [('2026-09-01',)]
+        assert con.execute('SELECT COUNT(*) FROM bars').fetchone()[0] == 0
+
+
 def test_walker_complete_outcome_writes_evidence_for_business_dates(runner):
     """Complete historical fetch records zero-trade evidence for the
     business dates in the response, real-bar-wins, and keeps the bar

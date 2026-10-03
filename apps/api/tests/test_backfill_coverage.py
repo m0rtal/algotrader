@@ -543,6 +543,23 @@ def historical_gate(tmp_path, monkeypatch):
     sqlitedb.close_all()
 
 
+def test_public_walker_keeps_evidence_inside_listing_and_completed_session(historical_gate):
+    proof = historical_gate
+    proof.feeds[2014].append([
+        '2014-01-14', None, None, None, None, 0, 0, 0, 'GAZP', 'TQBR',
+    ])
+    proof.feeds[2024].append([
+        '2024-12-31', None, None, None, None, 0, 0, 0, 'GAZP', 'TQBR',
+    ])
+    proof.walk('complete')
+    post = proof.snapshot()
+    dates = {row[0] for row in post['evidence']}
+    assert '2014-01-14' not in dates
+    assert '2024-12-31' not in dates
+    assert '2014-01-16' in dates
+    assert post['bars'] == proof.pre['bars']
+
+
 def test_walker_end_to_end_gate_improves_on_temp_db(historical_gate):
     proof = historical_gate
     proof.walk('complete')

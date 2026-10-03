@@ -1,5 +1,28 @@
 # Historical MOEX Evidence Implementation Plan
 
+## Final-fix contract ruling (supersedes older examples below)
+
+`record_historical_no_trade_evidence(conn, *, db_path, figi, ticker, rows,
+board, isin, outcome, from_d, to_d, today=None)` requires an explicit validated
+ordered date window. Every caller and direct-call fixture must supply it.
+The public walker intersects listing/requested range with the fetched year;
+the per-ticker walker intersects its requested range with the year; the CLI
+passes its actual `lo`/`win_hi`. No CLI argument or legacy bar-list filter changes.
+
+The shared helper, not local bar presence or caller extraction, requires all
+normalized OHLC keys explicitly None and all three counters numeric zero,
+never missing, bool, None, strings or non-finite values. It skips positive
+rows without poisoning valid zeros. Dates are strict YYYY-MM-DD, in-window,
+strictly before today, weekdays and not cached MOEX holidays. Out-of-window
+rows produce a bounded diagnostic, not a no-trade conclusion. Malformed JSON
+returns `malformed` while retaining earlier valid bars. Borrowed connections
+are never closed; writer acquisition remains once, with network outside locks.
+
+Cost: updating all call sites and fixture windows rather than retaining an
+unbounded compatibility default. This prevents denominator corruption from
+positive missing bars, earlier year rows and unpublished/future sessions.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task.

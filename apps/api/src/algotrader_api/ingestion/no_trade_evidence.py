@@ -42,6 +42,7 @@ Coordination (writer-coordination spec, Task 3):
 """
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import sqlite3
@@ -248,17 +249,23 @@ def _is_business_date_for_evidence(
     *,
     today: date | None = None,
 ) -> bool:
-    """True iff ``ts`` is an ISO date, a weekday, and not in
-    ``moex_holidays``.
+    """True iff ``ts`` is a strict ISO date for a completed business session.
+
+    The date must precede ``today`` (or the local clock), be a weekday,
+    and not appear in ``moex_holidays``. No current/future session is certified.
 
     Pure SQL helper. Does NOT acquire the writer lock; callers that
     persist rows must already hold it. Operates on the caller's open
     connection so a single transaction sees both the holiday table
     and the evidence table.
     """
+    if not isinstance(ts, str) or len(ts) != 10:
+        return False
     try:
-        d = date.fromisoformat((ts or "")[:10])
+        d = date.fromisoformat(ts)
     except ValueError:
+        return False
+    if d.isoformat() != ts or d >= (today or date.today()):
         return False
     if d.weekday() >= 5:  # Saturday / Sunday.
         return False
@@ -279,6 +286,8 @@ def record_historical_no_trade_evidence(
     board: str,
     isin: str,
     outcome: MOEXFetchOutcome,
+    from_d: date,
+    to_d: date,
     today: date | None = None,
 ) -> int:
     """Persist zero-trade evidence for a historical MOEX walk.
@@ -306,12 +315,20 @@ def record_historical_no_trade_evidence(
         whole batch is rejected (no DB write). The same
         ``identity_mismatch`` log line is emitted so the operator
         sees the gap.
-      * The brief preserves the public signature — no new
-        argument is added. The existing ``isin`` argument now
-        carries the upstream-verified metadata ISIN; the helper
+      * ``isin`` carries the upstream-verified metadata ISIN; the helper
         itself does the local-vs-upstream cross-check.
 
+    Window contract: ``from_d`` and ``to_d`` are mandatory ordered date
+    objects carrying the actual caller window, not the fetched year's bounds.
+    Invalid windows raise ValueError. Borrowed connections are never closed.
+
     Filter rule (after both gates pass):
+      * require all four normalized OHLC keys explicitly present and None,
+        plus explicit numeric (not bool) zero volume, _numtrades and _value;
+        positive rows are skipped without poisoning valid zero rows;
+      * require a strict YYYY-MM-DD date within [from_d, to_d] that precedes
+        today and is a weekday outside the cached MOEX holiday calendar;
+        out-of-window rows produce one bounded batch diagnostic;
       * keep rows whose ``_secid`` matches the explicit ``ticker``
         argument (the caller threads the ticker through from the
         ``instruments`` row — the helper MUST NOT guess the
@@ -330,6 +347,11 @@ def record_historical_no_trade_evidence(
     recent-vs-historical expiry branching, real-bar-wins filtering,
     and ON CONFLICT refresh behaviour stay verbatim.
     """
+    if (not isinstance(from_d, datetime.date) or not isinstance(to_d, datetime.date)
+            or isinstance(from_d, datetime.datetime) or isinstance(to_d, datetime.datetime)
+            or from_d > to_d):
+        raise ValueError("historical evidence requires an ordered date window")
+    today = today or date.today()
     if outcome != "complete":
         logging.getLogger("algotrader.ingestion").info(
             "moex_historical_evidence_rejected figi=%s reason=%s rows=%s",
@@ -363,21 +385,36 @@ def record_historical_no_trade_evidence(
     if not rows:
         return 0
     accepted: list[dict] = []
+    out_of_window = 0
+    non_business_dates = 0
     for r in rows:
         if str(r.get("_secid") or "") != ticker:
             continue
         if str(r.get("_boardid") or "") != board:
             continue
-        ts = (r.get("ts") or "")[:10]
+        # Complete provenance is not enough: positive bars never prove no trade.
+        # Exact numeric zero excludes missing, bool, strings, NaN and infinity.
+        if not all(k in r and r[k] is None for k in ("open", "high", "low", "close")):
+            continue
+        if not all(type(r.get(k)) in (int, float) and r[k] == 0
+                   for k in ("volume", "_numtrades", "_value")):
+            continue
+        ts = r.get("ts")
         if not _is_business_date_for_evidence(conn, ts, today=today):
+            non_business_dates += 1
+            continue
+        if not from_d.isoformat() <= ts <= to_d.isoformat():
+            out_of_window += 1
             continue
         accepted.append({"ts": ts})
-    if not accepted:
+    if out_of_window or non_business_dates or not accepted:
         logging.getLogger("algotrader.ingestion").info(
-            "moex_historical_evidence_rejected figi=%s "
-            "reason=non_business_date rows=%s",
-            figi, len(rows),
+            "moex_historical_evidence_rejected figi=%s reason=%s rows=%s",
+            figi, ("out_of_window" if out_of_window else
+                   "non_business_date" if non_business_dates else "no_eligible_zero_session"),
+            out_of_window or non_business_dates or len(rows),
         )
+    if not accepted:
         return 0
     return record_no_trade_evidence(
         conn,

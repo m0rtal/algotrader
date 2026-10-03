@@ -70,7 +70,7 @@ capability stays the single source of truth for evidence serialization.
    on outcome and refuse to record zero-trade evidence from anything
    other than `complete`.
 2. New helper `record_historical_no_trade_evidence(conn, *, db_path,
-   figi, ticker, rows, board, isin, outcome, today=None) -> int`
+   figi, ticker, rows, board, isin, outcome, from_d, to_d, today=None) -> int`
    in `apps.api.ingestion.no_trade_evidence`. The explicit `ticker`
    argument is the contract that lets the helper perform the
    per-row identity filter without guessing from `rows[0]`. The

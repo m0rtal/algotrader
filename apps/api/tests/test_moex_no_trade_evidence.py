@@ -1858,10 +1858,10 @@ def test_record_historical_no_trade_evidence_rejects_partial(tmp_path):
     db = tmp_path / "nte.db"
     con = _make_conn(db)
     rows = [
-        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
     ]
     written = record_historical_no_trade_evidence(
-        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
         rows=rows, board="TQBR", isin="RU000GAZP",
         outcome="partial",
     )
@@ -1880,7 +1880,7 @@ def test_record_historical_no_trade_evidence_rejects_error(tmp_path):
     db = tmp_path / "nte.db"
     con = _make_conn(db)
     written = record_historical_no_trade_evidence(
-        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
         rows=[{"ts": "2025-09-29"}], board="TQBR", isin="RU",
         outcome="error",
     )
@@ -1895,7 +1895,7 @@ def test_record_historical_no_trade_evidence_rejects_malformed(tmp_path):
     db = tmp_path / "nte.db"
     con = _make_conn(db)
     written = record_historical_no_trade_evidence(
-        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
         rows=[{"ts": "2025-09-29"}], board="TQBR", isin="RU",
         outcome="malformed",
     )
@@ -1909,9 +1909,9 @@ def test_record_historical_no_trade_evidence_rejects_identity_mismatch(tmp_path)
 
     db = tmp_path / "nte.db"
     con = _make_conn(db)
-    rows = [{"ts": "2025-09-29", "_secid": "SBER", "_boardid": "TQBR"}]
+    rows = [{"ts": "2025-09-29", "_secid": "SBER", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0}]
     written = record_historical_no_trade_evidence(
-        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
         rows=rows, board="TQBR", isin="RU",
         outcome="identity_mismatch",
     )
@@ -1997,13 +1997,13 @@ def test_record_historical_no_trade_evidence_complete_filters_non_business(
     )
     con.commit()
     rows = [
-        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},  # holiday
-        {"ts": "2025-09-27", "_secid": "GAZP", "_boardid": "TQBR"},  # Sat
-        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR"},  # Tue ok
-        {"ts": "garbage",   "_secid": "GAZP", "_boardid": "TQBR"},  # bad
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},  # holiday
+        {"ts": "2025-09-27", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},  # Sat
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},  # Tue ok
+        {"ts": "garbage",   "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},  # bad
     ]
     written = record_historical_no_trade_evidence(
-        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        con, from_d=date(2025, 9, 27), to_d=date(2025, 9, 30), db_path=str(db), figi="FIGI1", ticker="GAZP",
         rows=rows, board="TQBR", isin="RU",
         outcome="complete",
     )
@@ -2042,11 +2042,11 @@ def test_record_historical_no_trade_evidence_complete_keeps_ttl_semantics(
     # business-date sibling that still spans the recent/historical
     # TTL cut-off (14 days from `today`).
     rows = [
-        {"ts": "2026-09-25", "_secid": "GAZP", "_boardid": "TQBR"},
-        {"ts": "2026-08-03", "_secid": "GAZP", "_boardid": "TQBR"},
+        {"ts": "2026-09-25", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+        {"ts": "2026-08-03", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
     ]
     record_historical_no_trade_evidence(
-        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        con, from_d=date(2026, 8, 3), to_d=date(2026, 9, 25), db_path=str(db), figi="FIGI1", ticker="GAZP",
         rows=rows, board="TQBR", isin="RU",
         outcome="complete", today=today,
     )
@@ -2080,10 +2080,10 @@ def test_record_historical_no_trade_evidence_complete_respects_real_bar(
     )
     _insert_bar(con, "FIGI1", "2025-09-30", close=100)
     rows = [
-        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR"},
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
     ]
     written = record_historical_no_trade_evidence(
-        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        con, from_d=date(2025, 9, 30), to_d=date(2025, 9, 30), db_path=str(db), figi="FIGI1", ticker="GAZP",
         rows=rows, board="TQBR", isin="RU",
         outcome="complete",
     )
@@ -2117,11 +2117,11 @@ def test_record_historical_no_trade_evidence_uses_explicit_ticker_not_rows_zero(
     rows = [
         # First row is a mirror (would mislead a "guess from rows[0]"
         # implementation). Every other row is identity-correct.
-        {"ts": "2025-09-29", "_secid": "SBER", "_boardid": "TQBR"},
-        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR"},
+        {"ts": "2025-09-29", "_secid": "SBER", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
     ]
     written = record_historical_no_trade_evidence(
-        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 30), db_path=str(db), figi="FIGI1", ticker="GAZP",
         rows=rows, board="TQBR", isin="RU",
         outcome="complete",
     )
@@ -2162,11 +2162,11 @@ def test_record_historical_no_trade_evidence_rejects_isin_mismatch(tmp_path):
     )
     con.commit()
     rows = [
-        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
-        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR"},
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
     ]
     written = record_historical_no_trade_evidence(
-        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 30), db_path=str(db), figi="FIGI1", ticker="GAZP",
         rows=rows, board="TQBR", isin="UPSTREAM",
         outcome="complete",
     )
@@ -2200,12 +2200,12 @@ def test_record_historical_no_trade_evidence_fails_closed_on_missing_upstream_is
     )
     con.commit()
     rows = [
-        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
     ]
     # Caller passed an empty upstream ISIN (the MOEX probe
     # returned no value).
     written = record_historical_no_trade_evidence(
-        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
         rows=rows, board="TQBR", isin="",
         outcome="complete",
     )
@@ -2234,10 +2234,10 @@ def test_record_historical_no_trade_evidence_allows_blank_to_blank(tmp_path):
     # No instrument row seeded at all — local_isin is "". Upstream
     # ISIN is also "". They match (both blank).
     rows = [
-        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
     ]
     written = record_historical_no_trade_evidence(
-        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
         rows=rows, board="TQBR", isin="",
         outcome="complete",
     )
@@ -2288,11 +2288,11 @@ def test_record_historical_no_trade_evidence_acquires_lock_exactly_once(
     )
     con.commit()
     rows = [
-        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
     ]
     with _mock.patch.object(_wl_mod, "writer_lock", _tracking_lock):
         written = record_historical_no_trade_evidence(
-            con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+            con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
             rows=rows, board="TQBR", isin="RU",
             outcome="complete",
         )
@@ -2342,12 +2342,12 @@ def test_record_historical_no_trade_evidence_lock_busy_propagates(tmp_path):
     )
     con.commit()
     rows = [
-        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
     ]
     with _mock.patch.object(_wl_mod, "writer_lock", _busy_lock):
         with pytest.raises(WriterLockBusy):
             record_historical_no_trade_evidence(
-                con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+                con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
                 rows=rows, board="TQBR", isin="RU",
                 outcome="complete",
             )

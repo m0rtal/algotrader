@@ -190,19 +190,39 @@ only when:
 
 The helper signature is
 `record_historical_no_trade_evidence(conn, *, db_path, figi, ticker,
-rows, board, isin, outcome, today=None) -> int`. The explicit
-`ticker` parameter is the contract that lets the helper perform
-the per-row identity filter without guessing from `rows[0]`.
+rows, board, isin, outcome, from_d, to_d, today=None) -> int`. The explicit
+`ticker` parameter lets the helper perform the per-row identity filter without
+guessing from `rows[0]`. Mandatory `from_d` and `to_d` are ordered date objects
+carrying the actual caller window. Invalid or omitted windows MUST NOT certify
+any evidence. The public walker passes its listing/requested window intersected
+with each fetched year; the per-ticker walker passes its requested range; the
+CLI passes its chosen `[lo, win_hi]` without adding CLI arguments.
 
-When ANY of conditions 1–4 fails for a figi, the helper SHALL
-record no evidence rows for that figi and SHALL emit exactly one
-structured log line:
+The helper SHALL independently require normalized `open`, `high`, `low`, `close`
+keys all explicitly present and `None`, and `volume`, `_numtrades`, `_value`
+explicitly finite numeric zero (not bool, missing, None, or strings). Positive
+trade rows SHALL be skipped, never inferred as evidence from missing local bars.
+Their presence SHALL NOT poison valid zero rows in a validated complete feed.
+Dates SHALL be exact `YYYY-MM-DD`, within the caller window, strictly before
+`today` (or the current date), weekdays, and absent from cached `moex_holidays`.
+Thus evidence cannot exceed the last completed published business session.
+
+Malformed JSON containers, missing required structural blocks, invalid numeric
+rows or cursor containers SHALL return `malformed`, not raise an unchecked
+container exception. Valid bars collected on preceding pages SHALL remain in
+the returned list. No duplicated HTTP fetch is permitted.
+
+Non-complete outcomes and ISIN mismatch SHALL reject the whole batch with one
+structured log line. Individual invalid dates, identities and non-zero shapes
+SHALL be skipped; valid explicit zeros may still be recorded. Out-of-window
+rows SHALL emit one bounded batch diagnostic, even when other rows are accepted.
+An empty eligible set SHALL produce no evidence. Diagnostics use:
 
     {event: "moex_historical_evidence_rejected",
-     figi, ticker, reason, rows}
+     figi, reason, rows}
 
 where `reason ∈ {partial, error, malformed, identity_mismatch,
-non_business_date}`.
+non_business_date, out_of_window, no_eligible_zero_session}`.
 
 The bar list consumed by the backfill walker SHALL be unaffected:
 when outcome is non-`complete`, the walker continues writing real
@@ -221,6 +241,40 @@ MUST delegate the actual `INSERT … ON CONFLICT` to the existing
 `record_no_trade_evidence` so TTL semantics, recent-vs-historical
 expiry branching, real-bar-wins filtering, and `ON CONFLICT` refresh
 behaviour are preserved verbatim.
+
+#### Scenario: positive missing bar does not prove no trade
+
+- GIVEN a validated complete feed containing a null-OHLC zero-counter row for
+  2026-09-01 and a positive-trade OHLC row for 2026-09-02
+- AND neither session has a local bar
+- WHEN the historical CLI passes the same fetched rows to the shared helper
+  with caller window `[2026-09-01, 2026-09-30]`
+- THEN only 2026-09-01 SHALL be recorded as evidence
+- AND `bars` SHALL remain unchanged
+- AND missing OHLC keys, missing counters, bool counters, fractional volume,
+  NaN or negative volume SHALL never qualify as explicit zero evidence.
+
+#### Scenario: caller window and completed-session cap cannot be widened by year fetch
+
+- GIVEN `today = 2026-10-02` and caller window `[2026-09-01, 2026-09-30]`
+- AND the complete annual feed also returns explicit zeros for 2026-01-05,
+  2026-10-02, 2026-10-05 and 2099-01-05
+- WHEN the shared helper evaluates these rows
+- THEN none of those four dates SHALL be evidence
+- AND a valid 2026-09-01 zero row SHALL be accepted
+- AND out-of-window rows SHALL produce one bounded rejection diagnostic
+- AND non-ISO suffixes SHALL not be truncated into accepted dates.
+
+#### Scenario: malformed JSON after a valid first page preserves partial bars
+
+- GIVEN a valid positive bar on the first HTTP 200 page and a cursor promising
+  a second page
+- AND the second JSON response is null, a list, a null history block, malformed
+  columns, malformed raw rows or a malformed cursor container
+- WHEN `_fetch_year_moex_outcome` walks the finite response sequence
+- THEN it SHALL return `malformed` without an unchecked container exception
+- AND its returned rows SHALL retain the first positive bar
+- AND the evidence path SHALL record nothing from the malformed batch.
 
 #### Scenario: complete historical response writes evidence for business dates only
 
