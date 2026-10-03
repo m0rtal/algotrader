@@ -70,13 +70,16 @@ capability stays the single source of truth for evidence serialization.
    on outcome and refuse to record zero-trade evidence from anything
    other than `complete`.
 2. New helper `record_historical_no_trade_evidence(conn, *, db_path,
-   figi, rows, board, isin, outcome, today=None) -> int` in
-   `apps.api.ingestion.no_trade_evidence`. It accepts only
-   `outcome == "complete"`; for every other outcome it returns `0` and
-   performs no SQLite mutation. When accepted, it delegates to the
-   existing `record_no_trade_evidence` so TTL semantics, recent /
-   historical expiry branching, real-bar-wins filtering, and ON CONFLICT
-   refresh behaviour are preserved verbatim.
+   figi, ticker, rows, board, isin, outcome, today=None) -> int`
+   in `apps.api.ingestion.no_trade_evidence`. The explicit `ticker`
+   argument is the contract that lets the helper perform the
+   per-row identity filter without guessing from `rows[0]`. The
+   helper accepts only `outcome == "complete"`; for every other
+   outcome it returns `0` and performs no SQLite mutation. When
+   accepted, it delegates to the existing
+   `record_no_trade_evidence` so TTL semantics, recent /
+   historical expiry branching, real-bar-wins filtering, and ON
+   CONFLICT refresh behaviour are preserved verbatim.
 3. Business-date filtering for the historical walk: the helper
    subtracts weekends and `moex_holidays` from the [from_d, to_d]
    window before deciding which zero-trade rows to record. A row that
@@ -85,20 +88,30 @@ capability stays the single source of truth for evidence serialization.
    is the per-row mirror of the explicit “record evidence only on
    requested business dates” rule.
 4. The historical walker
-   (`apps.api.scripts.backfill_no_trade_evidence.py` + the
-   `BackfillRunner._process_moex_year` historical walk path) is
-   refactored to:
-   - capture the `MOEXFetchOutcome` from `_fetch_year_moex` per figi;
+   (`BackfillRunner._process_moex_year` and `_process_one`
+   historical walk branch) is refactored to:
+   - capture the `MOEXFetchOutcome` from
+     `_fetch_year_moex_outcome` per figi (the function is bound to
+     the `BackfillRunner` instance as a method so the walker is
+     statically bound to the new fetch symbol — the plan MUST
+     define this binding in Task 2, not defer it to a later
+     refactor);
    - record zero-trade evidence only when outcome is `complete` and
-     every row’s SECID matches the ticker and BOARDID matches the
-     figi board;
+     every row's SECID matches the explicit `ticker` and BOARDID
+     matches the figi board;
    - log a single structured line per rejected batch:
      `{event: moex_historical_evidence_rejected, figi, ticker, reason,
      rows}` where `reason ∈ {partial, error, malformed,
-     identity_mismatch}`;
+     identity_mismatch, non_business_date}`;
    - leave the `bars` list alone so the in-process backfill still
      writes whatever real bars the partial response had; bar count is
      unchanged for consumers that already tolerate partial bars.
+   This is a **mandatory** integration, not an optional extension:
+   the verified investigation's gate improvement is the new
+   evidence path, and a helper-only change that leaves the in-
+   process walker on the old list-only path does not move the
+   gate. No claim that all 215 incomplete-history figis are
+   recoverable is made or implied.
 5. Writer lock: the new helper acquires the shared writer lock once
    through the existing `writer-coordination` infrastructure
    (`_evidence_writer_lock` / `writer_lock` context manager with
@@ -142,17 +155,30 @@ capability stays the single source of truth for evidence serialization.
 ## Out-of-goals
 
 - No new MOEX HTTP requests; we reuse each full-year payload the
-  walker already issues.
+  walker already issues. The evidence path reads from the same
+  row list the bar consumer reads; there is no second fetch per
+  figi.
 - No fabricated OHLCV bars; the `bars` table only ever gets real
   upstream data.
-- No claim that all 215 incomplete-history figis are recoverable;
-  the change fixes the contract, the production walker still walks the
-  same window. Completion is measured separately and on its own
-  schedule.
-- No new public metric, no new cached `expected_bars` writes, no new
-  scheduled phase, no new thread / timeout / budget.
+- No claim that all 215 incomplete-history figis are recoverable
+  or that the daily 45-minute phase hang is caused by missing
+  evidence. The change fixes the contract; the production walker
+  still walks the same window. Completion is measured separately
+  and on its own schedule.
+- No CLI argument expansion: the existing
+  `apps/api/scripts/backfill_no_trade_evidence.py` is updated to
+  route through the new helper (so it picks up the outcome gate,
+  the business-date filter, and the structured
+  `moex_historical_evidence_rejected` line) but it does not gain
+  new arguments, new exit codes, or new branches.
+- No new public metric, no new cached `expected_bars` writes from
+  the change itself (the end-to-end test runs
+  `populate_expected_bars` on a TEMP DB to recompute the canonical
+  `expected_bars`; production threshold / universe / expected
+  formula are unchanged), no new scheduled phase, no new thread /
+  timeout / budget.
 - No changes to TTL semantics (recent 7 d / historical 365 d), the
-  cached `expected_bars` denominator, the 95 % coverage threshold, or
-  the writer-coordination lock namespace.
-- No re-introduction of raw `INSERT INTO bars` on the backfill path;
-  the writer-coordination raw-path removal stays.
+  cached `expected_bars` denominator, the 95 % coverage threshold,
+  or the writer-coordination lock namespace.
+- No re-introduction of raw `INSERT INTO bars` on the backfill
+  path; the writer-coordination raw-path removal stays.

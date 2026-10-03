@@ -8,9 +8,15 @@ The system SHALL classify every MOEX ISS `/iss/history/.../securities/{ticker}.j
 fetch performed by `apps.api.ingestion.backfill._fetch_year_moex`
 into exactly one `MOEXFetchOutcome` value drawn from the set
 `{complete, partial, error, malformed, identity_mismatch}`. The
-function SHALL return the outcome alongside the list of parsed rows
-it already returns today, so every caller can distinguish a
-validated full paginated response from a degraded one.
+outcome is a `typing.Literal` alias declared in
+`apps.api.ingestion.no_trade_evidence` and re-exported (NOT
+re-declared) by `apps.api.ingestion.backfill` so callers always
+import the same symbol. The function SHALL return the outcome
+alongside the list of parsed rows it already returns today, so every
+caller can distinguish a validated full paginated response from a
+degraded one. Callers compare the outcome with a plain string
+literal (`outcome == "complete"`, never `MOEXFetchOutcome("complete")`
+— the alias is not a runtime constructor).
 
 Outcome reduction rules (the function MUST apply these verbatim):
 
@@ -18,18 +24,47 @@ Outcome reduction rules (the function MUST apply these verbatim):
    fetching pages.
 2. `malformed` — response payload missing the `TRADEDATE` column,
    OR no `history.cursor` block AND short page (cannot certify
-   pagination completeness on its own).
-3. `partial` — cursor present but `offset + len(rows) < total`
-   (pagination incomplete).
+   pagination completeness on its own), OR HTTP `status_code != 200`,
+   OR the requested `start` cursor offset does not match the
+   server-reported cursor offset, OR the cursor's reported page
+   size does not match the page size the loop actually received
+   (consistency check), OR a repeated cursor offset is observed
+   (the loop must advance, never loop), OR the cursor's `total` is
+   non-positive.
+3. `partial` — cursor present and consistent, but
+   `offset + len(rows) < total` (pagination incomplete on the final
+   page).
 4. `identity_mismatch` — at least one parsed row carries
-   `SECID != ticker` or `BOARDID != board`.
+   `SECID != ticker` or `BOARDID != board` (single cross-listed
+   mirror row poisons the entire batch — identity is per-batch).
 5. `complete` — every page parsed cleanly, every SECID / BOARDID
-   matched the request, and the final cursor showed
-   `offset + len(rows) >= total`.
+   matched the request, the final cursor showed
+   `offset + len(rows) >= total`, the loop advanced monotonically,
+   and the empty final-page short-circuit fired only after a full
+   page of rows preceded it (a `len(rows) < page_size` first page
+   with no cursor cannot certify completeness).
+
+Strict feed contract (each row the loop accepts as input to
+`complete` MUST satisfy all of these; the fetcher drops non-conforming
+rows before the row list is returned, so the bar consumer sees
+cleaned data and the evidence consumer never sees non-conforming
+rows):
+
+- HTTP `status_code == 200` for the page.
+- Row length equals the column-list length (no malformed rows).
+- The four OHLC columns are present (and parsed as `None` for the
+  explicit zero-trade shape, not as missing/missing-converted-None);
+  missing OHLC on a non-zero `VOLUME` row is malformed.
+- `VOLUME` is present (the column itself; zero is a valid value).
+- `NUMTRADES` and `VALUE` are present and equal to `0` for the
+  zero-trade shape; missing counters on a zero-trade row are
+  malformed (the helper relies on the explicit `0`).
 
 The list of parsed rows returned by the function SHALL be unchanged
-for bar consumers (existing partial-bar tolerance is preserved). The
-outcome is the only addition.
+for bar consumers (existing partial-bar tolerance is preserved for
+rows that already passed the strict feed contract on a non-final
+page; the bar consumer keeps its current list with no behaviour
+change). The outcome is the only addition.
 
 #### Scenario: complete response with explicit zero-trade row
 
@@ -83,7 +118,54 @@ outcome is the only addition.
 - WHEN the function returns
 - THEN the outcome SHALL be `"identity_mismatch"`
 - AND the list SHALL still contain every parsed row
-- (bar consumers that already accepted the data unaffected.
+  (bar consumers that already accepted the data unaffected).
+
+#### Scenario: non-200 HTTP status is reported as malformed
+
+- GIVEN `requests.get` returns a response with
+  `status_code = 500`
+- AND the body would otherwise parse cleanly
+- WHEN the function returns
+- THEN the outcome SHALL be `"malformed"`
+- AND the list SHALL be `[]`.
+
+#### Scenario: missing OHLC on a non-zero volume row is reported as malformed
+
+- GIVEN a response row carries `OPEN=HIGH=LOW=CLOSE` absent AND
+  `VOLUME > 0`
+- WHEN the function returns
+- THEN the outcome SHALL be `"malformed"`
+- AND the offending row SHALL be dropped from the list (bar
+  consumer sees a clean list).
+
+#### Scenario: initial cursor offset mismatch is reported as malformed
+
+- GIVEN the loop requests `start=0` AND the server-reported
+  `history.cursor` offset is `2`
+- WHEN the function returns
+- THEN the outcome SHALL be `"malformed"`
+- (the server told us a different starting point than we asked for;
+  we cannot certify completeness on a cursor we did not start
+  from).
+
+#### Scenario: repeated cursor offset is reported as malformed
+
+- GIVEN two consecutive pages return the same `history.cursor`
+  offset (server-side loop / no progress)
+- WHEN the function returns
+- THEN the outcome SHALL be `"malformed"`
+- AND the row list SHALL be the union of the two pages' rows
+  (no bar consumer data loss beyond what the bad response
+  itself produced).
+
+#### Scenario: identity_mismatch poisons the whole batch
+
+- GIVEN a complete paginated response that contains one row with
+  `SECID = "SBER"` while the caller asked for `ticker = "GAZP"`
+- AND every other row matches identity
+- WHEN the function returns
+- THEN the outcome SHALL be `"identity_mismatch"` (a single
+  cross-listed mirror row is enough; identity is per-batch).
 
 ### Requirement: Historical Evidence Walk for Stale Figis
 
@@ -93,14 +175,24 @@ only when:
 
 1. The upstream `_fetch_year_moex` outcome for the historical window
    is `"complete"`;
-2. Every emitted row carries `SECID == ticker` and
-   `BOARDID == board`;
+2. Every emitted row carries `SECID == ticker` AND
+   `BOARDID == board` (the helper is invoked with the explicit
+   `ticker` carried from the producer through the caller — the
+   helper MUST NOT guess the ticker from `rows[0].get("_secid")`);
 3. The figi’s `instruments.isin` (when non-empty) matches the
    upstream ISIN metadata fetched by
-   `apps.api.ingestion.backfill._get_meta_moex`;
+   `apps.api.ingestion.backfill._get_meta_moex`; a single ISIN
+   mismatch is a batch-poisoning event (the helper rejects the
+   whole batch even if the per-row SECID/BOARDID checks passed);
 4. Every row’s `TRADEDATE` parses as a valid ISO date, falls inside
    the requested `[from_d, to_d]` window, AND is a business date
    (weekday AND not present in `moex_holidays`).
+
+The helper signature is
+`record_historical_no_trade_evidence(conn, *, db_path, figi, ticker,
+rows, board, isin, outcome, today=None) -> int`. The explicit
+`ticker` parameter is the contract that lets the helper perform
+the per-row identity filter without guessing from `rows[0]`.
 
 When ANY of conditions 1–4 fails for a figi, the helper SHALL
 record no evidence rows for that figi and SHALL emit exactly one
@@ -170,6 +262,31 @@ behaviour are preserved verbatim.
   `{event: "moex_historical_evidence_rejected",
   reason: "identity_mismatch"}` SHALL be emitted.
 
+#### Scenario: ISIN mismatch poisons the whole batch
+
+- GIVEN a figi whose `instruments.isin` is `"RU000A107UL4"` AND
+  `_get_meta_moex` returns `isin = "US00206R1023"` for the
+  upstream board
+- AND the per-row SECID/BOARDID checks all pass
+- WHEN `record_historical_no_trade_evidence` runs for that figi
+- THEN `moex_no_trade_evidence` SHALL remain unchanged for that
+  figi
+- AND one structured log line with
+  `{event: "moex_historical_evidence_rejected",
+  reason: "identity_mismatch"}` SHALL be emitted (a single ISIN
+  mismatch is a batch-poisoning event; the helper does not
+  attempt to record partial-batch evidence).
+
+#### Scenario: helper signature carries explicit ticker
+
+- GIVEN `record_historical_no_trade_evidence` is called with
+  `ticker = "GAZP"` AND `rows` whose first row has
+  `_secid = "SBER"`
+- WHEN the helper runs
+- THEN it MUST compare every row's `_secid` against the
+  explicit `ticker` parameter (not against `rows[0].get("_secid")`)
+- AND the batch SHALL be rejected for `identity_mismatch`.
+
 #### Scenario: rows on non-business dates are skipped
 
 - GIVEN a figi whose historical fetch outcome is `"complete"`
@@ -229,3 +346,37 @@ behaviour are preserved verbatim.
 - AND stdout SHALL contain exactly one
   `moex_historical_evidence_rejected` line for that figi with
   `reason: "partial"`.
+
+#### Scenario: end-to-end walker writes only explicit zero-trade evidence
+
+- GIVEN a figi instrument seeded on a TEMP DB with
+  `instruments.expected_bars` set to `expected_business_days(2024-01-01, 2024-12-31)`
+  AND a real `bars` row only for `2024-01-15`
+- AND `_fetch_year_moex` returns a strict synthetic feed:
+  one page, `start=0`/`offset=0`/`total=N`/`page_size=N`,
+  `status_code = 200`, every row has matching SECID/BOARDID,
+  every row that is not `2024-01-15` is an explicit zero-trade
+  shape (`OPEN=HIGH=LOW=CLOSE=None`, `VOLUME=NUMTRADES=VALUE=0`)
+  on a weekday not in `moex_holidays`, every row's `ts` is a
+  valid ISO date inside `[2024-01-01, 2024-12-31]`
+- WHEN the historical walker
+  (`BackfillRunner._process_moex_year` and the in-process call
+  path) runs for that figi
+- AND `populate_expected_bars` recomputes the canonical
+  `expected_bars` for the figi (TEMP DB only — the production
+  threshold / universe / expected formula are unchanged)
+- AND `check_coverage([figi])` is called
+- THEN `bars` SHALL contain exactly one row (the `2024-01-15`
+  real bar) — no fabricated OHLC rows
+- AND `moex_no_trade_evidence` SHALL contain one row per
+  weekday, non-holiday, in-window zero-trade date the upstream
+  served (TTL semantics preserved: recent → 7 days, historical
+  → 365 days)
+- AND `check_coverage([figi])` SHALL return `ok=True`
+- AND the figure's `bars_count / expected_bars` ratio SHALL
+  be `>= 0.95` (the canonical threshold; no manual denominator
+  override)
+- AND without the evidence write, the same synthetic feed
+  would have left `check_coverage([figi])` failing
+  (the test asserts the pre-evidence ratio is below `0.95`,
+  the post-evidence ratio is at or above it).
