@@ -53,6 +53,7 @@ from algotrader_api.ingestion.no_trade_evidence import (  # noqa: E402
 )
 from algotrader_api.ingestion.writer_lock import (  # noqa: E402
     WriterLockBusy,
+    format_busy_defer,
     writer_lock,
 )
 
@@ -96,22 +97,6 @@ def _probe_board_last(ticker: str) -> tuple[str, str] | None:
         if best is None or lt_s > best[1]:
             best = (str(b[idx["boardid"]]), lt_s)
     return best
-
-
-def _format_defer(exc: "WriterLockBusy") -> str:
-    """Render a single bounded ``DEFER writer-lock-busy ...`` line.
-
-    The line carries only the safe metadata exposed by
-    :class:`WriterLockBusy` (role, phase, timeout, reason, result).
-    It must not include the database path, figi, ticker, or any
-    secret. Used by the CLI when either the ``listed-till`` lock or
-    the ``evidence`` lock acquisition times out.
-    """
-    return (
-        f"DEFER writer-lock-busy role={exc.role} phase={exc.phase} "
-        f"reason={exc.reason} timeout={exc.timeout_seconds:g}s "
-        f"result={exc.result}"
-    )
 
 
 def main() -> int:
@@ -221,7 +206,7 @@ def main() -> int:
                             )
                             con.commit()
                     except WriterLockBusy as exc:
-                        print(_format_defer(exc))
+                        print(format_busy_defer(exc))
                         return 75
                 else:
                     print(f"  [dry] {ticker}: DELISTED {lt_iso} (board {board})")
@@ -258,7 +243,7 @@ def main() -> int:
                     board=board, isin=str(r["isin"] or ""),
                 )
             except WriterLockBusy as exc:
-                print(_format_defer(exc))
+                print(format_busy_defer(exc))
                 return 75
             if n:
                 figis_written += 1

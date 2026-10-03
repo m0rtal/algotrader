@@ -50,23 +50,10 @@ from algotrader_api.ingestion.backfill import (  # noqa: E402
     _last_trading_day,
 )
 from algotrader_api.ingestion.client import make_client  # noqa: E402
-from algotrader_api.ingestion.writer_lock import WriterLockBusy  # noqa: E402
-
-
-def _format_defer(exc: "WriterLockBusy") -> str:
-    """Render a single bounded ``DEFER writer-lock-busy ...`` line.
-
-    Carries only the safe metadata exposed by
-    :class:`WriterLockBusy` (role, phase, timeout, reason,
-    result). Must not include the database path, figi, ticker,
-    or any secret. Used by the CLI when the shared writer lock
-    acquisition times out inside ``replace_bars_for_figi``.
-    """
-    return (
-        f"DEFER writer-lock-busy role={exc.role} phase={exc.phase} "
-        f"reason={exc.reason} timeout={exc.timeout_seconds:g}s "
-        f"result={exc.result}"
-    )
+from algotrader_api.ingestion.writer_lock import (  # noqa: E402
+    WriterLockBusy,
+    format_busy_defer,
+)
 
 DEFAULT_DB = "/home/hermes/algotrader/apps/api/data/state.db"
 DEFAULT_DAYS = 90
@@ -203,7 +190,7 @@ async def run(db_path: str, limit: int, dry_run: bool, sleep_s: float,
                     last_err = None
                     break
                 except WriterLockBusy as exc:
-                    print(_format_defer(exc))
+                    print(format_busy_defer(exc))
                     return 75
                 except sqlite3.OperationalError as e:
                     last_err = e

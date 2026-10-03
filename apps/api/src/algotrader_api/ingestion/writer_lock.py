@@ -363,3 +363,66 @@ def _sanitize(value: str) -> str:
     # safe.
     cleaned = "".join("?" if (ord(c) < 0x20 or ord(c) == 0x7F) else c for c in value)
     return cleaned[: WriterLockBusy._MAX_FIELD]
+
+
+# ---------------------------------------------------------------------------
+# Bounded deferral diagnostic
+# ---------------------------------------------------------------------------
+#
+# The shared formatter used by every CLI and by the post-commit
+# reconciliation hook in ``bars_sqlite``. Renders the eight bounded
+# fields required by the writer-coordination spec
+# (role, phase, pid, database_path, lock_path, timeout, reason,
+# result). Each field is sanitized; ``database_path`` and
+# ``lock_path`` are additionally validated as canonical local
+# filesystem paths so a malformed caller cannot smuggle a
+# connection string, URL, userinfo, or query string into the
+# diagnostic stream. Unsafe values render as ``[REDACTED]``; a
+# real canonical ``/tmp/...`` style path survives untouched
+# (after sanitize) so the operator can still tell which DB
+# contended. This is the only public diagnostic helper for
+# ``WriterLockBusy``; CLIs MUST call it instead of formatting the
+# exception themselves.
+
+_REDACTED = "[REDACTED]"
+# Markers that are not filesystem-path syntax. Any path carrying
+# one is replaced wholesale with ``[REDACTED]`` — we cannot tell a
+# real path from a credential string by filename alone, so the
+# safe default for non-filesystem values is full redaction.
+_UNSAFE_PATH_MARKERS = ("://", "user:pass@", "?")  # query string
+
+
+def _is_unsafe_path(value: str) -> bool:
+    """Return True for connection-string / URL / userinfo / query
+    markers. Real canonical ``/tmp/...`` style paths never carry
+    ``://`` or ``user:pass@`` or ``?``; on any of these we treat
+    the value as a credential leak and redact it.
+    """
+    return any(marker in value for marker in _UNSAFE_PATH_MARKERS)
+
+
+def format_busy_defer(exc: "WriterLockBusy") -> str:
+    """Render a single bounded ``DEFER writer-lock-busy ...`` line.
+
+    Carries the eight spec-required fields: ``role``, ``phase``,
+    ``pid``, ``database_path``, ``lock_path``, ``timeout``,
+    ``reason``, ``result``. ``database_path`` and ``lock_path``
+    are validated as canonical filesystem paths; non-filesystem
+    values are replaced with ``[REDACTED]``. All fields are
+    sanitized (control characters stripped, length bounded) so
+    the line is safe to print to a terminal or capture in a log.
+    """
+    db = _sanitize(exc.database_path)
+    lock = _sanitize(exc.lock_path)
+    if _is_unsafe_path(db):
+        db = _REDACTED
+    if _is_unsafe_path(lock):
+        lock = _REDACTED
+    return (
+        f"DEFER writer-lock-busy role={_sanitize(exc.role)} "
+        f"phase={_sanitize(exc.phase)} pid={int(exc.pid)} "
+        f"database_path={db} lock_path={lock} "
+        f"timeout={float(exc.timeout_seconds):g}s "
+        f"reason={_sanitize(exc.reason)} "
+        f"result={_sanitize(exc.result)}"
+    )

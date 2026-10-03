@@ -26,11 +26,16 @@ canonical figi used by the `bars` table.
 """
 from __future__ import annotations
 
+import sys
 from datetime import date as _date
 from typing import Iterable
 
 from .sqlite import get_connection
-from ..ingestion.writer_lock import writer_lock
+from ..ingestion.writer_lock import (
+    WriterLockBusy,
+    format_busy_defer,
+    writer_lock,
+)
 
 # Public, monkeypatchable lock-timeout knob for the public
 # ``replace_bars_for_figi`` call. The brief explicitly forbids
@@ -192,6 +197,31 @@ def _replace_bars_for_figi_tx(
     return raw_added
 
 
+def _post_commit_reconcile(conn, sqlite_path: str) -> None:
+    """Run the post-commit ``reconcile_no_trade_evidence`` hook.
+
+    Both public bar-write entrypoints (``replace_bars_for_figi``
+    and ``replace_bars_for_figi_with_rowcount``) call this after
+    the bar transaction commits. The reconcile acquires its own
+    evidence-reconcile writer lock; on contention it raises
+    ``WriterLockBusy``. The bar write has already committed, so
+    a busy reconcile never rolls back the bar insert — we emit
+    a bounded DEFER diagnostic instead and let the caller keep
+    the success return value. Any other exception from the
+    reconcile (snapshot helper, upstream flake, …) stays silent:
+    the bar write is committed and the hook is best-effort.
+    """
+    try:
+        from ..ingestion.no_trade_evidence import reconcile_no_trade_evidence
+        reconcile_no_trade_evidence(conn, db_path=sqlite_path)
+    except WriterLockBusy as exc:
+        # Bounded diagnostic — same shape every caller emits, via
+        # the shared formatter in writer_lock.format_busy_defer.
+        print(format_busy_defer(exc), file=sys.stderr)
+    except Exception:
+        pass
+
+
 def replace_bars_for_figi(
     sqlite_path: str,
     figi: str,
@@ -313,11 +343,7 @@ def replace_bars_for_figi(
     # public reconcile helper acquires the lock for its own
     # DELETE + commit; we pass the explicit ``sqlite_path`` so
     # the lock namespace matches the bar lock's namespace.
-    try:
-        from ..ingestion.no_trade_evidence import reconcile_no_trade_evidence
-        reconcile_no_trade_evidence(conn, db_path=sqlite_path)
-    except Exception:
-        pass
+    _post_commit_reconcile(conn, sqlite_path)
     # Snapshot rebuild hook — runs after the commit so the file
     # rewrite never races with an in-flight transaction. Cost is
     # bounded by REFRESH_BUDGET_S: hot figis (every minute) only
@@ -404,11 +430,7 @@ def replace_bars_for_figi_with_rowcount(
     # run OUTSIDE the bar lock and never affect the return value.
     # Task 3: public reconcile helper takes explicit ``db_path``
     # so the lock namespace matches the bar lock's namespace.
-    try:
-        from ..ingestion.no_trade_evidence import reconcile_no_trade_evidence
-        reconcile_no_trade_evidence(conn, db_path=sqlite_path)
-    except Exception:
-        pass
+    _post_commit_reconcile(conn, sqlite_path)
     try:
         from ..ui_snapshot import maybe_refresh
         maybe_refresh(sqlite_path=sqlite_path)

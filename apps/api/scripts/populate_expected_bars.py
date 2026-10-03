@@ -43,6 +43,7 @@ sys.path.insert(0, str(API_SRC))
 
 from algotrader_api.ingestion.writer_lock import (  # noqa: E402
     WriterLockBusy,
+    format_busy_defer,
     writer_lock,
 )
 from algotrader_api.ml.coverage import expected_business_days  # noqa: E402
@@ -181,12 +182,7 @@ def main() -> int:
             finally:
                 mut.close()
     except WriterLockBusy as exc:
-        print(
-            f"DEFER writer-lock-busy role={exc.role} phase={exc.phase} "
-            f"reason={exc.reason} timeout={exc.timeout_seconds:g}s "
-            f"result={exc.result}",
-            file=sys.stderr,
-        )
+        print(format_busy_defer(exc), file=sys.stderr)
         return 75
     except Exception as exc:
         print(

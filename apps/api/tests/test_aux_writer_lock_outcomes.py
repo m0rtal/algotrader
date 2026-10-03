@@ -514,6 +514,12 @@ def test_cli_busy_emits_one_defer_line_and_exits_75(
     assert f"role={expected_role}" in line, (
         f"{name}: role missing/wrong in DEFER line: {line!r}"
     )
+    # All 8 spec-required fields must be present (writer-coordination
+    # spec line 184: role, phase, PID, database path, lock path,
+    # timeout, reason, result).
+    for k in ("role=", "phase=", "pid=", "database_path=",
+              "lock_path=", "timeout=", "reason=", "result="):
+        assert k in line, f"{name}: field {k!r} missing: {line!r}"
     assert "timeout=" in line, f"{name}: timeout missing: {line!r}"
     assert "reason=test-forced-busy-task5" in line, (
         f"{name}: reason missing: {line!r}"
@@ -783,6 +789,31 @@ def test_cli_defer_line_has_no_payload_token_or_userinfo(
     assert rc == 75, f"{name}: expected rc=75, got {rc}"
     for sentinel in (SECRET_TOKEN, SECRET_USERINFO, SECRET_PAYLOAD):
         assert sentinel not in output, (
-            f"{name}: sentinel {sentinel!r} leaked into output: "
-            f"{output!r}"
+            f"{name}: {sentinel!r} leaked through DEFER line"
         )
+    # All 8 spec-required fields must be present even when the
+    # exception's database_path / lock_path were tampered with —
+    # the unsafe-path branches render [REDACTED] in place of the
+    # path values, never omit the field entirely.
+    defer_lines = [
+        ln for ln in output.splitlines()
+        if ln.startswith("DEFER writer-lock-busy")
+    ]
+    assert len(defer_lines) == 1, (
+        f"{name}: expected exactly one DEFER line, got "
+        f"{defer_lines!r} in output={output!r}"
+    )
+    line = defer_lines[0]
+    for k in ("role=", "phase=", "pid=", "database_path=",
+              "lock_path=", "timeout=", "reason=", "result="):
+        assert k in line, (
+            f"{name}: {k!r} missing under secrets-test path: {line!r}"
+        )
+    # database_path carried ?token=Bearer-... — the path must
+    # have been redacted, NOT echoed verbatim.
+    assert "database_path=[REDACTED]" in line, (
+        f"{name}: tampered database_path not redacted: {line!r}"
+    )
+    assert f"lock_path=[REDACTED]" in line, (
+        f"{name}: tampered lock_path not redacted: {line!r}"
+    )
