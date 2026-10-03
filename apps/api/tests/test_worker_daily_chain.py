@@ -88,9 +88,12 @@ def _patch_all_steps(monkeypatch, *, results: dict | None = None):
 # --------------------------------------------------------------------------- #
 
 
-def test_chain_runs_all_8_phases_in_order(monkeypatch):
+def test_chain_runs_all_9_phases_in_order(monkeypatch):
     """After ml-data-readiness PR-2 decomposition, both subsets together
-    cover all 8 phases in the documented order. Run each subset
+    cover all 9 phases in the documented order (bonds_depth was added
+    between backfill_moex and gap_recovery by the fix/daily-bonds-depth
+    restoration; spec data-quality lines 79-90 require it to run AFTER
+    backfill_moex and BEFORE corporate_actions). Run each subset
     explicitly via the ``subset`` kwarg so the test exercises the full
     chain end-to-end."""
     worker, calls = _patch_all_steps(monkeypatch)
@@ -106,14 +109,49 @@ def test_chain_runs_all_8_phases_in_order(monkeypatch):
         "migrations",
         "universe_sync",
         "backfill_moex",
+        "bonds_depth",
         "gap_recovery",
         "corporate_actions",
         "dividends",
         "freshness_check",
         "guardian",
     ]
-    assert len(worker._DAILY_CHAIN_PHASES) == 8
+    assert len(worker._DAILY_CHAIN_PHASES) == 9
     assert [c[0] for c in calls] == expected
+
+
+# --------------------------------------------------------------------------- #
+# 1a. Bonds depth is wired into the daily chain (regression for the
+#     fix/daily-bonds-depth restoration; spec lines 79-90 of
+#     openspec/specs/data-quality/spec.md require bonds_depth to run AFTER
+#     backfill_moex and BEFORE corporate_actions). With the ml-data-
+#     readiness PR-2 subset split (first = migrations → gap_recovery,
+#     derived = corporate_actions → guardian), bonds_depth lives in the
+#     first subset, immediately after backfill_moex.
+# --------------------------------------------------------------------------- #
+
+
+def test_chain_runs_bonds_depth_between_backfill_moex_and_gap_recovery(monkeypatch):
+    """Without this wiring, ``backfill_bonds_to_depth`` is never invoked
+    from production even though the step is present in ``_STEP_FUNCS``.
+    Spec gap restoration for fix/daily-bonds-depth.
+    """
+    worker, calls = _patch_all_steps(monkeypatch)
+
+    rc_first = worker.run_daily_chain(subset="first")
+
+    assert rc_first == 0
+    actual = [c[0] for c in calls]
+    assert "backfill_moex" in actual
+    assert "bonds_depth" in actual
+    assert "gap_recovery" in actual
+    bm_idx = actual.index("backfill_moex")
+    bd_idx = actual.index("bonds_depth")
+    gr_idx = actual.index("gap_recovery")
+    assert bm_idx < bd_idx < gr_idx, (
+        f"bonds_depth must run after backfill_moex and before gap_recovery; "
+        f"got {actual}"
+    )
 
 
 # --------------------------------------------------------------------------- #
