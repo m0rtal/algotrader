@@ -12,7 +12,7 @@ import importlib
 import sqlite3
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -145,4 +145,98 @@ def test_step_bonds_depth_does_not_close_cached_connection(fake_db_path):
     finally:
         # Test teardown: don't leave a WAL file lying around.
         from algotrader_api.db.sqlite import close_all
+        close_all()
+
+
+def test_step_bonds_depth_does_not_rollback_when_helper_reports_errors(
+    fake_db_path: str,
+) -> None:
+    """Borrower contract: the step borrows the cached connection and
+    must NOT call ``rollback`` on it when the helper returns
+    ``errors > 0``. Transaction lifecycle (BEGIN/COMMIT/ROLLBACK) is the
+    writer helper's responsibility inside its lock; a separate rollback
+    from the step would race the helper's own commit/rollback and could
+    silently drop a half-written batch — or rollback a batch the helper
+    has already committed.
+
+    Same goes for the exception branch: a thrown helper must not
+    trigger a reacquire + rollback from the step, which would
+    double-rollback a connection the helper may already be holding
+    under its own lock.
+
+    Prove both with a ``spec=sqlite3.Connection`` mock so the step's
+    real call surface is exercised while still letting us assert
+    ``rollback`` was never called and ``get_connection`` was acquired
+    exactly once.
+    """
+    from algotrader_api.db.sqlite import close_all, get_connection
+
+    worker = _import_worker()
+
+    # 1) Helper returns errors>0: step must not rollback.
+    errors_result = {
+        "figis_processed": 4, "bars_added": 6, "skipped": 12, "errors": 3,
+    }
+    mock_conn = MagicMock(spec=sqlite3.Connection)
+    with patch(
+        "algotrader_api.db.sqlite.get_connection", return_value=mock_conn,
+    ) as mock_get_conn, patch(
+        "algotrader_api.ingestion.backfill.backfill_bonds_to_depth",
+        return_value=errors_result,
+    ):
+        try:
+            ok, detail = worker._step_bonds_depth(fake_db_path)
+        finally:
+            # Clear the cache so subsequent tests get a fresh handle.
+            close_all()
+
+    assert ok is False
+    assert "errors=3" in detail
+    # Borrower contract: exactly one acquire, no rollback.
+    assert mock_get_conn.call_count == 1, (
+        f"step must acquire cached connection once; got {mock_get_conn.call_count}"
+    )
+    assert mock_conn.rollback.call_count == 0, (
+        "step must NOT call rollback on the borrowed connection when the "
+        "helper returns errors; transaction lifecycle belongs to the "
+        "writer helper under its own lock"
+    )
+    # And the step must not have called .close() either.
+    assert mock_conn.close.call_count == 0
+
+    # 2) Helper throws: step must not reacquire or rollback either.
+    mock_conn2 = MagicMock(spec=sqlite3.Connection)
+    boom = RuntimeError("tinkoff channel closed")
+    with patch(
+        "algotrader_api.db.sqlite.get_connection", return_value=mock_conn2,
+    ) as mock_get_conn2, patch(
+        "algotrader_api.ingestion.backfill.backfill_bonds_to_depth",
+        side_effect=boom,
+    ):
+        try:
+            ok2, detail2 = worker._step_bonds_depth(fake_db_path)
+        finally:
+            close_all()
+
+    assert ok2 is False
+    assert "bonds_depth failed" in detail2
+    assert "tinkoff channel closed" in detail2
+    # Borrower contract on the exception branch: still one acquire,
+    # no rollback, no second reacquire.
+    assert mock_get_conn2.call_count == 1, (
+        f"step must acquire cached connection once on exception path; "
+        f"got {mock_get_conn2.call_count}"
+    )
+    assert mock_conn2.rollback.call_count == 0, (
+        "step must NOT call rollback on the borrowed connection when the "
+        "helper throws; same writer-helper-owns-the-lock reason"
+    )
+    assert mock_conn2.close.call_count == 0
+    # And the same real cached-connection handle the production path
+    # hands out must still be usable (sanity: the step really is the
+    # sole borrower of the module-level cache).
+    real_conn = get_connection(fake_db_path)
+    try:
+        assert real_conn.execute("SELECT 1").fetchone()[0] == 1
+    finally:
         close_all()

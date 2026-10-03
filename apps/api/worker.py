@@ -516,9 +516,17 @@ def _step_bonds_depth(db_path: str) -> tuple[bool, str]:
         ``errors > 0`` so the daily runner's retry semantics can pick
         it up. Detail is the bounded numeric summary (no raw exception)
         so the operator log line stays greppable.
-      * On an unexpected exception, rollback the shared connection so
-        a half-written batch can't poison the next step. We still
-        leave the connection open for subsequent steps.
+      * The step does NOT rollback or reacquire the connection on
+        either the partial-failure or the exception branch. The step
+        is a pure borrower of the cached connection; transaction
+        lifecycle (BEGIN/COMMIT/ROLLBACK) is owned by the writer
+        helper (``backfill_bonds_to_depth``) inside its own lock, so
+        a second rollback from the step would race the helper and
+        could silently drop a batch the helper has already committed.
+        On an unexpected exception the step just returns
+        ``(False, f"bonds_depth failed: {exc}")`` — the helper's own
+        ``finally`` / lock-release is responsible for putting the
+        connection back into a clean state.
     """
     try:
         from algotrader_api.db.sqlite import get_connection
@@ -536,21 +544,14 @@ def _step_bonds_depth(db_path: str) -> tuple[bool, str]:
         if errors > 0:
             # Partial success is not an honest success; surface to the
             # daily runner so the next cycle (or operator) can retry.
-            try:
-                conn.rollback()
-            except Exception:
-                # rollback is best-effort; never let teardown mask the
-                # original failure surfaced above.
-                pass
+            # Borrower contract: no rollback here — the helper already
+            # owned the transaction under its own lock.
             return False, detail
         return True, detail
     except Exception as exc:  # noqa: BLE001 — daily-chain step pattern
-        try:
-            from algotrader_api.db.sqlite import get_connection
-            conn = get_connection(db_path)
-            conn.rollback()
-        except Exception:
-            pass
+        # Borrower contract: no reacquire + rollback here either. The
+        # helper's lock release / finally is responsible for cleaning
+        # the connection state; the step just reports the failure.
         return False, f"bonds_depth failed: {exc}"
 
 
