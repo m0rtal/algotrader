@@ -54,7 +54,7 @@
       MANDATORY `BackfillRunner._process_moex_year` /
       `_process_one` historical walk branch integration; the
       historical CLI is a thin call-through to the new helper
-- [ ] Task 3 (mandatory, end-to-end): the strict-synthetic-feed
+- [x] Task 3 (mandatory, end-to-end): the strict-synthetic-feed
       walker test that proves the gate improves on a TEMP DB
 
 ## Spec review acceptance criteria (Phase 1)

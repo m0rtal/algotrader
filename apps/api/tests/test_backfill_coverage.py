@@ -1,7 +1,12 @@
 """Coverage tests for BackfillRunner.run() error paths and helpers."""
 
 import asyncio
+import importlib
+import importlib.util
 import sqlite3
+import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -350,3 +355,227 @@ async def test_decide_strategy_skips_figi_with_fresh_last_bar_ts():
     assert strategy == "skip"
     assert from_ is None
     assert to is None
+
+
+@pytest.fixture
+def historical_gate(tmp_path, monkeypatch):
+    """Real walker/fetcher/writer/CLI/gate; only HTTP and broker are isolated.
+
+    Removing the walker's evidence call must fail the positive test. A warm-up
+    public walk writes the latest genuine positive fixture bar before the PRE
+    gate: an anchor-only DB is stale, so it cannot report only 'incomplete'.
+    """
+    from algotrader_api.db import sqlite as sqlitedb
+    from algotrader_api.ml.features import check_coverage
+
+    today = date(2024, 12, 31)
+    anchor, last = date(2014, 1, 15), date(2024, 12, 30)
+    figi, ticker, board, isin = 'BBG00RU000A1', 'GAZP', 'TQBR', 'RU0007661625'
+
+    class PinnedDate(date):
+        @classmethod
+        def today(cls):
+            return cls.fromordinal(today.toordinal())
+
+    for name in ('ml.features', 'ml.coverage', 'ingestion.backfill',
+                 'ingestion.no_trade_evidence'):
+        module = importlib.import_module('algotrader_api.' + name)
+        monkeypatch.setattr(module, 'date', PinnedDate)
+
+    db = str(tmp_path / 'gate.db')
+    monkeypatch.setenv('ALGOTRADER_DATA_DIR', str(tmp_path))
+    sqlitedb.run_migrations(db, str(_migrations_dir()))
+    sqlitedb.close_all()
+    with sqlite3.connect(db) as con:
+        con.execute(
+            'INSERT INTO instruments '
+            '(ticker, figi, class, name, currency, lot_size, isin, source_updated_at) '
+            "VALUES (?, ?, 'share', 'Gazp', 'rub', 10, ?, ?)",
+            (ticker, figi, isin, anchor.isoformat()),
+        )
+        con.execute(
+            'INSERT INTO bars (figi, ts, open, high, low, close, volume, source) '
+            "VALUES (?, ?, 100, 102, 99, 101, 1000, 'tinkoff')",
+            (figi, anchor.isoformat()),
+        )
+        holidays = {r[0] for r in con.execute('SELECT date FROM moex_holidays')}
+
+    columns = ['TRADEDATE', 'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME',
+               'NUMTRADES', 'VALUE', 'SECID', 'BOARDID']
+    feeds = {year: [] for year in range(anchor.year, last.year + 1)}
+    current = anchor
+    while current <= last:
+        if current.weekday() < 5 and current.isoformat() not in holidays:
+            positive = current in (anchor, last)
+            feeds[current.year].append([
+                current.isoformat(),
+                *([100, 102, 99, 101, 1000, 5, 100000] if positive
+                  else [None, None, None, None, 0, 0, 0]), ticker, board,
+            ])
+        current += timedelta(days=1)
+    # Put genuine bars on page one, so degraded later pages preserve them.
+    for rows in feeds.values():
+        rows.sort(key=lambda row: row[5] == 0)
+    state = {'mode': 'warmup', 'http': [], 'fetch': []}
+
+    def http_get(url, *, params, timeout):
+        assert url == ('https://iss.moex.com/iss/history/engines/stock/markets/'
+                       'shares/boards/TQBR/securities/GAZP.json')
+        year = int(params['from'][:4])
+        assert year in feeds and params['from'] == f'{year}-01-01'
+        assert params['till'] == (last.isoformat() if year == last.year
+                                  else f'{year}-12-31')
+        assert timeout == 30
+        start = params['start']
+        key = (year, start)
+        assert key not in state['http'], 'extra/repeated HTTP fetch'
+        state['http'].append(key)
+        mode = state['mode']
+        rows = feeds[year]
+        if mode == 'warmup':
+            assert start == 0
+            page = [row[:] for row in rows if row[5] > 0]
+            total, size = len(page) + 1, 500  # deliberately uncertified
+        else:
+            assert start in (0, 128, 256)
+            page = [row[:] for row in rows[start:start + 128]]
+            total, size = len(rows), 128
+            if mode == 'partial':
+                assert start == 0
+                total, size = len(rows) + 1, 500
+            elif mode == 'error' and start == 128:
+                raise ConnectionError('synthetic interrupted pagination')
+            elif mode == 'malformed' and start == 128:
+                page[0] = page[0][:-1]
+            elif mode == 'identity_mismatch' and start == 128:
+                page[0][-2] = 'SBER'
+        payload = {'history': {'columns': columns, 'data': page},
+                   'history.cursor': {'columns': ['INDEX', 'TOTAL', 'PAGESIZE'],
+                                      'data': [[start, total, size]]}}
+        return SimpleNamespace(status_code=200, json=lambda: payload)
+
+    monkeypatch.setattr(bf_mod.requests, 'get', http_get)
+    # Fail closed if any other requests path is accidentally introduced.
+    monkeypatch.setattr(bf_mod.requests.sessions.Session, 'request',
+                        lambda *a, **kw: pytest.fail('unexpected live HTTP'))
+    real_fetch = bf_mod._fetch_year_moex_outcome
+
+    def fetch(market, actual_board, actual_ticker, year, last_trading_day=None):
+        assert (market, actual_board, actual_ticker, last_trading_day) == (
+            'shares', board, ticker, last)
+        rows, outcome = real_fetch(market, actual_board, actual_ticker, year,
+                                   last_trading_day=last_trading_day)
+        state['fetch'].append((year, outcome))
+        return rows, outcome
+
+    monkeypatch.setattr(BackfillRunner, '_fetch_year_moex_outcome', staticmethod(fetch))
+
+    def meta(actual_ticker, yesterday, *, meta_cache, meta_lock):
+        assert (actual_ticker, yesterday) == (ticker, last)
+        return {'market': 'shares', 'board': board, 'listed_from': anchor.isoformat(),
+                'listed_till': yesterday.isoformat(),
+                'isin': 'US00206R1023' if state['mode'] == 'isin_mismatch' else isin}
+
+    monkeypatch.setattr(BackfillRunner, '_get_meta_moex', staticmethod(meta))
+    client = MagicMock()
+    client.get_candles.side_effect = AssertionError('unexpected broker call')
+
+    def walk(mode):
+        state.update(mode=mode, http=[], fetch=[])
+        async def sink(event):
+            pass
+
+        runner = BackfillRunner(client=client, db_path=db, event_sink=sink)
+        asyncio.run(runner.backfill_from_moex(today=today))
+        if mode == 'isin_mismatch':
+            # Existing producer identity gate rejects metadata before any fetch.
+            assert state['fetch'] == state['http'] == []
+        else:
+            assert sorted(year for year, _ in state['fetch']) == list(feeds)
+            expected_calls = [(year, start) for year, rows in feeds.items()
+                              for start in (range(0, len(rows), 128)
+                                            if mode in ('complete', 'identity_mismatch')
+                                            else (0, 128) if mode in ('error', 'malformed')
+                                            else (0,))]
+            assert sorted(state['http']) == sorted(expected_calls)
+        client.get_candles.assert_not_called()
+
+    spec = importlib.util.spec_from_file_location(
+        'populate_expected_bars_gate_test',
+        Path(__file__).resolve().parent.parent / 'scripts/populate_expected_bars.py',
+    )
+    assert spec is not None and spec.loader is not None
+    peb = importlib.util.module_from_spec(spec)
+    # CLI imports add API_SRC to sys.path; restore it with fixture teardown.
+    monkeypatch.setattr(sys, 'path', sys.path[:])
+    spec.loader.exec_module(peb)
+    monkeypatch.setattr(peb, 'date', PinnedDate)
+
+    def populate():
+        monkeypatch.setattr(sys, 'argv', ['populate_expected_bars', '--db', db, '--refresh'])
+        assert peb.main() == 0
+
+    def snapshot():
+        con = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            return {
+                'gate': check_coverage(con, [figi]),
+                'expected': con.execute('SELECT expected_bars FROM instruments').fetchone()[0],
+                'bars': [tuple(r) for r in con.execute('SELECT * FROM bars ORDER BY ts')],
+                'evidence': [tuple(r) for r in con.execute(
+                    'SELECT session_date, expires_at FROM moex_no_trade_evidence ORDER BY session_date')],
+            }
+        finally:
+            con.close()
+
+    assert len(snapshot()['bars']) == 1
+    walk('warmup')
+    populate()
+    pre = snapshot()
+    assert pre['evidence'] == []
+    assert len(pre['bars']) == 2
+    assert pre['gate'] == [{'figi': figi, 'max_ts': last.isoformat(),
+                            'bars_count': 2, 'expected': pre['expected'], 'reason': 'incomplete'}]
+    assert pre['expected'] > 0 and 2 / pre['expected'] < 0.95
+    yield SimpleNamespace(walk=walk, populate=populate, snapshot=snapshot, pre=pre,
+                          feeds=feeds, state=state, today=today)
+    sqlitedb.close_all()
+
+
+def test_walker_end_to_end_gate_improves_on_temp_db(historical_gate):
+    proof = historical_gate
+    proof.walk('complete')
+    walked = proof.snapshot()
+    assert walked['bars'] == proof.pre['bars'], 'evidence must not fabricate/change OHLC'
+    assert walked['expected'] == proof.pre['expected'], 'walker must not update denominator'
+    zero_dates = {row[0] for rows in proof.feeds.values() for row in rows if row[5] == 0}
+    assert {outcome for _, outcome in proof.state['fetch']} == {'complete'}
+    for session, expires in walked['evidence']:
+        days = 7 if date.fromisoformat(session) >= proof.today - timedelta(days=14) else 365
+        assert expires == (proof.today + timedelta(days=days)).isoformat()
+    proof.populate()
+    post = proof.snapshot()
+    assert post['bars'] == proof.pre['bars']
+    assert post['gate'] == []
+    assert post['expected'] == proof.pre['expected'] - len(zero_dates) == 2
+    assert {row[0] for row in walked['evidence']} == zero_dates
+    assert len(post['bars']) / post['expected'] >= 0.95
+    print(f"GATE_PROOF pre=2/{proof.pre['expected']} incomplete post=2/2 "
+          f"evidence={len(zero_dates)} HTTP={len(proof.state['http'])} gate=[]")
+
+
+@pytest.mark.parametrize('mode', ['partial', 'error', 'malformed',
+                                  'identity_mismatch', 'isin_mismatch'])
+def test_walker_degraded_feed_preserves_bars_and_denominator(historical_gate, mode):
+    proof = historical_gate
+    proof.walk(mode)
+    walked = proof.snapshot()
+    assert walked['bars'] == proof.pre['bars']
+    assert walked['evidence'] == []
+    proof.populate()
+    assert proof.snapshot() == proof.pre
+    expected_outcomes = set() if mode == 'isin_mismatch' else {mode}
+    assert {outcome for _, outcome in proof.state['fetch']} == expected_outcomes
+    print(f"NEGATIVE_PROOF mode={mode} bars=2 evidence=0 "
+          f"expected={proof.pre['expected']} HTTP={len(proof.state['http'])}")
