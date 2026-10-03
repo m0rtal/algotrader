@@ -1988,6 +1988,13 @@ def test_record_historical_no_trade_evidence_complete_filters_non_business(
     con.execute(
         "INSERT INTO moex_holidays(date, name) VALUES ('2025-09-29', 'X')"
     )
+    # R1: seed the instrument so the new ISIN identity gate (helper
+    # compares upstream ``isin`` arg against the stored
+    # ``instruments.isin``) sees a match and proceeds.
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
     con.commit()
     rows = [
         {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},  # holiday
@@ -2021,6 +2028,13 @@ def test_record_historical_no_trade_evidence_complete_keeps_ttl_semantics(
 
     db = tmp_path / "nte.db"
     con = _make_conn(db)
+    # R1: seed the instrument so the new ISIN identity gate sees a
+    # match.
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
+    con.commit()
     today = _dt.date(2026, 9, 30)
     # 2026-09-25 is a Friday (recent), 2026-08-03 is a Monday (historical).
     # Brief fixture 2026-08-01 was a Saturday — helper correctly rejects
@@ -2058,6 +2072,12 @@ def test_record_historical_no_trade_evidence_complete_respects_real_bar(
 
     db = tmp_path / "nte.db"
     con = _make_conn(db)
+    # R1: seed the instrument so the new ISIN identity gate sees a
+    # match.
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
     _insert_bar(con, "FIGI1", "2025-09-30", close=100)
     rows = [
         {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR"},
@@ -2087,6 +2107,13 @@ def test_record_historical_no_trade_evidence_uses_explicit_ticker_not_rows_zero(
 
     db = tmp_path / "nte.db"
     con = _make_conn(db)
+    # R1: seed the instrument so the new ISIN identity gate sees a
+    # match.
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
+    con.commit()
     rows = [
         # First row is a mirror (would mislead a "guess from rows[0]"
         # implementation). Every other row is identity-correct.
@@ -2106,3 +2133,221 @@ def test_record_historical_no_trade_evidence_uses_explicit_ticker_not_rows_zero(
         "WHERE figi='FIGI1' ORDER BY session_date"
     ).fetchall()
     assert [r["session_date"] for r in rows_db] == ["2025-09-30"]
+
+
+# -- R1: ISIN identity gate (helper self-check) --------------------------
+
+
+def test_record_historical_no_trade_evidence_rejects_isin_mismatch(tmp_path):
+    """R1: the helper itself compares the upstream ISIN (the
+    ``isin`` argument, which the caller got from
+    ``fetch_issuer_identity``) against the figi's stored ISIN
+    in ``instruments.isin``. A mismatch rejects the whole batch
+    with one structured ``identity_mismatch`` log line and
+    performs no DB write. The existing ``outcome`` gate still
+    short-circuits non-``complete`` outcomes first, so the
+    ISIN check is only reached when ``outcome == "complete"``.
+    """
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    # Stored ISIN is "STORED"; the helper's ``isin`` argument is
+    # "UPSTREAM" — mismatch.
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'STORED')"
+    )
+    con.commit()
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR"},
+    ]
+    written = record_historical_no_trade_evidence(
+        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="UPSTREAM",
+        outcome="complete",
+    )
+    assert written == 0
+    n = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence"
+    ).fetchone()[0]
+    assert n == 0, (
+        f"ISIN mismatch must NOT write evidence, got {n}"
+    )
+
+
+def test_record_historical_no_trade_evidence_fails_closed_on_missing_upstream_isin(
+    tmp_path,
+):
+    """R1: when the upstream ISIN (the ``isin`` argument) is empty
+    and the local ``instruments.isin`` is populated, the helper
+    fails closed: it cannot certify the row's identity against
+    upstream metadata, so the whole batch is rejected with one
+    structured ``identity_mismatch`` log line and no DB write.
+    """
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU0007661625')"
+    )
+    con.commit()
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
+    ]
+    # Caller passed an empty upstream ISIN (the MOEX probe
+    # returned no value).
+    written = record_historical_no_trade_evidence(
+        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="",
+        outcome="complete",
+    )
+    assert written == 0
+    n = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence"
+    ).fetchone()[0]
+    assert n == 0, (
+        f"empty upstream ISIN + populated local ISIN must fail closed, "
+        f"got n={n}"
+    )
+
+
+def test_record_historical_no_trade_evidence_allows_blank_to_blank(tmp_path):
+    """R1: when both the upstream ISIN (the ``isin`` argument) and
+    the stored ``instruments.isin`` are blank, the helper
+    proceeds (no identity to mismatch on). The brief says
+    "decide spec allow matching blanks" — blank matches blank.
+    """
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    # No instrument row seeded at all — local_isin is "". Upstream
+    # ISIN is also "". They match (both blank).
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
+    ]
+    written = record_historical_no_trade_evidence(
+        con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="",
+        outcome="complete",
+    )
+    assert written == 1
+    n = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence"
+    ).fetchone()[0]
+    assert n == 1, f"blank-blank ISIN must proceed, got n={n}"
+
+
+# -- R1: lock propagation, no nested acquisition ----------------------
+
+
+def test_record_historical_no_trade_evidence_acquires_lock_exactly_once(
+    tmp_path,
+):
+    """The helper delegates the actual ``INSERT ... ON CONFLICT`` to
+    ``record_no_trade_evidence``, which acquires the shared
+    writer lock exactly once with
+    ``role="no-trade-evidence" / phase="evidence"``. The helper
+    itself does NOT acquire the lock; the wrapped
+    ``record_no_trade_evidence`` does. There is no nested
+    acquisition.
+
+    We trace every ``writer_lock`` call in this test and assert
+    that exactly one acquisition matches the
+    ``no-trade-evidence / evidence`` role/phase pair.
+    """
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+    from algotrader_api.ingestion import writer_lock as _wl_mod
+    acquisitions: list[dict] = []
+    real_lock = _wl_mod.writer_lock
+
+    @_wl_mod.contextmanager  # type: ignore[attr-defined]
+    def _tracking_lock(db_path, **kw):
+        acquisitions.append({**kw, "db_path": str(db_path)})
+        with real_lock(db_path, **kw):
+            yield
+
+    import unittest.mock as _mock
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
+    con.commit()
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
+    ]
+    with _mock.patch.object(_wl_mod, "writer_lock", _tracking_lock):
+        written = record_historical_no_trade_evidence(
+            con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+            rows=rows, board="TQBR", isin="RU",
+            outcome="complete",
+        )
+    assert written == 1
+    evidence_acqs = [
+        a for a in acquisitions
+        if a.get("role") == "no-trade-evidence"
+        and a.get("phase") == "evidence"
+    ]
+    assert len(evidence_acqs) == 1, (
+        f"helper must acquire evidence lock exactly once, "
+        f"got {evidence_acqs!r}"
+    )
+
+
+def test_record_historical_no_trade_evidence_lock_busy_propagates(tmp_path):
+    """When ``record_no_trade_evidence`` (called by the helper)
+    raises ``WriterLockBusy`` because the lock is held by another
+    writer, the helper does NOT swallow the exception. The
+    public wrapper's ``WriterLockBusy`` propagates so the
+    caller's defer/abort/fallback decision is honoured.
+    """
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+    from algotrader_api.ingestion import writer_lock as _wl_mod
+    from algotrader_api.ingestion.writer_lock import WriterLockBusy
+
+    real_lock = _wl_mod.writer_lock
+
+    @_wl_mod.contextmanager  # type: ignore[attr-defined]
+    def _busy_lock(db_path, **kw):
+        raise WriterLockBusy(
+            role=kw["role"], phase=kw["phase"],
+            database_path=str(db_path),
+            lock_path=str(db_path) + ".writer.lock",
+            timeout_seconds=kw.get("timeout_seconds", 0.0),
+            reason="test-forced-busy",
+        )
+
+    import unittest.mock as _mock
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
+    con.commit()
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR"},
+    ]
+    with _mock.patch.object(_wl_mod, "writer_lock", _busy_lock):
+        with pytest.raises(WriterLockBusy):
+            record_historical_no_trade_evidence(
+                con, db_path=str(db), figi="FIGI1", ticker="GAZP",
+                rows=rows, board="TQBR", isin="RU",
+                outcome="complete",
+            )

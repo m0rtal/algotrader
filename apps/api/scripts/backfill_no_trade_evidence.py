@@ -30,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import sqlite3
 import sys
 import threading
@@ -150,6 +151,12 @@ def main() -> int:
         rows_written = 0
         figis_nometa = 0
         figis_delisted = 0
+        # R1: count figis that the per-year fetcher returned a
+        # non-``complete`` outcome for. The CLI exits non-zero
+        # when at least one such figi was seen AND no evidence
+        # was produced — a degraded run must not look like
+        # success in cron / supervisor.
+        figis_degraded = 0
         t0 = time.time()
         for i, r in enumerate(todo, 1):
             figi = r["figi"]
@@ -264,6 +271,7 @@ def main() -> int:
             if overall != "complete":
                 # The helper emits its own structured rejection line;
                 # we only need the figi context for the operator log.
+                figis_degraded += 1
                 print(
                     f"  [{i}/{len(todo)}] {ticker}: "
                     f"moex_historical_evidence_rejected figi={figi} "
@@ -271,6 +279,36 @@ def main() -> int:
                 )
                 continue
             if not zrows:
+                continue
+            # Identity guard (R1): the helper compares the upstream
+            # ISIN it receives against the figi's stored ISIN. The
+            # ``isin`` argument MUST carry the upstream-verified
+            # metadata ISIN (not the local one), so the CLI does the
+            # same MOEX identity probe the historical walker does
+            # before invoking the helper. When the upstream ISIN is
+            # empty (probe failed or no primary board) AND the local
+            # ISIN is populated, we skip the figi with the same
+            # ``identity_mismatch`` log line the helper would emit
+            # — fail-closed, no DB write, no fabricated identity.
+            local_isin = str(r["isin"] or "").strip()
+            from algotrader_api.ingestion.no_trade_evidence import (
+                fetch_issuer_identity as _fii,
+            )
+            ident = _fii(ticker)
+            upstream_isin = (
+                (ident.get("isin") or "").strip() if ident else ""
+            )
+            if upstream_isin != local_isin:
+                logging.getLogger("algotrader.ingestion").info(
+                    "moex_historical_evidence_rejected figi=%s "
+                    "reason=identity_mismatch rows=%s",
+                    figi, len(all_rows),
+                )
+                print(
+                    f"  [{i}/{len(todo)}] {ticker}: "
+                    f"moex_historical_evidence_rejected figi={figi} "
+                    f"reason=identity_mismatch rows={len(all_rows)}"
+                )
                 continue
             # Coordination (Task 3): evidence write goes through
             # ``record_historical_no_trade_evidence`` which acquires
@@ -285,7 +323,7 @@ def main() -> int:
                 n = record_historical_no_trade_evidence(
                     con, db_path=str(db_path), figi=figi, ticker=ticker,
                     rows=all_rows, board=board,
-                    isin=str(r["isin"] or ""),
+                    isin=upstream_isin,
                     outcome=overall,
                 )
             except WriterLockBusy as exc:
@@ -299,7 +337,17 @@ def main() -> int:
                 time.sleep(args.sleep)
         dt = time.time() - t0
         print(f"done: figis_with_evidence={figis_written} rows={rows_written} "
-              f"delisted={figis_delisted} no_meta={figis_nometa} elapsed_s={dt:.1f}")
+              f"delisted={figis_delisted} no_meta={figis_nometa} "
+              f"degraded={figis_degraded} elapsed_s={dt:.1f}")
+        # R1: a degraded run must not exit 0. We only escalate
+        # when ``figis_degraded > 0 AND figis_written == 0`` — a
+        # mixed run (some evidence, some degraded) is still a
+        # partial success and exits 0; cron / supervisor only
+        # flags a fully-degraded run. Exit code 76 mirrors the
+        # existing 75 (``WriterLockBusy``) convention: 75 = lock
+        # busy, 76 = degraded run.
+        if figis_degraded > 0 and figis_written == 0:
+            return 76
         return 0
     finally:
         con.close()

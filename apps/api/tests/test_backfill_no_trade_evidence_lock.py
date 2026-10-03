@@ -422,6 +422,15 @@ def test_cli_listed_till_uses_separate_lock_from_evidence(tmp_path, monkeypatch)
     monkeypatch.setattr(
         mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
     )
+    # R1: stub the upstream ISIN probe so the CLI's identity guard
+    # sees a match against the seeded instrument ISIN and proceeds
+    # to the evidence write. Without this stub the production probe
+    # returns ``None`` and the guard emits ``identity_mismatch``
+    # (fail-closed).
+    from algotrader_api.ingestion import no_trade_evidence as _nte_cli
+    _nte_cli.fetch_issuer_identity = lambda ticker: {
+        "board": "TQCB", "isin": "X",
+    }
     # Patch _fetch_year_moex_outcome (Task 2) to return a single
     # zero-trade row so the evidence write path is exercised. The
     # downstream ``record_historical_no_trade_evidence`` then
@@ -518,6 +527,15 @@ def test_cli_busy_exits_75_and_emits_one_defer_line(tmp_path, monkeypatch):
     monkeypatch.setattr(
         mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
     )
+    # R1: stub the upstream ISIN probe so the CLI's identity guard
+    # sees a match against the seeded instrument ISIN and proceeds
+    # to the evidence write. Without this stub the production probe
+    # returns ``None`` and the guard emits ``identity_mismatch``
+    # (fail-closed).
+    from algotrader_api.ingestion import no_trade_evidence as _nte_cli
+    _nte_cli.fetch_issuer_identity = lambda ticker: {
+        "board": "TQCB", "isin": "X",
+    }
     monkeypatch.setattr(mod, "_fetch_year_moex_outcome", lambda *a, **kw: ([], "complete"))
 
     def _busy_always(db_path, **kw):
@@ -595,6 +613,15 @@ def test_cli_dry_run_does_not_acquire_writer_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(
         mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
     )
+    # R1: stub the upstream ISIN probe so the CLI's identity guard
+    # sees a match against the seeded instrument ISIN and proceeds
+    # to the evidence write. Without this stub the production probe
+    # returns ``None`` and the guard emits ``identity_mismatch``
+    # (fail-closed).
+    from algotrader_api.ingestion import no_trade_evidence as _nte_cli
+    _nte_cli.fetch_issuer_identity = lambda ticker: {
+        "board": "TQCB", "isin": "X",
+    }
     monkeypatch.setattr(mod, "_fetch_year_moex_outcome", lambda *a, **kw: ([], "complete"))
 
     acquisitions: list[dict] = []
@@ -622,3 +649,100 @@ def test_cli_dry_run_does_not_acquire_writer_lock(tmp_path, monkeypatch):
     # Verify the dry-run message was emitted.
     out = buf.getvalue()
     assert "[dry]" in out, f"dry-run marker missing from output: {out!r}"
+
+
+# ─── R1: CLI partial outcome must NOT exit 0 ─────────────────────────────
+
+
+def test_cli_partial_outcome_does_not_exit_zero(tmp_path, monkeypatch):
+    """R1: when every figi's MOEX fetch returns a non-``complete``
+    outcome (``partial``), the CLI MUST NOT exit 0 — the operator
+    must see a non-zero exit code so cron / supervisor can flag a
+    degraded run. Previously the CLI exited 0 unconditionally
+    regardless of how many figis produced evidence, which made the
+    script look successful in cron even when every fetch degraded.
+
+    Bounded: 1 figi, 1 year, ``partial`` outcome. The CLI must
+    not exit 0 in this case.
+    """
+    import importlib.util
+    import io
+    import contextlib
+
+    db = tmp_path / "partial.db"
+    _migrate(db)
+    _seed_instrument(db, "FIGI-PARTIAL", "DELISTED")
+    con = sqlite3.connect(str(db))
+    con.execute(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume, source) "
+        "VALUES ('FIGI-PARTIAL', '2026-09-05', 1, 1, 1, 1, 1, 'tinkoff')",
+    )
+    con.commit()
+    con.close()
+
+    from algotrader_api.ingestion import writer_lock as wl_mod
+    script_path = (
+        Path(__file__).resolve().parent.parent / "scripts"
+        / "backfill_no_trade_evidence.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "backfill_no_trade_evidence_cli_partial", script_path,
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    monkeypatch.setattr(mod, "_get_meta_moex", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
+    )
+    # R1: stub the upstream ISIN probe so the CLI's identity guard
+    # sees a match against the seeded instrument ISIN and proceeds
+    # to the per-year fetch loop.
+    from algotrader_api.ingestion import no_trade_evidence as _nte_cli
+    _nte_cli.fetch_issuer_identity = lambda ticker: {
+        "board": "TQCB", "isin": "X",
+    }
+    # Force a ``partial`` outcome from the per-year fetcher — the
+    # helper short-circuits, no evidence is written, the CLI
+    # must NOT exit 0.
+    monkeypatch.setattr(
+        mod, "_fetch_year_moex_outcome",
+        lambda *a, **kw: ([], "partial"),
+    )
+
+    # Allow the writer lock to be acquired normally (we are not
+    # testing the lock path here).
+    real_cm = wl_mod.writer_lock
+
+    @wl_mod.contextmanager  # type: ignore[attr-defined]
+    def _passthrough(db_path, **kw):
+        with real_cm(db_path, **kw):
+            yield
+
+    monkeypatch.setattr(mod, "writer_lock", _passthrough)
+
+    buf = io.StringIO()
+    monkeypatch.setattr(
+        sys, "argv",
+        ["x", "--db", str(db), "--limit", "1", "--sleep", "0"],
+    )
+    with contextlib.redirect_stdout(buf):
+        rc = mod.main()
+    output = buf.getvalue()
+    # CLI must NOT exit 0 — a partial outcome with zero evidence
+    # is a degraded run, not a success.
+    assert rc != 0, (
+        f"CLI exited 0 despite partial outcome; output={output!r}"
+    )
+    # And no evidence row was persisted.
+    con2 = sqlite3.connect(str(db))
+    try:
+        n = con2.execute(
+            "SELECT COUNT(*) FROM moex_no_trade_evidence "
+            "WHERE figi = ?",
+            ("FIGI-PARTIAL",),
+        ).fetchone()[0]
+    finally:
+        con2.close()
+    assert n == 0, (
+        f"partial outcome must NOT write evidence, got n={n}"
+    )

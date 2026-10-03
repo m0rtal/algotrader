@@ -1147,7 +1147,21 @@ class BackfillRunner:
     # can patch them with ``patch.object(BackfillRunner, '_fetch_year_moex')``.
     # These bindings mirror the inner closures that used to live inside
     # backfill_from_moex — same logic, but reachable from outside.
+    #
+    # ``_fetch_year_moex_outcome`` is the outcome-emitting variant
+    # (Task 2). The binding mirrors ``_fetch_year_moex`` exactly so
+    # test doubles can monkeypatch at the class level via
+    # ``BackfillRunner._fetch_year_moex_outcome = staticmethod(...)``.
+    # Production callers see the real implementation; the
+    # ``_backfill_one_moex`` walker calls
+    # ``self._fetch_year_moex_outcome(...)`` so a test double installed
+    # via ``runner._fetch_year_moex_outcome = ...`` is used (the
+    # instance attribute shadows the class binding). Do NOT set this
+    # in ``__post_init__`` — that would force every test to override
+    # the assignment; the class binding plus optional instance
+    # attribute is the proven pattern.
     _fetch_year_moex = staticmethod(_fetch_year_moex)
+    _fetch_year_moex_outcome = staticmethod(_fetch_year_moex_outcome)
     _fetch_moex_range = staticmethod(_fetch_moex_range)
     _get_meta_moex = staticmethod(_get_meta_moex)
     _fetch_tinkoff_fallback = staticmethod(_fetch_tinkoff_fallback_impl)
@@ -1531,15 +1545,16 @@ class BackfillRunner:
         _TINKOFF_BREAKER_OPEN_HOURS = 24
 
         async def _process_moex_year(inst: dict, meta: dict, year: int) -> list[dict]:
-            # Task 2: walk the outcome-emitting variant so the evidence
-            # helper can branch on ``complete`` vs degraded. The bar
-            # list is still the rows the fetcher returned; the
-            # ``outcome`` only gates the new evidence path. The
-            # module-level symbol is used directly so test doubles can
-            # monkeypatch the import target in
-            # ``algotrader_api.ingestion.backfill`` (no class-level
-            # binding needed).
-            year_bars, outcome = _fetch_year_moex_outcome(
+            # Task 2 (R1 fix): call through the ``self._fetch_year_moex_outcome``
+            # binding so the class-level staticmethod (which is the
+            # production default) is used, and so test doubles
+            # installed on the class via
+            # ``BackfillRunner._fetch_year_moex_outcome = staticmethod(...)``
+            # are picked up. Task 3 (the end-to-end test) expects this
+            # ``self`` binding — the prior module-level lookup meant
+            # ``monkeypatch.setattr(BackfillRunner, ...)`` had no
+            # effect on the public walker.
+            year_bars, outcome = self._fetch_year_moex_outcome(
                 meta["market"], meta["board"], inst["ticker"], year,
                 last_trading_day=yesterday,
             )
@@ -1568,12 +1583,19 @@ class BackfillRunner:
                         record_historical_no_trade_evidence,
                     )
                     from ..db.bars_sqlite import get_connection
+                    # R1: pass the UPSTREAM-VERIFIED ISIN (the
+                    # ``meta`` dict carries the MOEX probe result;
+                    # ``inst`` carries the locally-stored ISIN).
+                    # The helper compares the upstream ISIN against
+                    # the stored one in ``instruments.isin``; passing
+                    # the local ISIN would defeat the gate.
+                    upstream_isin = str(meta.get("isin") or "").strip()
                     record_historical_no_trade_evidence(
                         get_connection(self.db_path),
                         db_path=self.db_path,
                         figi=inst["figi"], ticker=inst["ticker"],
                         rows=year_bars, board=meta["board"],
-                        isin=str(inst.get("isin") or ""),
+                        isin=upstream_isin,
                         outcome=outcome,
                     )
                 except Exception as _exc:  # noqa: BLE001
@@ -2354,18 +2376,28 @@ class BackfillRunner:
         year = from_.year
         while year <= to.year:
             last_trading_day_for_year = today if year == to.year else None
-            # Task 2: the historical walker has two ways to call MOEX:
-            # the legacy list-only ``_fetch_year_moex`` (preserved for
-            # bar-consumer compatibility) and the new
-            # ``_fetch_year_moex_outcome`` that emits a
-            # ``MOEXFetchOutcome`` for the evidence path.
-            # Production callers can opt into the outcome-gated
-            # evidence path by setting
-            # ``runner._fetch_year_moex_outcome`` to a callable that
-            # returns ``(rows, outcome)``; otherwise the legacy
-            # ``_fetch_year_moex`` is used and the bar list is the
-            # only thing carried back (no outcome, evidence path
-            # silently bypassed).
+            # Task 2 (R1 fix): the historical walker has two ways to
+            # call MOEX. The new, production path uses the
+            # ``_fetch_year_moex_outcome`` staticmethod (the class
+            # binding lives next to ``_fetch_year_moex``; tests can
+            # monkeypatch at the class level via
+            # ``BackfillRunner._fetch_year_moex_outcome = staticmethod(...)``)
+            # — the fetcher returns ``(rows, outcome)`` and the walker
+            # routes only ``"complete"`` outcomes to the evidence
+            # helper. Production callers see the class binding.
+            # The legacy ``_fetch_year_moex`` staticmethod is preserved
+            # for bar-consumer compatibility but is NOT a valid
+            # evidence source: it does not return an outcome, so the
+            # evidence helper has no proof the upstream feed was
+            # validated-complete. Callers that drive the legacy
+            # fetcher (``runner._fetch_year_moex = ...``) are legacy
+            # bar-only stubs; the evidence path is intentionally
+            # bypassed by setting ``outcome = "error"`` (fail-closed).
+            # Stale tests that only stub the legacy list-only
+            # fetcher therefore see no evidence writes — that is the
+            # correct fail-closed behaviour, not a bug. Such tests
+            # MUST be migrated to stub ``_fetch_year_moex_outcome``
+            # (Task 2 contract) when they want to assert evidence.
             outcome_fn = getattr(self, "_fetch_year_moex_outcome", None)
             try:
                 if outcome_fn is not None:
@@ -2374,11 +2406,16 @@ class BackfillRunner:
                         last_trading_day=last_trading_day_for_year,
                     )
                 else:
+                    # Legacy path: bar-consumer stub. No outcome is
+                    # available; treat as ``"error"`` (fail-closed)
+                    # so the evidence helper short-circuits. The
+                    # bar list is still written; only the evidence
+                    # write is skipped.
                     candles = self._fetch_year_moex(
                         "shares", "TQBR", ticker, year,
                         last_trading_day=last_trading_day_for_year,
                     )
-                    outcome = "complete"
+                    outcome = "error"
             except Exception as e:  # noqa: BLE001
                 await self._log("warn", figi=figi,
                                 message=f"moex year {year} failed: {e}")
@@ -2418,12 +2455,20 @@ class BackfillRunner:
                         record_historical_no_trade_evidence,
                     )
                     from ..db.bars_sqlite import get_connection
+                    # R1: pass the UPSTREAM-VERIFIED ISIN (the
+                    # ``meta_isin`` variable is the result of
+                    # ``fetch_issuer_identity``; ``inst_isin`` is the
+                    # locally-stored value). The two were compared
+                    # above and the early-return on mismatch is what
+                    # lets us reach this point, but the helper
+                    # itself re-checks against ``instruments.isin``,
+                    # so we pass the upstream value by convention.
                     record_historical_no_trade_evidence(
                         get_connection(self.db_path),
                         db_path=self.db_path,
                         figi=figi, ticker=ticker,
                         rows=candles, board="TQBR",
-                        isin=inst_isin,
+                        isin=meta_isin,
                         outcome=outcome,
                     )
                 except Exception as _exc:  # noqa: BLE001

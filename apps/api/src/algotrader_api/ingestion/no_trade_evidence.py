@@ -290,7 +290,28 @@ def record_historical_no_trade_evidence(
       * any other outcome — return ``0`` immediately, perform no
         SQLite mutation, and emit one structured log line.
 
-    Filter rule (after outcome gate):
+    ISIN identity gate (added in Task 2 R1):
+      * The ``isin`` argument represents the **upstream-verified
+        metadata ISIN** that the caller (the historical walker or
+        the CLI) obtained from MOEX's identity probe. The helper
+        reads the figi's stored ISIN from the same ``conn`` (no
+        extra HTTP, no nested lock acquisition) and compares the
+        two. A mismatch rejects the whole batch with one
+        structured ``moex_historical_evidence_rejected
+        reason=identity_mismatch`` log line and **no DB write**.
+      * When the upstream ISIN is empty (the caller's MOEX probe
+        did not return a value) and the stored ``instruments.isin``
+        for the figi is populated, the helper **fails closed**: it
+        cannot certify the row's identity against upstream, so the
+        whole batch is rejected (no DB write). The same
+        ``identity_mismatch`` log line is emitted so the operator
+        sees the gap.
+      * The brief preserves the public signature — no new
+        argument is added. The existing ``isin`` argument now
+        carries the upstream-verified metadata ISIN; the helper
+        itself does the local-vs-upstream cross-check.
+
+    Filter rule (after both gates pass):
       * keep rows whose ``_secid`` matches the explicit ``ticker``
         argument (the caller threads the ticker through from the
         ``instruments`` row — the helper MUST NOT guess the
@@ -313,6 +334,30 @@ def record_historical_no_trade_evidence(
         logging.getLogger("algotrader.ingestion").info(
             "moex_historical_evidence_rejected figi=%s reason=%s rows=%s",
             figi, outcome, len(rows),
+        )
+        return 0
+    # ISIN identity gate: compare the upstream-verified metadata ISIN
+    # (carried in the ``isin`` argument, set by the caller from
+    # ``fetch_issuer_identity``) against the figi's stored ISIN in
+    # the SAME connection — no HTTP, no nested lock. A mismatch
+    # rejects the whole batch with one structured
+    # ``identity_mismatch`` log line and no DB write. A missing
+    # upstream ISIN combined with a populated local ISIN is the
+    # same fail-closed rejection: the row's identity cannot be
+    # certified against upstream metadata.
+    try:
+        row = conn.execute(
+            "SELECT isin FROM instruments WHERE figi = ?", (figi,),
+        ).fetchone()
+    except Exception:
+        row = None
+    local_isin = ((row["isin"] if row else "") or "").strip()
+    upstream_isin = (isin or "").strip()
+    if upstream_isin != local_isin:
+        logging.getLogger("algotrader.ingestion").info(
+            "moex_historical_evidence_rejected figi=%s "
+            "reason=identity_mismatch rows=%s",
+            figi, len(rows),
         )
         return 0
     if not rows:

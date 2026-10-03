@@ -1,4 +1,5 @@
 """Route 5y windows to MOEX, 9m tail to Tinkoff, delisted to Tinkoff-fallback."""
+import sqlite3
 from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -74,11 +75,27 @@ def test_auto_routes_long_window_to_moex_year_walker(runner, tmp_path):
             "volume": 100, "source": "moex",
         }]
 
+    def fake_moex_year_outcome(market, board, ticker, year,
+                               last_trading_day=None):
+        # Task 2: drive the new outcome-emitting fetcher so the
+        # production class binding (which now exists next to
+        # ``_fetch_year_moex``) is exercised. The bar list is the
+        # same one the legacy stub would have returned; the outcome
+        # is ``"error"`` so this bar-routing test does not assert
+        # evidence (it never did). The evidence path is intentionally
+        # fail-closed: legacy bar-only stubs do not produce evidence
+        # because the upstream feed was not validated through the
+        # new contract.
+        return (fake_moex_year(market, board, ticker, year,
+                               last_trading_day=last_trading_day),
+                "error")
+
     async def fake_tinkoff(figi, date_from, date_to, interval):
         tinkoff_calls.append((date_from, date_to))
         return []
 
     runner._fetch_year_moex = staticmethod(fake_moex_year)
+    runner._fetch_year_moex_outcome = staticmethod(fake_moex_year_outcome)
     runner.client.get_candles = AsyncMock(side_effect=fake_tinkoff)
 
     # Identity gate (PR #176 follow-up): _backfill_one_moex calls
@@ -125,6 +142,16 @@ def test_tinkoff_source_routes_to_get_candles(runner):
         moex_calls.append(year)
         return []
 
+    def fake_moex_year_outcome(market, board, ticker, year,
+                               last_trading_day=None):
+        # Task 2: drive the new outcome-emitting fetcher. Bar list
+        # empty (Tinkoff-only routing); outcome is "error" so the
+        # evidence path is fail-closed (this test does not assert
+        # evidence).
+        return (fake_moex_year(market, board, ticker, year,
+                               last_trading_day=last_trading_day),
+                "error")
+
     async def fake_tinkoff(figi, date_from, date_to, interval):
         tinkoff_calls.append((date_from, date_to))
         return [{
@@ -133,6 +160,7 @@ def test_tinkoff_source_routes_to_get_candles(runner):
         }]
 
     runner._fetch_year_moex = staticmethod(fake_moex_year)
+    runner._fetch_year_moex_outcome = staticmethod(fake_moex_year_outcome)
     runner.client.get_candles = AsyncMock(side_effect=fake_tinkoff)
 
     from_ = date(2025, 1, 1)
@@ -167,7 +195,17 @@ def test_skipped_marker_NOT_set_on_empty_moex_response(runner):
     def empty_moex(market, board, ticker, year, last_trading_day=None):
         return []  # MOEX returns empty for this year
 
+    def empty_moex_outcome(market, board, ticker, year,
+                           last_trading_day=None):
+        # Task 2: drive the new outcome-emitting fetcher. Empty
+        # bar list; outcome is "error" (fail-closed; this test
+        # does not assert evidence).
+        return (empty_moex(market, board, ticker, year,
+                           last_trading_day=last_trading_day),
+                "error")
+
     runner._fetch_year_moex = staticmethod(empty_moex)
+    runner._fetch_year_moex_outcome = staticmethod(empty_moex_outcome)
 
     from_ = date(2021, 1, 1)
     to_ = date(2021, 12, 31)
@@ -225,7 +263,19 @@ def test_moex_year_exception_is_swallowed(runner):
     def boom_moex(market, board, ticker, year, last_trading_day=None):
         raise ConnectionError("MOEX ISS down")
 
+    def boom_moex_outcome(market, board, ticker, year,
+                          last_trading_day=None):
+        # Task 2: drive the new outcome-emitting fetcher. Propagate
+        # the underlying exception so the walker logs the same
+        # "moex year {year} failed" line the test asserts on. The
+        # walker's existing ``except Exception`` branch converts the
+        # exception into ``outcome = "error"`` and an empty bar
+        # list; that is the fail-closed contract.
+        return boom_moex(market, board, ticker, year,
+                         last_trading_day=last_trading_day)
+
     runner._fetch_year_moex = staticmethod(boom_moex)
+    runner._fetch_year_moex_outcome = staticmethod(boom_moex_outcome)
     runner.client.get_candles = AsyncMock(return_value=[])
 
     from_ = date(2024, 1, 1)
@@ -314,7 +364,7 @@ def test_walker_partial_outcome_writes_no_evidence_but_keeps_bars(runner):
                         last_trading_day=None):  # noqa: ARG001
         return (real_partial_row, "partial")
 
-    runner._fetch_year_moex_outcome = partial_outcome
+    runner._fetch_year_moex_outcome = staticmethod(partial_outcome)
     # Stub Tinkoff so the trailing 9m bridge is a no-op.
     from unittest.mock import AsyncMock
     runner.client.get_candles = AsyncMock(return_value=[])
@@ -391,7 +441,7 @@ def test_walker_complete_outcome_writes_evidence_for_business_dates(runner):
                          last_trading_day=None):  # noqa: ARG001
         return (list(zero_rows), "complete")
 
-    runner._fetch_year_moex_outcome = complete_outcome
+    runner._fetch_year_moex_outcome = staticmethod(complete_outcome)
     from unittest.mock import AsyncMock
     runner.client.get_candles = AsyncMock(return_value=[])
 
@@ -416,3 +466,225 @@ def test_walker_complete_outcome_writes_evidence_for_business_dates(runner):
     assert [r["session_date"] for r in n_evidence] == [
         "2024-01-15", "2024-01-16",
     ], f"expected Mon+Tue only, got {n_evidence}"
+
+
+def test_walker_evidence_failure_does_not_undo_bars(runner):
+    """R1: when the evidence helper fails (e.g. ``WriterLockBusy``)
+    after the bar write has already committed, the bar write
+    MUST NOT be rolled back. The walker swallows the evidence
+    failure (logs ``moex_historical_evidence_deferred``) and
+    keeps the bar list intact. This pins the "evidence failure
+    doesn't undo committed bars" invariant.
+    """
+    runner._moex_meta["GAZP"] = {
+        "market": "shares", "board": "TQBR",
+        "listed_from": date(2024, 1, 1),
+        "isin": "RU0007661625",
+    }
+    import sqlite3
+    con = sqlite3.connect(runner.db_path)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin) "
+        "VALUES ('GAZP', '00000000-0000-0000-0000-000000000997', "
+        "'share', 'Gazp', 'rub', 10, 'RU0007661625')"
+    )
+    con.commit()
+    con.close()
+    from algotrader_api.ingestion import no_trade_evidence as _nte
+    _nte.fetch_issuer_identity = lambda ticker: {
+        "board": "TQBR", "isin": "RU0007661625",
+    }
+
+    # One business date zero-trade row + one real bar. The bar
+    # write goes through ``replace_bars_for_figi`` (committed);
+    # the evidence call goes through
+    # ``record_historical_no_trade_evidence`` which acquires
+    # the evidence lock.
+    real_bars = [{
+        "figi": None, "ts": "2024-06-03", "open": 100.0, "high": 102.0,
+        "low": 99.0, "close": 101.0, "volume": 1000, "source": "moex",
+        "_secid": "GAZP", "_boardid": "TQBR",
+        "_numtrades": 5, "_value": 100000,
+    }]
+
+    def complete_outcome(market, board, ticker, year,
+                         last_trading_day=None):  # noqa: ARG001
+        return (list(real_bars), "complete")
+
+    runner._fetch_year_moex_outcome = staticmethod(complete_outcome)
+    from unittest.mock import AsyncMock
+    runner.client.get_candles = AsyncMock(return_value=[])
+
+    # Force the evidence writer lock to be busy. The bar write
+    # uses the bar-writer lock (different role/phase), so it
+    # still acquires — only the evidence write fails.
+    from algotrader_api.ingestion import writer_lock as _wl_mod
+    from algotrader_api.ingestion.writer_lock import WriterLockBusy
+
+    real_lock = _wl_mod.writer_lock
+
+    @_wl_mod.contextmanager  # type: ignore[attr-defined]
+    def _busy_evidence_lock(db_path, **kw):
+        if kw.get("role") == "no-trade-evidence" and kw.get("phase") == "evidence":
+            raise WriterLockBusy(
+                role=kw["role"], phase=kw["phase"],
+                database_path=str(db_path),
+                lock_path=str(db_path) + ".writer.lock",
+                timeout_seconds=kw.get("timeout_seconds", 0.0),
+                reason="test-forced-busy",
+            )
+        with real_lock(db_path, **kw):
+            yield
+
+    import unittest.mock as _mock
+    with _mock.patch.object(_wl_mod, "writer_lock", _busy_evidence_lock):
+        import asyncio
+        # The walker swallows the WriterLockBusy from the
+        # evidence call (logs ``moex_historical_evidence_deferred``)
+        # and returns the bar count.
+        n_bars = asyncio.run(runner._backfill_one(
+            figi="00000000-0000-0000-0000-000000000997",
+            ticker="GAZP",
+            from_=date(2024, 1, 1),
+            to=date(2024, 12, 31),
+            source="moex",
+        ))
+
+    con = sqlite3.connect(runner.db_path)
+    n_bars_db = con.execute(
+        "SELECT COUNT(*) FROM bars "
+        "WHERE figi='00000000-0000-0000-0000-000000000997' "
+        "AND ts='2024-06-03'"
+    ).fetchone()[0]
+    n_evidence_db = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence "
+        "WHERE figi='00000000-0000-0000-0000-000000000997'"
+    ).fetchone()[0]
+    con.close()
+    assert n_bars == 1, (
+        f"bar write must still report 1 even when evidence fails, "
+        f"got n_bars={n_bars}"
+    )
+    assert n_bars_db == 1, (
+        f"bar row must be committed before evidence failure, "
+        f"got n_bars_db={n_bars_db}"
+    )
+    assert n_evidence_db == 0, (
+        f"evidence was busy and must NOT have written, "
+        f"got n_evidence_db={n_evidence_db}"
+    )
+
+
+def test_public_backfill_from_moex_persists_evidence_for_complete_outcome(
+    tmp_path,
+):
+    """R1: the public ``BackfillRunner.backfill_from_moex(...)``
+    walker (not just ``_backfill_one``) MUST drive the historical
+    evidence integration end-to-end. With a real-looking
+    ``_fetch_year_moex_outcome`` stub returning ``(zero_rows,
+    "complete")`` and the upstream ISIN matching the stored ISIN,
+    the public walker persists one ``moex_no_trade_evidence``
+    row for the right figi, session_date, board, and isin.
+
+    Bounded: 1 figi, 1 year, 1 zero-trade row on a Monday
+    (business date). Uses the real ``backfill_from_moex``
+    public method.
+    """
+    from algotrader_api.db import sqlite as _sqlitedb
+    migrations_dir = str(
+        Path(__file__).resolve().parent.parent
+        / "src/algotrader_api/db/migrations"
+    )
+    db_file = str(tmp_path / "public_walker.db")
+    _sqlitedb.run_migrations(db_file, migrations_dir)
+    _sqlitedb.close_all()
+    figi = "BBG00-PUBLIC-WALKER"
+    ticker = "GAZP"
+    isin = "RU0007661625"
+    con = sqlite3.connect(db_file)
+    con.execute(
+        "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size, isin) "
+        "VALUES (?, ?, 'share', 'Gazp', 'rub', 10, ?)",
+        (ticker, figi, isin),
+    )
+    con.commit()
+    con.close()
+
+    # Stub the public walker fetcher at the class level so the
+    # walker sees a real-looking ``(rows, "complete")`` outcome
+    # without HTTP. The single zero-trade row is on a Monday
+    # (2024-01-15) — a valid business date.
+    zero_row = [{
+        "figi": None, "ts": "2024-01-15", "open": None, "high": None,
+        "low": None, "close": None, "volume": 0, "source": "moex",
+        "_secid": ticker, "_boardid": "TQBR",
+        "_numtrades": 0, "_value": 0,
+    }]
+
+    def _outcome(market, board, tk, year, *, last_trading_day=None):  # noqa: ARG001
+        return (list(zero_row), "complete")
+
+    # Stub the metadata probe so the walker resolves to a
+    # MOEX-routable figi without HTTP. The meta dict carries the
+    # upstream ISIN; the helper compares it against the stored
+    # ``instruments.isin`` and the two MUST match.
+    def _get_meta(ticker, today, *, meta_cache, meta_lock):  # noqa: ARG001
+        return {
+            "market": "shares", "board": "TQBR",
+            "listed_from": "2024-01-01",
+            "listed_till": today.isoformat(),
+            "isin": isin,
+        }
+
+    # Stub the universe discovery + meta prefetch so the public
+    # walker does not try to call the broker.
+    async def _noop_self(self, instruments):  # noqa: ARG001
+        return None
+    async def _noop_discover(self):  # noqa: ARG001
+        return 1
+
+    import algotrader_api.ingestion.backfill as _backfill_mod
+    BackfillRunner._fetch_year_moex_outcome = staticmethod(_outcome)
+    BackfillRunner._get_meta_moex = staticmethod(_get_meta)
+    BackfillRunner.prefetch_moex_meta = _noop_self
+    BackfillRunner._discover_universe = _noop_discover
+
+    async def _noop_sink(_ev):
+        return None
+
+    try:
+        runner = BackfillRunner(
+            client=MagicMock(), db_path=db_file,
+            event_sink=_noop_sink, run_id=0,
+        )
+        # Drive the real public walker.
+        import asyncio as _asyncio
+        _asyncio.run(
+            runner.backfill_from_moex(today=date(2024, 12, 31)),
+        )
+
+        con2 = sqlite3.connect(db_file)
+        try:
+            evidence_rows = con2.execute(
+                "SELECT figi, session_date, board, isin "
+                "FROM moex_no_trade_evidence WHERE figi = ? "
+                "ORDER BY session_date",
+                (figi,),
+            ).fetchall()
+        finally:
+            con2.close()
+        assert evidence_rows == [
+            (figi, "2024-01-15", "TQBR", isin),
+        ], (
+            f"public walker must persist 1 evidence row for "
+            f"complete-outcome fetch, got {evidence_rows!r}"
+        )
+    finally:
+        # Restore the class bindings so other tests in the run
+        # are not affected by our monkeypatch.
+        BackfillRunner._fetch_year_moex_outcome = staticmethod(
+            _backfill_mod._fetch_year_moex_outcome,
+        )
+        BackfillRunner._get_meta_moex = staticmethod(
+            _backfill_mod._get_meta_moex,
+        )
