@@ -10,7 +10,7 @@
 ## 2. Release verification
 
 - [ ] 2.1 Repeat strict change and canonical-target validation and diff checks; publish authorized PR and verify exact remote SHA/CI.
-- [ ] 2.2 Follow AGENTS.md operator/cron merge ownership; verify merged SHA, then backup-first approved deployment of that SHA in the same parent execution flow.
+- [ ] 2.2 Follow feature-branch PR safeguards. The latest specific user/operator full-rollout authorization supersedes stale cron deferral: parent owns merge only after independent reviews and CI on the exact SHA, not implementer self-merge. Verify merged SHA, then backup-first approved deployment of that SHA in the same parent execution flow.
 - [ ] 2.3 Read back bounded smoke results, integrity, readiness and rollback artifacts; record actual counts and remaining standing-goal gates without claiming seven-day acceptance.
 
 Documentation drafting/validation evidence is in `docs/superpowers/evidence/verified-delisting-metadata/`; unchecked items above are future execution, not completed work.

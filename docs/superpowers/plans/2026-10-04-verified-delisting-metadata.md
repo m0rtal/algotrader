@@ -19,7 +19,7 @@
 - Rejected metadata preserves existing listed-till (NULL or non-NULL), bars, expected-bars and evidence exactly. Validated inactive metadata does not require subsequent history success or synthetic zeros.
 - Keep foreign bars after date guard, latest-board selection and strict earlier-than-last-session comparison. No active board may certify delisting.
 - Locks remain `no-trade-evidence/listed-till` and `no-trade-evidence/evidence`, separate and non-nested. Rollback pending failure before unlock, owned connection close, network/sleep outside locks, dry-run read-only/lock-free, busy exit 75, ordinary degradation exit 0.
-- One implementation task plus release verification. Follow AGENTS.md feature-branch PR and independent review; operator/cron owns merge. Parent authorization allows the release flow, not self-merge or bypassing checks.
+- One implementation task plus release verification. Follow AGENTS.md feature-branch PR and independent review. The latest specific user/operator authorization already covers full rollout and supersedes stale cron deferral: the parent owns merge after independent reviews and CI on the exact SHA, never implementer self-merge or bypassing CI/production safeguards.
 
 ## Preflight and Evidence Wiring
 
@@ -168,8 +168,11 @@ def exercise(tmp_path, monkeypatch, payload, *, status=200,
                 "data": [["2026-09-01", "GAZP", "TQBR", None, None,
                           None, None, 0, 0, 0]],
             },
-            "history.cursor": {"data": [[0, 1, 1]]},
+            "history.cursor": {"columns": ["INDEX", "TOTAL", "PAGESIZE"],
+                               "data": [[0, 1, 1]]},
         }
+        if history == "partial":
+            body["history.cursor"]["data"] = [[0, 2, 2]]
         if history == "error":
             raise ConnectionError("offline history failure")
         if history == "wrong_secid":
@@ -184,11 +187,6 @@ def exercise(tmp_path, monkeypatch, payload, *, status=200,
     monkeypatch.setattr(backfill, "_get_moex_session", lambda: session)
     monkeypatch.setattr(cli, "_moex_session", lambda: session)
     monkeypatch.setattr(backfill, "requests", SimpleNamespace(get=get))
-    if history == "partial":
-        def partial(market, board, ticker, year, last_trading_day=None):
-            get("/history/", params={"from": "2026-01-01"})
-            return [], "partial"
-        monkeypatch.setattr(cli, "_fetch_year_moex_outcome", partial)
     monkeypatch.setattr(sys, "argv", ["cli", "--db", str(db), "--days", "60",
                                       "--limit", "1", "--sleep", "0"]
                         + (["--dry-run"] if dry else []))
@@ -205,6 +203,7 @@ def exercise(tmp_path, monkeypatch, payload, *, status=200,
 
 @pytest.mark.parametrize("fault", ["http500", "wrong_secid", "wrong_isin",
     "missing_secid", "empty_isin", "missing_boards", "short_board",
+    "missing_board_secid", "empty_board_secid", "wrong_board_secid",
     "duplicate_column", "bad_date", "suffix_date", "null_date", "active_other",
     "json_error", "network_error"])
 @pytest.mark.parametrize("prior", [None, "2026-09-30"])
@@ -217,6 +216,11 @@ def test_invalid_metadata_empty_window_preserves_state(tmp_path, monkeypatch, fa
     if fault == "empty_isin": body["description"]["data"][1][2] = ""
     if fault == "missing_boards": body.pop("boards")
     if fault == "short_board": body["boards"]["data"][0].pop()
+    if fault == "missing_board_secid":
+        body["boards"]["columns"].pop(0)
+        for row in body["boards"]["data"]: row.pop(0)
+    if fault == "empty_board_secid": body["boards"]["data"][0][0] = ""
+    if fault == "wrong_board_secid": body["boards"]["data"][0][0] = "SBER"
     if fault == "duplicate_column": body["boards"]["columns"][0] = "boardid"
     if fault == "bad_date": body["boards"]["data"][0][13] = "2026-02-30"
     if fault == "suffix_date": body["boards"]["data"][0][13] += "junk"
@@ -262,6 +266,8 @@ def test_valid_metadata_survives_degraded_history(tmp_path, monkeypatch, history
     rc, before, after, _, _, events = exercise(tmp_path, monkeypatch, metadata(),
         bar="2026-08-31", history=history)
     assert rc == 0 and "history" in events
+    if history == "partial":
+        assert events.count("history") == 1
     con = sqlite3.connect(str(tmp_path / "state.db"))
     try:
         assert con.execute("SELECT listed_till FROM instruments").fetchone()[0] == "2026-09-10"
@@ -291,11 +297,91 @@ env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 /home/hermes/algotrade
 
 Expected semantic failures include HTTP500/wrong SECID/ISIN/suffix date making `after != before`; malformed row/date may expose unchecked parser exceptions. Network/error controls may already pass. Record actual collected/pass/fail counts, traceback assertion and exit code; do not invent a total of failures. The exact adversarial NULL case must show before `stale`, after unexpected ready on the unfixed base. Repeat HTTP500/wrong-identity with bar `2026-08-31` to prove rejection precedes first history. Add those as separate parameterized real-CLI tests using the same helper; a history observer must never be reached for invalid metadata.
 
-- [ ] **Step 3: Complete retained edge/transaction tests before GREEN.** Extend the same fixture with local ISIN parameter and existing evidence setup; assert invalid metadata preserves non-empty evidence including observed/expiry fields and local ISIN NULL/empty cannot certify delisting. Add malformed description/boards container cases (`None`, list, string), missing/duplicate required columns/identity rows, long rows, bool/string activity, empty board id and second-board invalid date. Add two valid inactive boards to verify the latest end wins and no history is requested when equal to last bar. Use the actual metadata payload through the fake session, not stubbed probe tuples for trust tests.
+- [ ] **Step 3: Complete retained edge/transaction tests before GREEN.** Extend the same fixture with local ISIN parameter and existing evidence setup; assert invalid metadata preserves non-empty evidence including observed/expiry fields and local ISIN NULL/empty cannot certify delisting. Add malformed description/boards container cases (`None`, list, string), missing/duplicate required columns/identity rows, long rows, the exact accepted/rejected activity forms below, empty board id and second-board invalid date. Add two valid inactive boards to verify the latest end wins and no history is requested when equal to last bar. Use the actual metadata payload through the fake session, not stubbed probe tuples for trust tests.
+
+Inactive forms are exactly integer `0` (bool excluded from that integer branch), boolean `False`, and exact string `"0"`. Active forms are exactly integer `1`, boolean `True`, and exact string `"1"`; each prevents delisting, including on a non-primary board. Every other form is invalid/unknown, including `0.0`, `1.0`, `""`, `None`, `" 0"`, `"0 "`, `"false"`, `"true"`, `"unknown"`, and integer `2`. Never use general truthiness or integer coercion.
+
+The partial-history transport returns one valid zero-trade row and cursor columns `INDEX`, `TOTAL`, `PAGESIZE`, data `[[0, 2, 2]]`. The actual year parser must retain that one row, return `partial`, and make exactly one HTTP call. Never monkeypatch `_fetch_year_moex_outcome`; its real parser is the acceptance boundary.
 
 The following additional tests use the scaffold's `customize` hook and real SQLite; add them to the same file before GREEN.
 
 ```python
+@pytest.mark.parametrize("fault", ["missing", "empty", "mismatch", "other_row"])
+@pytest.mark.parametrize("bar", ["2026-09-10", "2026-08-31"])
+@pytest.mark.parametrize("prior", [None, "2026-09-30"])
+def test_board_identity_rejection_precedes_window_and_history(
+        tmp_path, monkeypatch, fault, bar, prior):
+    body = metadata()  # Description SECID remains GAZP in every case.
+    if fault == "missing":
+        body["boards"]["columns"].pop(0)
+        for row in body["boards"]["data"]: row.pop(0)
+    elif fault == "other_row":
+        other = body["boards"]["data"][0].copy()
+        other[0], other[1] = "SBER", "OTHER"
+        body["boards"]["data"].append(other)
+    else:
+        body["boards"]["data"][0][0] = "" if fault == "empty" else "SBER"
+    rc, before, after, gate_before, gate_after, events = exercise(
+        tmp_path, monkeypatch, body, bar=bar, prior=prior)
+    assert rc == 0 and before == after and gate_before == gate_after
+    assert "history" not in events
+
+
+@pytest.mark.parametrize("activity", [0, False, "0"], ids=["int0", "false", "str0"])
+def test_exact_inactive_activity_accepts_empty_window(tmp_path, monkeypatch, activity):
+    body = metadata()
+    body["boards"]["data"][0][8] = activity
+    rc, before, after, _, gate_after, events = exercise(tmp_path, monkeypatch, body)
+    assert rc == 0 and gate_after == [] and "history" not in events
+    con = sqlite3.connect(str(tmp_path / "state.db"))
+    try:
+        assert con.execute("SELECT listed_till FROM instruments").fetchone()[0] == "2026-09-10"
+    finally:
+        con.close()
+    assert after["bars"] == before["bars"]
+    assert after["moex_no_trade_evidence"] == before["moex_no_trade_evidence"]
+
+
+@pytest.mark.parametrize("activity", [1, True, "1", 0.0, 1.0, "", None,
+                                       " 0", "0 ", "false", "true", "unknown", 2])
+@pytest.mark.parametrize("other_board", [False, True])
+@pytest.mark.parametrize("bar", ["2026-09-10", "2026-08-31"])
+def test_active_or_invalid_activity_preserves_state(
+        tmp_path, monkeypatch, activity, other_board, bar):
+    body = metadata()
+    if other_board:
+        row = body["boards"]["data"][0].copy()
+        row[1] = "OTHER"
+        body["boards"]["data"].append(row)
+    body["boards"]["data"][-1][8] = activity
+    rc, before, after, gate_before, gate_after, events = exercise(
+        tmp_path, monkeypatch, body, bar=bar, prior="2026-09-30")
+    assert rc == 0 and before == after and gate_before == gate_after
+    assert "history" not in events
+
+
+def test_partial_cursor_uses_real_year_parser(monkeypatch):
+    calls = []
+    body = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID", "OPEN", "HIGH",
+                        "LOW", "CLOSE", "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [["2026-09-01", "GAZP", "TQBR", None, None,
+                      None, None, 0, 0, 0]],
+        },
+        "history.cursor": {"columns": ["INDEX", "TOTAL", "PAGESIZE"],
+                           "data": [[0, 2, 2]]},
+    }
+    def get(url, params=None, timeout=None):
+        calls.append(url)
+        assert len(calls) == 1
+        return SimpleNamespace(status_code=200, json=lambda: copy.deepcopy(body))
+    monkeypatch.setattr(backfill, "requests", SimpleNamespace(get=get))
+    rows, outcome = backfill._fetch_year_moex_outcome(
+        "shares", "TQBR", "GAZP", 2026, last_trading_day=date(2026, 10, 1))
+    assert outcome == "partial" and len(rows) == 1 and len(calls) == 1
+    assert rows[0]["_secid"] == "GAZP" and rows[0]["_boardid"] == "TQBR"
+
 @pytest.mark.parametrize("local_isin", [None, ""])
 def test_missing_local_identity_rejects_delisting(tmp_path, monkeypatch, local_isin):
     rc, before, after, gate_before, gate_after, events = exercise(
@@ -380,7 +466,7 @@ def test_commit_busy_rolls_back_while_locked_and_closes(tmp_path, monkeypatch, c
 
 For contention, retain and run existing `test_cli_busy_exits_75_and_emits_one_defer_line`, `test_cli_dry_run_does_not_acquire_writer_lock`, `test_cli_listed_till_uses_separate_lock_from_evidence` and `test_cli_partial_outcome_exits_zero_without_writing_evidence` in `test_backfill_no_trade_evidence_lock.py`. Update their private tuple fixtures and FrozenDate module bindings only. Add commit-failure injection through a CLI-local `sqlite3` proxy (never shared `sqlite3.connect`): forward execute/commit/close to a real file-backed connection, make commit raise numeric SQLITE_BUSY after UPDATE, and observe real SQL restoring the prior date. Track rollback while the real flock is still held and `close` after CLI exit; assert one exit-75 deferral. Inject direct BaseException and rollback failure separately to prove original failure is preserved and release/close attempted. Force only evidence lock busy after successful listed-till commit; assert 75 with verified date retained and no evidence change. Bound lock waits; never create child processes under a held lock.
 
-- [ ] **Step 4: Implement the minimal CLI change.** Change private probe to return `(board, date, upstream_isin)`. Validate response status before JSON, exact container/list/column/row shapes, unique `name/value` and board columns, one exact `SECID`/`ISIN`, non-empty identifiers, all inactive integer activity values and strict calendar dates (parse then require `parsed.isoformat() == raw`). Catch transport/JSON/shape errors as unknown, not an unchecked parser exception. Check upstream/local non-empty matching ISIN before UPDATE or history, retain foreign/future guards, and carry the same verified ISIN into evidence for the inactive path. Do not use `fetch_issuer_identity` to re-certify an inactive board or move delisting behind the history outcome/zero-row gate. Keep existing UPDATE transaction rollback/close/lock code intact. The design provides the private interface; no additional abstraction is required.
+- [ ] **Step 4: Implement the minimal CLI change.** Change private probe to return `(board, date, upstream_isin)`. Validate response status before JSON, exact container/list/column/row shapes, unique `name/value` and board columns, one exact `SECID`/`ISIN`, non-empty identifiers, each board row's non-empty exact `secid == ticker`, all inactive activity forms (`type(value) is int and value == 0`, `value is False`, or `type(value) is str and value == "0"`; never truthiness/int coercion) and strict calendar dates (parse then require `parsed.isoformat() == raw`). Catch transport/JSON/shape errors as unknown, not an unchecked parser exception. Check upstream/local non-empty matching ISIN before UPDATE or history, retain foreign/future guards, and carry the same verified ISIN into evidence for the inactive path. Do not use `fetch_issuer_identity` to re-certify an inactive board or move delisting behind the history outcome/zero-row gate. Keep existing UPDATE transaction rollback/close/lock code intact. The design provides the private interface; no additional abstraction is required.
 
 At the CLI boundary, catch ordinary parser/transport failures from `_get_meta_moex` as unknown and let the strict inactive probe reject them; the current active helper can raise on null/list boards before the inactive probe is reached. Do not change that shared helper globally.
 
@@ -408,7 +494,7 @@ def _probe_board_last(ticker: str) -> tuple[str, str, str] | None:
         parsed = {}
         for key, required in (
             ("description", {"name", "value"}),
-            ("boards", {"boardid", "is_traded", "listed_till"}),
+            ("boards", {"secid", "boardid", "is_traded", "listed_till"}),
         ):
             block = data.get(key)
             if not isinstance(block, dict):
@@ -435,8 +521,13 @@ def _probe_board_last(ticker: str) -> tuple[str, str, str] | None:
         candidates = []
         for row in parsed["boards"]:
             board, end, traded = row["boardid"], row["listed_till"], row["is_traded"]
-            if (not isinstance(board, str) or not board.strip()
-                    or type(traded) is not int or traded != 0
+            inactive = ((type(traded) is int and traded == 0)
+                        or traded is False
+                        or (type(traded) is str and traded == "0"))
+            if (not isinstance(row["secid"], str) or not row["secid"]
+                    or row["secid"] != ticker
+                    or not isinstance(board, str) or not board.strip()
+                    or not inactive
                     or not isinstance(end, str)
                     or date.fromisoformat(end).isoformat() != end):
                 return None
@@ -500,7 +591,7 @@ Parent dispatches independent spec and quality review of exact SHA after impleme
 
 **Files:** Execution evidence/progress and change tasks only; no additional feature scope.
 
-**Interfaces:** Consumes independently reviewed implementation SHA and actual RED/GREEN/full-suite reports; produces verified PR/CI, operator/cron merged SHA, WAL-aware backup, exact-SHA deployment and readback evidence.
+**Interfaces:** Consumes independently reviewed implementation SHA and actual RED/GREEN/full-suite reports; produces verified PR/CI, parent/operator merged SHA, WAL-aware backup, exact-SHA deployment and readback evidence.
 
 - [ ] **Step 1: Repeat preflight strict commands and diff check.** Review new scenario mapping and canonical files for unchanged clauses. Do not apply/archive before actual approved implementation completion.
 - [ ] **Step 2: Publish PR and verify remote target/CI.**
@@ -512,7 +603,7 @@ gh pr view --json number,url,headRefOid,reviewDecision,statusCheckRollup
 gh pr checks --watch
 ```
 
-Read back exact head SHA, actual check conclusions and independent approval. Local coverage remains mandatory even if CI only checks branch names. AGENTS.md assigns merge to operator/cron; parent tracks approved merge and verifies `mergeCommit` rather than invoking self-merge.
+Read back exact head SHA, actual check conclusions and independent approval. Local coverage remains mandatory even if CI only checks branch names. The latest specific user/operator authorization supersedes stale cron deferral. The parent, not the implementer, owns merge after independent spec/quality reviews and successful CI on the exact head SHA; then read back `mergeCommit`. No CI or production safeguard is bypassed.
 
 - [ ] **Step 3: Backup then deploy approved merged SHA.** In the existing authorized operator deployment flow, record prior/deployed SHAs and schedule/config backup paths. Create restricted SQLite online backup using `sqlite3.Connection.backup`; verify backup `PRAGMA integrity_check` equals `ok` before process/code changes. Preserve untracked operator config and existing scheduler topology. Prepare rollback to prior code SHA; DB restore is operator-controlled and WAL-aware, never copy only the main SQLite file over a running DB. No migration or cleanup is needed. This plan deliberately does not invent a deployment script: repository contains supervisor scripts, not a verified generic deploy command; parent must use its already established deployment procedure and read back the exact target.
 - [ ] **Step 4: Bounded smoke and final readback.** Execute the same offline one-FIGI migrated fixture on deployed code twice, with explicit fixture DB and transport fakes, never the production-default full CLI. Require invalid metadata exact preservation and stale gate; valid metadata idempotency; metadata-valid/history-degraded date retained with no evidence/bar/expected mutation. Read back deployed SHA, smoke SQL/counters, integrity and service health through the existing operator flow. Link actual artifacts and timestamps from progress; report any remaining blocker.
