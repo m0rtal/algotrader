@@ -102,7 +102,7 @@ def test_failed_write_rolls_back_before_unlock(database, monkeypatch, capsys, pa
             monkeypatch.setattr(mod, "writer_lock", observed_lock(db, conn, exits))
             monkeypatch.setattr(mod, "_last_trading_day", lambda *a: date(2026, 9, 15))
             monkeypatch.setattr(mod, "_get_meta_moex", lambda *a, **kw: None)
-            monkeypatch.setattr(mod, "_probe_board_last", lambda *a: ("TQCB", "2026-09-10"))
+            monkeypatch.setattr(mod, "_probe_board_last", lambda *a: ("TQCB", "2026-09-10", "RU000A0NT0A1"))
             monkeypatch.setattr(mod, "_fetch_year_moex_outcome", lambda *a, **kw: pytest.fail("fetch after failed listed-till"))
             monkeypatch.setattr(evidence, "fetch_issuer_identity", lambda *a: {"isin": "RU000A0NT0A1"})
             monkeypatch.setattr(sys, "argv", [str(mod.__file__), "--db", str(db), "--days", "60", "--sleep", "0"])
