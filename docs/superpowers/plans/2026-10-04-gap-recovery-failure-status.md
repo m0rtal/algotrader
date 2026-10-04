@@ -38,10 +38,10 @@ Files and responsibility:
 
 ## Execution preparation
 
-- [ ] Parent reads spec/design and ledger coupling rows, independently reviews this draft, and records preflight verdict before dispatching Task 1.
+- [x] Parent reads spec/design and ledger coupling rows, independently reviews this draft, and records preflight verdict before dispatching Task 1.
 - [ ] Verify worktree HEAD and status. Resolve only this plan's workspace with `/home/hermes/.hermes/skills/productivity/subagent-driven-development/scripts/sdd-workspace docs/superpowers/plans/2026-10-04-gap-recovery-failure-status.md`.
 - [ ] Record BASE, use fresh implementer and independent reviewer identities, and extract Task 1 with the skill's `scripts/task-brief`. Require task verdicts for spec compliance and code quality. Final review gets the full BASE..HEAD diff and every ledger ruling, including parked findings.
-- [ ] Use existing offline interpreter `/home/hermes/algotrader/apps/api/.venv/bin/python` from this worktree's `apps/api`. If unavailable, use the prior cached environment `/home/hermes/.hermes/cache/scratch/gap-real-worker-verify-env/bin/python` for focused diagnostics only; do not call missing exporters/fixtures a valid RED. Cached package installation only, no dependency manifests changed. A production config/SDK factory call is a fixture defect: fix fixture, not source.
+- [x] Use existing offline interpreter `/home/hermes/algotrader/apps/api/.venv/bin/python` from this worktree's `apps/api`. If unavailable, use the prior cached environment `/home/hermes/.hermes/cache/scratch/gap-real-worker-verify-env/bin/python` for focused diagnostics only; do not call missing exporters/fixtures a valid RED. Cached package installation only, no dependency manifests changed. A production config/SDK factory call is a fixture defect: fix fixture, not source.
 
 ### Task 1: Truthful trailing failure status
 
@@ -57,7 +57,7 @@ Files and responsibility:
 - Consumes actual `_step_gap_recovery(db_path: str) -> tuple[bool, str]`, `recover_gaps(db_path, runner, gaps) -> dict[str, int]`, actual `BackfillRunner._backfill_one(*, figi, ticker=None, from_, to, source="auto") -> int`, and actual async `event_sink(BackfillEvent) -> None` with `.type` and `.payload`.
 - Produces unchanged tuple and runner integer signatures. Ordinary summary adds `failed=N`; `ok` becomes false for any unique failed trailing FIGI. Metadata DEFER shape stays unchanged. No intermediate/new API parameters.
 
-- [ ] **Step 1: Write the failing test and offline controls.** Put this complete scaffold in the new test file. The real-runner tests patch external candle I/O only and wrap actual `_emit` without replacing delivery. Boundary tests deliberately inject exceptions/events to verify deduplication and diagnostics; they do not substitute for actual-runner acceptance. Name the mutations detected: removing observer, failing to record caught exceptions, counting events, widening historical scope, marking `0` failure, dropping counters, closing early, swallowing cancellation, or changing chain policy.
+- [x] **Step 1: Write the failing test and offline controls.** Put this complete scaffold in the new test file. The real-runner tests patch external candle I/O only and wrap actual `_emit` without replacing delivery. Boundary tests deliberately inject exceptions/events to verify deduplication and diagnostics; they do not substitute for actual-runner acceptance. Name the mutations detected: removing observer, failing to record caught exceptions, counting events, widening historical scope, marking `0` failure, dropping counters, closing early, swallowing cancellation, or changing chain policy.
 
 ```python
 from __future__ import annotations
@@ -381,7 +381,7 @@ def test_actual_chain_best_effort_and_critical(offline, phase, expected):
 
 ```
 
-- [ ] **Step 2: Run RED on unchanged source.** Run from worktree `apps/api`:
+- [x] **Step 2: Run RED on unchanged source.** Run from worktree `apps/api`:
 
 ```bash
 mkdir -p /home/hermes/.hermes/cache/scratch/gap-recovery-failure-status
@@ -393,7 +393,7 @@ export TMPDIR=/home/hermes/.hermes/cache/scratch/gap-recovery-failure-status
 
 Expected RED: real all-chunks-failed, real partial success, dedup/exception, and real bar-writer contention fail on `ok is False` (old code returns `True`). Successful zero-row/shared-loop/historical-event controls also lack `failed=0`. No import/setup/network error counts as RED. Capture actual failures/counts rather than claiming the earlier diagnostic count for this new scaffold. Check finite sequences have no unexpected extra call: deque exhaustion is a fixture failure, not acceptable source RED.
 
-- [ ] **Step 3: Implement the minimal change only after assertion RED.** Inside the existing `_step_gap_recovery`, before runner construction, add local state and pass this sink instead of `_async_noop_sink`. Existing event shape is not a future API:
+- [x] **Step 3: Implement the minimal change only after assertion RED.** Inside the existing `_step_gap_recovery`, before runner construction, add local state and pass this sink instead of `_async_noop_sink`. Existing event shape is not a future API:
 
 ```python
 failed_trailing_figis: set[str] = set()
@@ -446,7 +446,7 @@ return not failed_trailing_figis, (
 
 No source refactor, new outcome class, retry, metadata query, or whole-phase rollback. If close-failure/cancellation precedence needs changing, record separate evidence and a narrow ruling rather than quietly widening this change.
 
-- [ ] **Step 4: Run GREEN and regressions.** Repeat RED command using `pytest-green` basetemp and `green.log`. Then run:
+- [x] **Step 4: Run GREEN and regressions.** Repeat RED command using `pytest-green` basetemp and `green.log`. Then run:
 
 ```bash
 /home/hermes/algotrader/apps/api/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_worker_gap_recovery_failure_status.py tests/test_worker_trailing_gap_recovery.py tests/test_worker_daily_chain.py tests/test_gap_recovery.py --basetemp="$TMPDIR/pytest-regression" > "$TMPDIR/regression.log" 2>&1
@@ -499,7 +499,7 @@ git commit -m "fix: report trailing gap recovery failures"
 - Consumes Task 1 commit, actual RED/GREEN/regression reports, task review verdict, and canonical data-quality.
 - Produces a written evidence record and strict-valid specs, not a new runtime behavior. Parent's approved rollout remains separate; no prod or network action by this leaf.
 
-- [ ] **Step 1: Run full backend gate and focused worker coverage.** Use the same safe environment and scratch directory. From worktree `apps/api`:
+- [x] **Step 1: Run full backend gate and focused worker coverage.** Use the same safe environment and scratch directory. From worktree `apps/api`:
 
 ```bash
 export COVERAGE_FILE="$TMPDIR/backend.coverage"
@@ -511,7 +511,7 @@ export COVERAGE_FILE="$TMPDIR/worker.coverage"
 
 Set `COVERAGE_FILE="$TMPDIR/backend.coverage"` before full command and `COVERAGE_FILE="$TMPDIR/worker.coverage"` before focused command. `worker.py` is outside package coverage; focused coverage is diagnostic, not a lowered 95% backend gate. Verify changed observer/error/summary lines and branches are exercised. Do not add pragmas, alter omissions, or reduce thresholds. Full-suite fixtures must remain scratch-owned; inspect legacy sandbox gates/fixtures before running and block any production/SDK access. Existing sandbox integration remains disabled. Any full-suite blocker stays explicitly unresolved, not PASS.
 
-- [ ] **Step 2: Apply reviewed additive delta and strict-validate separately.** Append the `### Requirement: Truthful Best-Effort Trailing Gap Recovery` block and its scenarios to canonical `## Requirements`; preserve all other canonical sections. Do not overwrite with delta or archive before reviewed implementation completion. From worktree root run both commands:
+- [x] **Step 2: Apply reviewed additive delta and strict-validate separately.** Append the `### Requirement: Truthful Best-Effort Trailing Gap Recovery` block and its scenarios to canonical `## Requirements`; preserve all other canonical sections. Do not overwrite with delta or archive before reviewed implementation completion. From worktree root run both commands:
 
 ```bash
 openspec validate report-gap-recovery-failures --strict
@@ -521,7 +521,7 @@ git diff --check
 
 - [ ] **Step 3: Independent full-branch review and CI.** Parent provides whole BASE..HEAD diff, test outputs, and this plan's ledger to a reviewer independent of implementation. Resolve load-bearing findings; record all rulings and costs if wrong. Parent checks every required CI status on the exact candidate SHA, including branch-name-check and externally configured gates; this repository currently contains only that workflow. A local test run is not CI. No network/push/merge by this leaf. Missing CI is outstanding, never inferred green.
 
-- [ ] **Step 4: Write release evidence and docs commit.** Use the following record structure, populated with actual outputs and exact SHAs; unchecked gates remain explicitly not verified:
+- [x] **Step 4: Write release evidence and docs commit.** Use the following record structure, populated with actual outputs and exact SHAs; unchecked gates remain explicitly not verified:
 
 ```markdown
 # Gap recovery failure status verification
@@ -548,6 +548,17 @@ git diff --check
 ```
 
 State that truthful cycle failure does not prove freshness, coverage readiness increase, seven-day reliability, partial-chunk completeness, detached thread settlement, or SIGKILL cleanup. Do not mark deployment/rollout success without parent's written actual proof. Commit exact docs/spec paths after evidence exists. Archive only when approved complete; docs drafting alone does not complete implementation.
+
+## Verified local status (Task 2)
+
+Completed gate evidence is consumed, not rerun: exact implementation candidate `2586e66b86e3f46aec0151c565cc2f44ffdb076a`, 581 copied tracked files verified HEAD/worktree/isolated candidate before docs edits. Actual namespace launcher commands and outcomes are recorded in `docs/superpowers/results/2026-10-04-gap-recovery-failure-status.md`; earlier host commands in this plan remain proposals, not safe replay instructions.
+
+- [x] Parent preflight on `04e2c4d77b4b6ef5754522d97ffbdeba3a0883a5`, independent source/task review and final implementation whole-branch review supplied: `deleg_f285050d`, `SPEC ✅ + Approved`, no blockers. Initial implementation commit preceded independent approval; do not retroactively claim the Step 5 ordering.
+- [x] RED/GREEN, approved legacy fixture/assertion wave, full backend coverage and focused worker coverage verified from real artifacts.
+- [x] Canonical requirement and eight scenarios appended exactly; all 21317 original bytes preserved as prefix. Both strict validators and whitespace check pass.
+- [x] Local release evidence and docs-only commit; resulting SHA is recorded in the ignored Task 2 report after commit.
+- [ ] Combined Task 2 Step 3 remains pending: required CI on final docs head, remote publication, and final parent release gate not verified here. Independent implementation approval does not approve a later docs SHA.
+- [ ] Push, merge, deployment, rollout and archive require parent actual verification; none claimed by this leaf.
 
 ## Draft self-review
 
