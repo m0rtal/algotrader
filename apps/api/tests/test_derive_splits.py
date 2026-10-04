@@ -300,13 +300,10 @@ def test_run_derivation_is_idempotent(tmp_path):
 
 def test_lookup_face_values_handles_missing_secid(monkeypatch):
     """A 404 / network error returns empty dict (no exception)."""
-    from email.message import Message
-    from urllib.error import HTTPError
-
     def missing_secid(url, *, timeout):
         assert url.endswith("/DEFINITELY_NOT_A_REAL_SECID_XYZ123.json")
         assert timeout == 1.0
-        raise HTTPError(url, 404, "Not Found", Message(), None)
+        raise OSError("offline-face-value-fixture")
 
     monkeypatch.setattr(derive_splits.urllib.request, "urlopen", missing_secid)
     out = derive_splits.lookup_face_values(

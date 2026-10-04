@@ -1,13 +1,16 @@
 """Real daily transaction owners: order, contention, cleanup and retry state."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import date, datetime, timezone
 import asyncio
 import importlib
 import importlib.util
 import fcntl
+import json
+import os
+import subprocess
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -801,6 +804,7 @@ def corporate_trace(corporate_db, owner_trace, monkeypatch):
     db, _ = corporate_db
     state, events, connections, base_install = owner_trace
     worker = importlib.import_module("worker")
+    probe_preparation = False
 
     @contextmanager
     def acquire(path, *, role, phase, **kwargs):
@@ -819,15 +823,22 @@ def corporate_trace(corporate_db, owner_trace, monkeypatch):
             events.append(("duplicate-check",))
         elif normalized.startswith("SELECT figi, ex_date, factor FROM corporate_actions"):
             assert not state["held"] and not conn.in_transaction
+            if probe_preparation:
+                assert_unlocked(db, state)
             events.append(("prepare-select",))
         elif normalized.startswith("SELECT ba.adj_close, b.close"):
             assert state["held"] and conn.in_transaction
             events.append(("already-applied",))
         elif normalized.startswith(("SELECT DISTINCT figi FROM bars", "SELECT ts, close, volume FROM bars")):
             assert not state["held"]
+            if probe_preparation:
+                assert_unlocked(db, state)
             events.append(("derive-select",))
 
-    def install(*, real_derivation=False, **kwargs):
+    def install(*, real_derivation=False, probe_reads=False, **kwargs):
+        nonlocal probe_preparation
+        # A deliberately held competing writer may coexist with preparation reads.
+        probe_preparation = probe_reads
         base_install(sql_observer=observe_sql, **kwargs)
         monkeypatch.setattr(corporate, "writer_lock", acquire, raising=False)
         monkeypatch.setattr(worker, "writer_lock", acquire, raising=False)
@@ -1098,13 +1109,13 @@ def test_corporate_merge_prepares_every_field_and_date_before_acquisition(corpor
     class PreparedRow(corporate.CorporateActionRow):
         def __getattribute__(self, name):
             if name in {"figi", "action_type", "ex_date", "factor", "cash_amount", "note", "source"}:
-                assert not state["held"], f"row field {name} inside owner lock"
+                assert_unlocked(db, state)
                 events.append(("parameter", name))
             return super().__getattribute__(name)
 
     class PreparedDate(date):
         def isoformat(self):
-            assert not state["held"]
+            assert_unlocked(db, state)
             events.append(("date-iso",))
             return super().isoformat()
 
@@ -1128,12 +1139,12 @@ def test_corporate_adjustment_prepares_all_events_before_acquisition(corporate_d
     class PreparedDate(date):
         @classmethod
         def fromisoformat(cls, value):
-            assert not state["held"]
+            assert_unlocked(db, state)
             events.append(("prepare-date", value))
             return date.fromisoformat(value)
 
     def prepare_float(value):
-        assert not state["held"]
+        assert_unlocked(db, state)
         events.append(("prepare-float", value))
         return float(value)
 
@@ -1222,7 +1233,8 @@ def test_corporate_merge_real_derivation_releases_before_adjustment(
 
     monkeypatch.setattr(derive_splits, "derive_splits_for_figi", derive)
     primary = Interrupted("fixture-adjustment-interrupted")
-    install(real_derivation=True, failure=primary if interrupt_adjustment else None, fail_operation="UPDATE")
+    install(real_derivation=True, probe_reads=True,
+            failure=primary if interrupt_adjustment else None, fail_operation="UPDATE")
     if interrupt_adjustment:
         with pytest.raises(Interrupted) as caught:
             worker._step_corporate_actions(db)
@@ -1444,7 +1456,7 @@ def test_dividend_merge_prepares_all_22_fields_before_connection_and_acquisition
     class PreparedRow(corporate.DividendRow):
         def __getattribute__(self, name):
             if name in DIVIDEND_FIELDS:
-                assert not state["held"], f"row field {name} inside owner lock"
+                assert_unlocked(db, state)
                 assert ("acquire", "dividends", "dividends") not in events
                 events.append(("parameter", name))
                 time.sleep(0)
@@ -2586,3 +2598,661 @@ def test_dividend_partial_commit_keeps_prior_figi_and_failed_queue(
         con.close()
     assert invoke() == ((True, "dividends: tinkoff=0 queued=0") if entrypoint == "daily" else 0)
     assert all(client.closed for client in clients)
+
+
+# Task 6: finite stdlib child, actual owners, real flock and SQLite readback.
+# These tests catch removing any owner lock, globalizing the per-DB lock,
+# losing committed rows on resume, and admitting same-PID competing threads.
+STRESS_OWNERS = ("universe", "instrument", "seed", "update", "merge", "adjustment",
+                 "dividend", "bars", "evidence", "expected")
+STRESS_PAIRS = {
+    "universe": [("universe-sync", "instruments")],
+    "instrument": [("backfill-metadata", "instruments")],
+    "seed": [("backfill-metadata", "metadata")],
+    "update": [("backfill-metadata", "metadata")],
+    "merge": [("corporate-actions", "corporate-actions")],
+    "adjustment": [("corporate-actions", "corporate-actions"),
+                   ("corporate-actions", "adjusted-bars")],
+    "dividend": [("dividends", "dividends")],
+    "bars": [("bar-writer", "bars"), ("evidence-reconcile", "reconcile")],
+    "evidence": [("no-trade-evidence", "evidence")],
+    "expected": [("expected-bars", "expected-bars")],
+}
+OWNER_CHILD = r'''
+import ast, fcntl, inspect, json, os, socket, sqlite3, sys, time
+from contextlib import contextmanager
+from datetime import date
+from pathlib import Path
+
+cfg = json.loads(sys.argv[1])
+root, db, owner = Path(cfg["root"]), cfg["db"], cfg["owner"]
+assert Path(db).resolve().is_relative_to(root)
+assert not Path.cwd().joinpath(".env").exists()
+def deny_connect(*args, **kwargs):
+    raise AssertionError("unexpected-network")
+socket.socket.connect = socket.socket.connect_ex = deny_connect
+from algotrader_api.db import sqlite as sqlitedb
+from algotrader_api.db import bars_sqlite
+from algotrader_api.ingestion import backfill, universe, no_trade_evidence as evidence
+from algotrader_api.ingestion import writer_lock as locks
+from algotrader_api.scripts_import import import_corporate_actions_common as corporate
+import worker
+from scripts import populate_expected_bars as expected
+
+class FrozenDate(date):
+    @classmethod
+    def today(cls):
+        return date(2024, 5, 17)
+expected.date = FrozenDate
+real_lock = locks.writer_lock
+intervals, attempts, results = [], [], []
+def wait_file(path):
+    deadline = time.monotonic() + 5
+    while not path.exists():
+        assert time.monotonic() < deadline, f"child barrier timeout: {path.name}"
+        time.sleep(0.005)
+@contextmanager
+def audited_lock(db_path, *, role, phase, **kwargs):
+    attempts.append((time.monotonic(), role, phase))
+    Path(root / (owner + ".attempted")).touch()
+    with real_lock(db_path, role=role, phase=phase, timeout_seconds=5):
+        started = time.monotonic()
+        try:
+            # Independent descriptor proves this observer delegates to flock.
+            with open(locks.writer_lock_path(db_path), "a+b") as descriptor:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    raise AssertionError("observer did not hold kernel flock")
+            if not intervals:
+                (root / (owner + ".entered")).touch()
+                for contender in cfg.get("attempt_barrier", []):
+                    wait_file(root / (contender + ".attempted"))
+                if cfg.get("hold"):
+                    wait_file(root / "release")
+            # Test-only probe; never interpreted as production lock duration.
+            time.sleep(0.015)
+            yield
+        finally:
+            intervals.append((started, time.monotonic(), role, phase))
+    # Persist only after the real lock exits; one JSON file per child.
+    (root / (owner + ".json")).write_text(json.dumps({
+        "owner": owner, "pid": os.getpid(), "db": db,
+        "intervals": intervals, "attempts": attempts, "results": results,
+    }))
+for module in (universe, backfill, corporate, worker, bars_sqlite, expected):
+    module.writer_lock = audited_lock
+# Evidence imports the primitive lazily; keep the captured real primitive above.
+locks.writer_lock = audited_lock
+
+if cfg.get("remove_lock"):
+    # Negative-control replay: compile only the selected function in memory.
+    target = {"universe": universe.upsert_instruments,
+              "instrument": backfill.BackfillRunner._upsert_instrument,
+              "seed": backfill.BackfillRunner._seed_metadata_for_figi,
+              "update": backfill.BackfillRunner._upsert_metadata,
+              "merge": corporate.merge_into_corporate_actions,
+              "adjustment": worker._step_corporate_actions,
+              "dividend": corporate.merge_into_dividends}[owner]
+    import textwrap
+    class RemoveLock(ast.NodeTransformer):
+        def visit_With(self, node):
+            node = self.generic_visit(node)
+            if any(isinstance(item.context_expr, ast.Call)
+                   and isinstance(item.context_expr.func, ast.Name)
+                   and item.context_expr.func.id == "writer_lock" for item in node.items):
+                return node.body
+            return node
+    tree = RemoveLock().visit(ast.parse(textwrap.dedent(inspect.getsource(target))))
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(tree), "<test-only-no-lock-replay>", "exec"),
+         target.__globals__, namespace)
+    target.__code__ = namespace[target.__name__].__code__
+
+async def sink(event):
+    return None
+runner = backfill.BackfillRunner(client=object(), db_path=db, event_sink=sink)
+def invoke(index):
+    figi = f"F{owner}-{index}"
+    row = dict(ticker=figi, figi=figi, **{"class": "share"}, name="Updated",
+               currency="RUB", lot_size=10, isin="fixture-isin", sector="fixture-sector")
+    if owner == "universe":
+        return universe.upsert_instruments(db, [row])
+    if owner == "instrument":
+        return runner._upsert_instrument(row)
+    if owner == "seed":
+        return runner._seed_metadata_for_figi(figi)
+    if owner == "update":
+        return runner._upsert_metadata(figi=figi, last_bar_ts="2024-05-15",
+            total_bars=index + 1, status="ok", error_msg=None)
+    if owner == "merge":
+        return corporate.merge_into_corporate_actions(db, [corporate.CorporateActionRow(
+            figi, "split", "2024-05-15", 1.0, 0.0, source="derived:stress")])
+    if owner == "adjustment":
+        result = worker._step_corporate_actions(db)
+        assert result[0], result
+        return result
+    if owner == "dividend":
+        return corporate.merge_into_dividends(db, [corporate.DividendRow(
+            figi=figi, ex_date="2024-06-15", period_year=2024,
+            amount_per_share=10.0, retrieved_at="2024-09-14T12:00:00")])
+    if owner == "bars":
+        return bars_sqlite.replace_bars_for_figi_with_rowcount(db, "Fbars", [{
+            "ts": f"2024-05-{13 + index:02d}", "open": 50, "high": 52,
+            "low": 49, "close": 50, "volume": 100}], replace=False)
+    if owner == "evidence":
+        con = sqlitedb.get_connection(db)
+        return evidence.record_no_trade_evidence(con, db_path=db, figi="Fevidence",
+            rows=[{"ts": f"2024-05-{13 + index:02d}"}], board="TQBR",
+            isin="fixture-isin", now=date(2024, 5, 17))
+    assert owner == "expected"
+    sys.argv = ["populate_expected_bars", "--db", db, "--refresh"]
+    result = expected.main()
+    assert result == 0
+    return result
+
+(root / (owner + ".ready")).touch()
+wait_file(root / "go")
+try:
+    for repeat in range(cfg.get("repeats", 2)):
+        for index in range(cfg.get("iterations", 3)):
+            results.append(invoke(index))
+finally:
+    sqlitedb.close_all()
+    (root / (owner + ".json")).write_text(json.dumps({
+        "owner": owner, "pid": os.getpid(), "db": db,
+        "intervals": intervals, "attempts": attempts, "results": results,
+    }))
+'''
+
+
+def measured_peak(intervals):
+    points = [(start, 1) for start, end, role, phase in intervals]
+    points += [(end, -1) for start, end, role, phase in intervals]
+    current = peak = 0
+    for timestamp, delta in sorted(points):
+        current += delta
+        peak = max(peak, current)
+        assert current >= 0
+    assert current == 0
+    return peak
+
+
+def wait_owner_files(paths, *, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not all(path.exists() for path in paths):
+        assert time.monotonic() < deadline, f"owner barrier timeout: {paths}"
+        time.sleep(0.005)
+
+
+def seed_stress_db(db, owners, *, iterations=3):
+    # Complete migration schema, distinct PKs; no production settings/default DB.
+    from algotrader_api.db.migrations import MIGRATIONS_DIR
+    sqlitedb.run_migrations(str(db), MIGRATIONS_DIR)
+    sqlitedb.close_all()
+    with closing(sqlite3.connect(db)) as con:
+        con.execute("PRAGMA journal_mode=WAL")
+        keys = [f"F{owner}-{index}" for owner in owners
+                if owner in {"universe", "instrument", "seed", "update", "merge", "dividend"}
+                for index in range(iterations)]
+        keys += [f"F{owner}" for owner in owners
+                 if owner in {"bars", "evidence", "expected", "adjustment"}]
+        con.executemany(
+            "INSERT INTO instruments (figi, ticker, class, name, currency, lot_size, "
+            "isin, sector, source_updated_at, listed_till, expected_bars) "
+            "VALUES (?, ?, 'share', 'Original', 'RUB', 1, 'fixture-isin', 'fixture-sector', "
+            "'2024-05-13', '2024-05-16', 123)", [(key, key) for key in keys],
+        )
+        if "bars" in owners:
+            con.execute("INSERT INTO instrument_metadata (figi, total_bars, last_run_status) "
+                        "VALUES ('Fbars', 0, 'pending')")
+        if "adjustment" in owners:
+            con.executemany("INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+                            "VALUES ('Fadjustment', ?, ?, ?, ?, ?, 100)", [
+                                ("2024-05-13", 100, 100, 100, 100),
+                                ("2024-05-15", 50, 50, 50, 50),
+                            ])
+            con.execute("INSERT INTO corporate_actions VALUES "
+                        "('Fadjustment', 'split', '2024-05-15', 2, 0, '', 'derived:fixture')")
+        con.commit()
+
+
+@contextmanager
+def owner_children(root, specs):
+    """Spawn before critical sections; reap only these owned finite children."""
+    api = Path(__file__).resolve().parents[1]
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "home").mkdir(exist_ok=True)
+    (root / "logs").mkdir(exist_ok=True)
+    children, streams = [], []
+    # No inherited broker credentials, PYTHONPATH, HOME, or .env working directory.
+    env = {"PATH": os.defpath, "PYTHONPATH": os.pathsep.join([str(api / "src"), str(api)]),
+           "PYTHONHOME": "", "PYTHONDONTWRITEBYTECODE": "1", "HOME": str(root / "home"),
+           "TMPDIR": str(root), "ALGOTRADER_DATA_DIR": str(root),
+           "ALGOTRADER_LOG_DIR": str(root / "logs"), "ALGOTRADER_INGEST_FAKE": "1",
+           "ALGOTRADER_UI_SNAPSHOT_PATH": str(root / "ui_snapshot.json")}
+    try:
+        locks.assert_process_creation_allowed()
+        for spec in specs:
+            owner = spec["owner"]
+            stream = open(root / (owner + ".output"), "w")
+            streams.append(stream)
+            children.append(subprocess.Popen(
+                [sys.executable, "-c", OWNER_CHILD, json.dumps({**spec, "root": str(root)})],
+                cwd=root, env=env, stdout=stream, stderr=subprocess.STDOUT,
+            ))
+        wait_owner_files([root / (spec["owner"] + ".ready") for spec in specs])
+        yield children
+    finally:
+        # Test cleanup consent applies only to child Popen handles created here.
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+        for child in children:
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=2)
+        for stream in streams:
+            stream.close()
+        assert all(child.poll() is not None for child in children)
+
+
+def join_owner_children(root, specs, children):
+    deadline = time.monotonic() + 20
+    for spec, child in zip(specs, children):
+        rc = child.wait(timeout=max(0.01, deadline - time.monotonic()))
+        assert rc == 0, (spec["owner"], rc, (root / (spec["owner"] + ".output")).read_text())
+    return [json.loads((root / (spec["owner"] + ".json")).read_text()) for spec in specs]
+
+
+def assert_owner_intervals(payloads, *, iterations=3, repeats=2):
+    assert len({payload["pid"] for payload in payloads}) == len(payloads)
+    for payload in payloads:
+        expected = STRESS_PAIRS[payload["owner"]] * iterations * repeats
+        actual = [(row[2], row[3]) for row in payload["intervals"]]
+        assert actual == expected, f"missing owner intervals: {payload['owner']}: {actual}"
+        assert len(payload["results"]) == iterations * repeats
+        assert all(start < end for start, end, role, phase in payload["intervals"])
+
+
+def assert_stress_rows(db, owners, *, iterations=3):
+    with closing(sqlite3.connect(db)) as con:
+        if "universe" in owners or "instrument" in owners:
+            for owner in set(owners) & {"universe", "instrument"}:
+                assert con.execute("SELECT figi, name, lot_size, source_updated_at, listed_till "
+                                   "FROM instruments WHERE figi LIKE ? ORDER BY figi",
+                                   (f"F{owner}-%",)).fetchall() == [
+                    (f"F{owner}-{i}", "Updated", 10, "2024-05-13", "2024-05-16")
+                    for i in range(iterations)]
+                # Unrelated concurrent expected-bar writes survive instrument upserts.
+                expected_bars = 4 if "expected" in owners else 123
+                assert con.execute("SELECT DISTINCT expected_bars FROM instruments "
+                                   "WHERE figi LIKE ?", (f"F{owner}-%",)).fetchall() == [(expected_bars,)]
+        if "seed" in owners:
+            assert con.execute("SELECT figi, total_bars, last_run_status, last_bar_ts "
+                               "FROM instrument_metadata WHERE figi LIKE 'Fseed-%' ORDER BY figi").fetchall() == [
+                (f"Fseed-{i}", 0, "pending", None) for i in range(iterations)]
+        if "update" in owners:
+            assert con.execute("SELECT figi, total_bars, last_run_status, last_bar_ts, last_error, "
+                               "last_backfilled_at=last_run_at FROM instrument_metadata "
+                               "WHERE figi LIKE 'Fupdate-%' ORDER BY figi").fetchall() == [
+                (f"Fupdate-{i}", i + 1, "ok", "2024-05-15", None, 1) for i in range(iterations)]
+        if "merge" in owners:
+            assert con.execute("SELECT figi, action_type, ex_date, factor, source FROM corporate_actions "
+                               "WHERE figi LIKE 'Fmerge-%' ORDER BY figi").fetchall() == [
+                (f"Fmerge-{i}", "split", "2024-05-15", 1, "derived:stress") for i in range(iterations)]
+        if "dividend" in owners:
+            assert con.execute("SELECT figi, ex_date, period_year, period_no, revision_n, "
+                               "amount_per_share, retrieved_at FROM dividends ORDER BY figi").fetchall() == [
+                (f"Fdividend-{i}", "2024-06-15", 2024, 1, 1, 10, "2024-09-14T12:00:00")
+                for i in range(iterations)]
+        if "adjustment" in owners:
+            assert con.execute("SELECT ts, adj_close FROM bars_adjusted WHERE figi='Fadjustment'").fetchall() == [
+                ("2024-05-15", 25)]
+            assert con.execute("SELECT ts, close FROM bars WHERE figi='Fadjustment' ORDER BY ts").fetchall() == [
+                ("2024-05-13", 100), ("2024-05-15", 50)]
+        if "bars" in owners:
+            assert con.execute("SELECT ts, close, source FROM bars WHERE figi='Fbars' ORDER BY ts").fetchall() == [
+                (f"2024-05-{13 + i:02d}", 50, "tinkoff") for i in range(iterations)]
+            assert con.execute("SELECT total_bars, first_bar_ts, last_bar_ts, last_run_status "
+                               "FROM instrument_metadata WHERE figi='Fbars'").fetchall() == [
+                (iterations, "2024-05-13", f"2024-05-{12 + iterations:02d}", "ok")]
+        if "evidence" in owners:
+            assert con.execute("SELECT session_date, board, isin, expires_at FROM moex_no_trade_evidence "
+                               "WHERE figi='Fevidence' ORDER BY session_date").fetchall() == [
+                (f"2024-05-{13 + i:02d}", "TQBR", "fixture-isin", "2024-05-24") for i in range(iterations)]
+            assert con.execute("SELECT * FROM bars WHERE figi='Fevidence'").fetchall() == []
+        if "expected" in owners:
+            assert con.execute("SELECT expected_bars FROM instruments WHERE figi='Fexpected'").fetchall() == [(4,)]
+        assert con.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+
+
+def run_stress(root, owners, *, independent=False, remove_lock=None):
+    root.mkdir()
+    if independent:
+        dbs = [root / f"{owner}.db" for owner in owners]
+        for db, owner in zip(dbs, owners):
+            seed_stress_db(db, [owner])
+    else:
+        db = root / "shared.db"
+        seed_stress_db(db, owners)
+        alias = root / "alias.db"
+        alias.symlink_to(db)
+        dbs = [alias if index % 2 else db for index in range(len(owners))]
+    barrier = [owner for owner in owners if owner != remove_lock]
+    specs = [{"owner": owner, "db": str(db), "hold": independent,
+              "attempt_barrier": barrier, "remove_lock": owner == remove_lock}
+             for owner, db in zip(owners, dbs)]
+    with owner_children(root, specs) as children:
+        (root / "go").touch()
+        if independent:
+            wait_owner_files([root / (owner + ".entered") for owner in owners])
+            assert not any((root / (owner + ".json")).exists() for owner in owners), \
+                "independent owner released before all entered"
+            (root / "release").touch()
+        payloads = join_owner_children(root, specs, children)
+    assert_owner_intervals(payloads)
+    intervals = [interval for payload in payloads for interval in payload["intervals"]]
+    peak = measured_peak(intervals)
+    assert peak == (len(owners) if independent else 1)
+    if independent:
+        first = [payload["intervals"][0] for payload in payloads]
+        assert max(row[0] for row in first) < min(row[1] for row in first)
+        for db, owner in zip(dbs, owners):
+            assert_stress_rows(db, [owner])
+    else:
+        # Every process attempted its first acquisition while the first holder waited.
+        assert max(payload["attempts"][0][0] for payload in payloads) < min(row[1] for row in intervals)
+        assert_stress_rows(dbs[0], owners)
+    for payload in payloads:
+        owner = payload["owner"]
+        if owner in {"merge", "dividend", "bars"}:
+            assert payload["results"] == [1, 1, 1, 0, 0, 0]
+    summary = {"owners": list(owners), "child_count": len(payloads),
+               "interval_count": len(intervals), "peak": peak,
+               "independent": independent, "returncodes": [child.returncode for child in children]}
+    (root / "aggregate.json").write_text(json.dumps(summary))
+    return summary
+
+
+@pytest.mark.parametrize("owners", [
+    ("universe", "merge"), ("update", "dividend"), ("instrument", "seed"),
+    ("adjustment", "bars"), ("evidence", "expected"), STRESS_OWNERS,
+], ids=["universe-corporate", "metadata-dividend", "metadata-instrument-seed",
+        "adjustment-bars", "evidence-expected", "all-seven-plus-existing"])
+def test_actual_owner_interprocess_stress_same_db_and_symlink(tmp_path, owners):
+    run_stress(tmp_path / "stress", owners)
+
+
+@pytest.mark.parametrize("owners", [("universe", "merge"), ("update", "dividend")])
+def test_actual_owner_independent_dbs_enter_before_either_releases(tmp_path, owners):
+    run_stress(tmp_path / "independent", owners, independent=True)
+
+
+@pytest.mark.parametrize("removed", STRESS_OWNERS[:7])
+def test_actual_owner_no_lock_mutation_is_detected(tmp_path, removed):
+    # Feature already implemented: this is mutation replay, not new-feature TDD RED.
+    partner = "dividend" if removed != "dividend" else "universe"
+    with pytest.raises(AssertionError, match="missing owner intervals"):
+        run_stress(tmp_path / "negative", (removed, partner), remove_lock=removed)
+
+
+def test_actual_universe_and_dividend_same_pid_threads_fail_closed(coordinated_db, monkeypatch):
+    db, real_connect = coordinated_db
+    entered, release = threading.Event(), threading.Event()
+    events, errors = [], []
+    alias = Path(db).with_name("thread-alias.db")
+    alias.symlink_to(db)
+
+    @contextmanager
+    def acquire(path, *, role, phase, **kwargs):
+        with locks.writer_lock(path, role=role, phase=phase, timeout_seconds=0.05):
+            events.append(("acquire", role, phase))
+            try:
+                if role == "universe-sync":
+                    entered.set()
+                    assert release.wait(2), "thread release timeout"
+                yield
+            finally:
+                events.append(("release", role, phase))
+
+    monkeypatch.setattr(universe, "writer_lock", acquire)
+    monkeypatch.setattr(corporate, "writer_lock", acquire)
+
+    def first_owner():
+        try:
+            universe.upsert_instruments(db, [BROKER_ROW])
+        except BaseException as exc:
+            errors.append(exc)
+
+    before = snapshot(db, real_connect)
+    thread = threading.Thread(target=first_owner)
+    thread.start()
+    try:
+        assert entered.wait(1)
+        with pytest.raises(locks.WriterLockReentrant):
+            corporate.merge_into_dividends(str(alias), [DIVIDEND_ROW])
+        assert events == [("acquire", "universe-sync", "instruments")]
+        assert snapshot(db, real_connect) == before
+    finally:
+        release.set()
+        thread.join(timeout=3)
+    assert not thread.is_alive() and errors == []
+    assert_saved("universe", db, real_connect)
+    assert corporate.merge_into_dividends(str(alias), [DIVIDEND_ROW]) == 1
+    assert snapshot(db, real_connect)["dividends"] == [DIVIDEND_STORED]
+    assert events == [("acquire", "universe-sync", "instruments"),
+                      ("release", "universe-sync", "instruments"),
+                      ("acquire", "dividends", "dividends"), ("release", "dividends", "dividends")]
+
+
+@pytest.mark.parametrize("location", ["discovery", "metadata-discovery", "derive", "dividend-row", "broker", "limiter"])
+def test_dormant_preparation_allows_another_actual_writer_to_commit(corporate_db, monkeypatch, location):
+    # Moving preparation/SDK/limiter work under the owner lock must fail here.
+    db, real_connect = corporate_db
+    root = Path(db).parent
+    state, events = {"held": False}, []
+    preparing, release = threading.Event(), threading.Event()
+    outcomes, errors = [], []
+    worker = importlib.import_module("worker")
+    dividends = importlib.import_module("algotrader_api.scripts_import.import_dividends_tinkoff")
+    original_derive, original_row = derive_splits.derive_splits_for_figi, dividends._to_row
+
+    def pause():
+        assert_unlocked(db, state)
+        preparing.set()
+        assert release.wait(5), "preparation release timeout"
+        assert_unlocked(db, state)
+
+    def acquire(path, *, role, phase, **kwargs):
+        return observed_lock(path, role=role, phase=phase, state=state, events=events, **kwargs)
+
+    for module in (universe, backfill, corporate, worker):
+        monkeypatch.setattr(module, "writer_lock", acquire)
+
+    def derive(**kwargs):
+        if not preparing.is_set():
+            pause()
+        assert_unlocked(db, state)
+        return original_derive(**kwargs)
+
+    def to_row(*args, **kwargs):
+        pause()
+        return original_row(*args, **kwargs)
+
+    class Broker(OfflineBroker):
+        async def get_shares(self):
+            pause()
+            return await super().get_shares()
+
+        async def get_dividends(self, figi, from_, to):
+            assert_unlocked(db, state)
+            if location == "broker":
+                pause()
+            await asyncio.sleep(0)
+            assert_unlocked(db, state)
+            return await super().get_dividends(figi, from_, to)
+
+    class Limiter:
+        async def acquire(self, method):
+            assert method == "get_dividends"
+            assert_unlocked(db, state)
+            if location == "limiter":
+                pause()
+            await asyncio.sleep(0)
+            assert_unlocked(db, state)
+
+    monkeypatch.setattr(dividends._rl, "_GLOBAL", Limiter())
+    if location == "derive":
+        monkeypatch.setattr(derive_splits, "derive_splits_for_figi", derive)
+    if location == "dividend-row":
+        monkeypatch.setattr(dividends, "_to_row", to_row)
+    client = Broker()
+
+    def prepare_and_write():
+        try:
+            if location == "discovery":
+                outcome = asyncio.run(run_universe_sync(db, client))
+            elif location == "metadata-discovery":
+                runner = backfill.BackfillRunner(client=client, db_path=db, event_sink=offline_sink)
+                outcome = asyncio.run(runner._discover_universe())
+            elif location == "derive":
+                outcome = worker._step_corporate_actions(db)
+            else:
+                outcome = dividends.fetch_and_persist(db, client=client, figis=["FCOORD"], from_year=2024)
+            outcomes.append(outcome)
+        except BaseException as exc:
+            errors.append(exc)
+
+    specs = [{"owner": "universe", "db": db, "iterations": 1, "repeats": 1}]
+    with owner_children(root, specs) as children:
+        thread = threading.Thread(target=prepare_and_write)
+        thread.start()
+        try:
+            assert preparing.wait(2), (location, errors)
+            assert not state["held"] and events == []
+            (root / "go").touch()
+            payloads = join_owner_children(root, specs, children)
+            assert_owner_intervals(payloads, iterations=1, repeats=1)
+            assert not release.is_set() and thread.is_alive()
+            assert not state["held"] and events == []
+            # The independent real writer commits before the SDK/preparation resumes.
+            with closing(real_connect(db)) as con:
+                assert con.execute("SELECT name, lot_size FROM instruments WHERE figi='Funiverse-0'").fetchall() == [
+                    ("Updated", 10)]
+        finally:
+            release.set()
+            thread.join(timeout=6)
+    assert not thread.is_alive() and errors == []
+    assert outcomes == ([1] if location in {"discovery", "metadata-discovery"} else
+                        [(True, "splits derived=1 bars adjusted=2")] if location == "derive" else [(1, 0)])
+    assert events and events[0][0] == "acquire"
+    if location == "derive":
+        assert snapshot(db, real_connect)["corporate_actions"][0][:4] == (
+            "FCOORD", "split", "2024-05-15", 2)
+        with closing(real_connect(db)) as con:
+            assert con.execute("SELECT ts, adj_close FROM bars_adjusted WHERE figi='FCOORD' ORDER BY ts").fetchall() == [
+                ("2024-05-15", 25), ("2024-05-16", 25.5)]
+    elif location in {"discovery", "metadata-discovery"}:
+        with closing(real_connect(db)) as con:
+            assert con.execute("SELECT name, lot_size FROM instruments WHERE figi='FCOORD'").fetchall() == [("Updated", 10)]
+            if location == "metadata-discovery":
+                assert con.execute("SELECT total_bars, last_run_status FROM instrument_metadata WHERE figi='FCOORD'").fetchall() == [
+                    (0, "pending")]
+    else:
+        assert snapshot(db, real_connect)["dividends"][0][:2] == ("FCOORD", "2024-06-15")
+        assert client.closed
+    assert_unlocked(db, state)
+
+
+def test_dividend_queue_dequeue_sql_runs_unlocked_outside_owner_transaction(coordinated_db, monkeypatch):
+    # Adding a dividend/whole-phase lock to queue operations violates this contract.
+    db, real_connect = coordinated_db
+    dividends = importlib.import_module("algotrader_api.scripts_import.import_dividends_tinkoff")
+    state, events, active_transactions, boundaries = {"held": False}, [], set(), []
+    original_row = dividends._to_row
+
+    def acquire(path, *, role, phase, **kwargs):
+        return observed_lock(path, role=role, phase=phase, state=state, events=events, **kwargs)
+
+    class Tracked(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            normalized = " ".join(sql.split())
+            if normalized.startswith(("INSERT INTO dividends_throttle_pending", "DELETE FROM dividends_throttle_pending")):
+                assert_unlocked(db, state)
+                assert not active_transactions and not self.in_transaction
+                boundaries.append(normalized.split()[0])
+            if normalized.startswith("BEGIN"):
+                assert state["held"]
+                active_transactions.add(id(self))
+            if normalized.startswith("SELECT 1 FROM dividends WHERE"):
+                assert state["held"] and self.in_transaction
+            return super().execute(sql, parameters)
+
+        def commit(self):
+            result = super().commit()
+            active_transactions.discard(id(self))
+            return result
+
+        def rollback(self):
+            result = super().rollback()
+            active_transactions.discard(id(self))
+            return result
+
+        def close(self):
+            assert not self.in_transaction
+            active_transactions.discard(id(self))
+            return super().close()
+
+    def connect(path, *args, **kwargs):
+        assert_unlocked(db, state)
+        return real_connect(path, *args, factory=Tracked, **kwargs)
+
+    def to_row(*args, **kwargs):
+        assert_unlocked(db, state)
+        return original_row(*args, **kwargs)
+
+    class Broker(OfflineBroker):
+        throttled = True
+
+        async def get_dividends(self, figi, from_, to):
+            assert_unlocked(db, state)
+            if self.throttled:
+                raise RuntimeError("RESOURCE_EXHAUSTED")
+            return await super().get_dividends(figi, from_, to)
+
+    class Limiter:
+        async def acquire(self, method):
+            assert method == "get_dividends"
+            assert_unlocked(db, state)
+            await asyncio.sleep(0)
+            assert_unlocked(db, state)
+
+        def signal_throttle(self, method):
+            assert method == "get_dividends"
+            assert_unlocked(db, state)
+
+    monkeypatch.setattr(corporate, "writer_lock", acquire)
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    monkeypatch.setattr(dividends, "_to_row", to_row)
+    monkeypatch.setattr(dividends, "_fetched_at", lambda: DIVIDEND_ROW.retrieved_at)
+    monkeypatch.setattr(dividends._rl, "_GLOBAL", Limiter())
+    assert dividends.fetch_and_persist(db, client=Broker(), figis=["FCOORD"], from_year=2024) == (0, 1)
+    assert events == [] and boundaries == ["INSERT"]
+    with closing(real_connect(db)) as con:
+        assert con.execute("SELECT figi, retry_count FROM dividends_throttle_pending").fetchall() == [("FCOORD", 1)]
+        assert con.execute("SELECT * FROM dividends").fetchall() == []
+    client = Broker()
+    client.throttled = False
+    assert dividends.fetch_and_persist(db, client=client, figis=["FCOORD"], from_year=2024) == (1, 0)
+    assert boundaries == ["INSERT", "DELETE"]
+    assert events == [("acquire", "dividends", "dividends"), ("release", "dividends", "dividends")]
+    with closing(real_connect(db)) as con:
+        assert con.execute("SELECT * FROM dividends_throttle_pending").fetchall() == []
+        assert con.execute("SELECT * FROM dividends").fetchall() == [DIVIDEND_STORED]
+    assert active_transactions == set()
+    assert_unlocked(db, state)
