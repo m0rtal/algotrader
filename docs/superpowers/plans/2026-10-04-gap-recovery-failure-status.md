@@ -29,6 +29,7 @@ Read `apps/api/worker.py:684-816,1214-1295`, actual runner `apps/api/src/algotra
 Prior independent actual-import evidence: `/home/hermes/.hermes/cache/scratch/gap_actual_worker_results/REPORT.md` and `results.json`. Diagnostic RED: `/home/hermes/.hermes/cache/scratch/gap_actual_worker_red.log`, **6 failed, 1 passed**. Pointer only: do not copy scratch assertions or AST/function-clone tests. These results are prior evidence, not this draft's test run. Fresh-fixture migration 016 warnings are known baseline evidence, not a regression claim.
 
 Files and responsibility:
+
 - Modify `apps/api/worker.py:_step_gap_recovery` only: scoped observer, unique failure count, bounded trailing warning, truthful summary.
 - Create `apps/api/tests/test_worker_gap_recovery_failure_status.py`: actual-import offline contracts; retain existing tests unchanged unless deterministic fixture isolation requires a reviewed adjustment.
 - Modify `openspec/specs/data-quality/spec.md` only after GREEN/review: append additive requirement; do not replace canonical text with the delta.
@@ -45,11 +46,14 @@ Files and responsibility:
 ### Task 1: Truthful trailing failure status
 
 **Files:**
+
 - Modify: `apps/api/worker.py:684-816`.
 - Create/Test: `apps/api/tests/test_worker_gap_recovery_failure_status.py`.
 - Report: this plan's ignored `task-1-report.md`.
+- Fix round 1 compatibility allowlist (parent ruling after independent source review): modify only `gap_env.FrozenWorkerDate.fromisoformat` and the trailing branch of `test_gap_metadata_adapters_preserve_other_error_policy` in `apps/api/tests/test_daily_reference_writer_coordination.py`. Return an ordinary `date` for SQLite binding; assert False/failed=1 without DEFER and exact FIGI/error_type diagnostics, absent raw error/message. The additive approved truthful-failure and no-raw-payload contract supersedes old trailing success/raw-error assertions. Preserve historical policy and all close/release/DB-continuity checks. If this ruling is wrong, it could conceal a fixture type defect or weaken diagnostics/ownership; fresh RED, exact diagnostic assertions and unchanged ownership checks bound that risk. No source or spec semantics changes in this round.
 
 **Interfaces:**
+
 - Consumes actual `_step_gap_recovery(db_path: str) -> tuple[bool, str]`, `recover_gaps(db_path, runner, gaps) -> dict[str, int]`, actual `BackfillRunner._backfill_one(*, figi, ticker=None, from_, to, source="auto") -> int`, and actual async `event_sink(BackfillEvent) -> None` with `.type` and `.payload`.
 - Produces unchanged tuple and runner integer signatures. Ordinary summary adds `failed=N`; `ok` becomes false for any unique failed trailing FIGI. Metadata DEFER shape stays unchanged. No intermediate/new API parameters.
 
@@ -485,11 +489,13 @@ git commit -m "fix: report trailing gap recovery failures"
 ### Task 2: Release verification record (docs-only)
 
 **Files:**
+
 - Modify: `openspec/specs/data-quality/spec.md`, additive requirement only after reviewed GREEN.
 - Modify: `openspec/changes/report-gap-recovery-failures/tasks.md` and plan checkboxes only for verified work.
 - Create: `docs/superpowers/results/2026-10-04-gap-recovery-failure-status.md`.
 
 **Interfaces:**
+
 - Consumes Task 1 commit, actual RED/GREEN/regression reports, task review verdict, and canonical data-quality.
 - Produces a written evidence record and strict-valid specs, not a new runtime behavior. Parent's approved rollout remains separate; no prod or network action by this leaf.
 
@@ -519,15 +525,25 @@ git diff --check
 
 ```markdown
 # Gap recovery failure status verification
+
 ## Candidate identity and scope
+
 ## Assertion RED: command, exit status, failing assertions, counts
+
 ## GREEN and focused regressions: commands, exit statuses, counts
+
 ## Full backend coverage and focused worker branch evidence
+
 ## Real-runner event, partial commit, empty/idempotent, lock, cancellation proof
+
 ## Independent task review and full-branch review verdicts
+
 ## Required CI status on exact candidate SHA
+
 ## Strict change and canonical validation; diff check
+
 ## Warnings, unresolved gates, rulings and cost if wrong
+
 ## Rollout ownership and limit of claims
 ```
 
