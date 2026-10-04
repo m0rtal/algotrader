@@ -50,6 +50,8 @@ import urllib.parse
 from datetime import date, timedelta
 from typing import Literal
 
+from .writer_lock import WriterLockBusy, is_sqlite_busy, writer_lock_path
+
 # Default expiry windows. Recent evidence is cheap to re-fetch and must
 # be revalidated frequently; historical evidence is trusted for longer
 # because the upstream source itself treats those sessions as settled.
@@ -536,16 +538,22 @@ def record_no_trade_evidence(
                 conn, figi=figi, rows=rows, board=board,
                 isin=isin, now=now,
             )
-        except Exception:
+            conn.commit()
+        except BaseException as exc:
             try:
                 conn.rollback()
-            except Exception:
-                # Rollback can itself raise on a closed connection;
-                # the lock-release path is more important than the
-                # rollback error, so swallow this.
+            except BaseException:
+                # Preserve the original failure; the lock must still release.
                 pass
+            if is_sqlite_busy(exc):
+                raise WriterLockBusy(
+                    role="no-trade-evidence", phase="evidence",
+                    database_path=db_path,
+                    lock_path=str(writer_lock_path(db_path)),
+                    timeout_seconds=_EVIDENCE_LOCK_TIMEOUT_SECONDS,
+                    reason="sqlite-busy",
+                ) from exc
             raise
-        conn.commit()
     return written
 
 

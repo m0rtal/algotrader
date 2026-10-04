@@ -58,7 +58,9 @@ from algotrader_api.ingestion.no_trade_evidence import (  # noqa: E402
 from algotrader_api.ingestion.writer_lock import (  # noqa: E402
     WriterLockBusy,
     format_busy_defer,
+    is_sqlite_busy,
     writer_lock,
+    writer_lock_path,
 )
 
 DEFAULT_DB = "/home/hermes/algotrader/apps/api/data/state.db"
@@ -203,12 +205,26 @@ def main() -> int:
                             role="no-trade-evidence",
                             phase="listed-till",
                         ):
-                            con.execute(
-                                "UPDATE instruments SET listed_till = ? "
-                                "WHERE figi = ?",
-                                (lt_iso, figi),
-                            )
-                            con.commit()
+                            try:
+                                con.execute(
+                                    "UPDATE instruments SET listed_till = ? "
+                                    "WHERE figi = ?",
+                                    (lt_iso, figi),
+                                )
+                                con.commit()
+                            except BaseException as exc:
+                                try:
+                                    con.rollback()
+                                except BaseException:
+                                    pass  # Preserve the original failure; still unlock.
+                                if is_sqlite_busy(exc):
+                                    raise WriterLockBusy(
+                                        role="no-trade-evidence", phase="listed-till",
+                                        database_path=str(db_path),
+                                        lock_path=str(writer_lock_path(db_path)),
+                                        timeout_seconds=30.0, reason="sqlite-busy",
+                                    ) from exc
+                                raise
                     except WriterLockBusy as exc:
                         print(format_busy_defer(exc))
                         return 75
