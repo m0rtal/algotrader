@@ -81,7 +81,8 @@ The system SHALL coordinate exactly the additional daily transaction owners name
 - GIVEN a dividend FIGI passes through its limiter, fetch, and row mapping
 - WHEN `merge_into_dividends` persists its prepared rows
 - THEN only the existing dividend row-list transaction acquires the shared lock
-- AND duplicate PKs, retrospective `revision_n` rows, and actual insert count retain their current meaning
+- AND duplicate PKs, explicit retrospective `DividendRow(revision_n=2)` merge inputs, and actual insert count retain their current meaning
+- AND the existing fetch mapper retains `revision_n=1`; a fetch smoke does not claim to generate revision 2
 - AND fetch, mapping, queue, dequeue, and rate-limit waits do not hold or acquire this lock
 
 #### Scenario: Contention leaves pending work retryable
@@ -94,6 +95,28 @@ The system SHALL coordinate exactly the additional daily transaction owners name
 - AND the daily phase reports failure or deferral rather than successful completion, while existing auxiliary CLI adapters exit 75 with the shared bounded formatter
 - AND previously committed rows or separate bar/derivation transactions remain committed for the next normal retry
 - AND no added retry, sleep, timeout increase, fallback write, or failed-work success checkpoint is introduced
+
+#### Scenario: Rollback failure does not prevent owned connection close
+
+- GIVEN an owner has an active transaction and its primary failure is followed by an injected rollback failure
+- WHEN cleanup runs
+- THEN rollback is attempted under flock, unlock and native owned-connection close still run, and the primary exception remains the reported failure
+- AND a later independent connection sees no partial pending rows and can acquire the lock
+- AND the test observer allows active-at-close only for a per-connection flag set by the injected rollback failure
+- AND separate healthy commit/rollback cases require idle before close, with native close in `finally` even if the observer assertion fails
+- AND no borrowed connection is closed and no test requires reuse of the failed handle
+
+#### Scenario: Metadata BUSY reaches the real worker error boundary
+
+- GIVEN a newly coordinated BackfillRunner helper raises `WriterLockBusy` with `role=backfill-metadata` during discovery or a per-ticker metadata update
+- WHEN actual `BackfillRunner.run` is driven by `worker.run_worker` in scheduled or manual mode
+- THEN the runner emits final `done.status=error`, resets IDLE, and propagates the original exception rather than returning normally or reporting `done.status=ok`
+- AND already-started per-ticker jobs settle before the worker closes its client
+- AND the worker returns rc=2 and records the exact pipeline phase as `status=err` with the bounded formatter, never pipeline `ok` or rc=0
+- AND actual historical or trailing gap recovery propagates this metadata failure to `(False, format_busy_defer(exc))`, not successful zero-bar completion
+- AND the trailing call uses the existing `_backfill_one(..., to=...)` signature and executes the real metadata owner
+- AND earlier committed rows remain committed and the next normal retry can reuse them
+- AND other BUSY roles and ordinary failures retain their existing caller policies, without a whole-run lock or a generic success-policy repair
 
 #### Scenario: Same-process contender cannot create a second critical section
 
@@ -111,3 +134,15 @@ The system SHALL coordinate exactly the additional daily transaction owners name
 - AND original bar, evidence, raw-path, no-process-creation, identity, dry-run, and reconciliation tests remain enforced
 - AND pipeline, heartbeat, guardian, maintenance, legacy importer, startup-repair, circuit-breaker and SQLite connection/query helper exclusions remain explicit
 - AND no global `get_connection`, `execute`, or `execute_returning_id` lock or claim of eliminating all SQLite BUSY is introduced
+
+#### Scenario: Standing-goal acceptance requires full autonomous daily evidence
+
+- GIVEN capability tests and bounded fixture or production smoke have passed but standing-goal acceptance is still open
+- WHEN production acceptance is assessed after an operator-approved deployment
+- THEN one full scheduled daily cycle covers every first/derived phase, including bonds depth, freshness check and guardian
+- AND seven consecutive days of complete autonomous daily cycles demonstrate natural retry/resume without manual restart, pause or forced backfill
+- AND at each qualifying daily observation ML-ready coverage is at least 95% and freshness at most 4 hours for every required cohort, not merely a passing global average
+- AND measurement uses the complete canonical required FIGI population, unchanged positive cached `instruments.expected_bars` denominator and existing session/evidence/delisting rules
+- AND unknown/nonpositive denominators and failed cohorts are reported rather than counted as ready or excluded
+- AND timestamped per-phase and per-cohort evidence, committed-row continuity and actual retry outcomes are retained; missing evidence or an interrupted day leaves this gate open
+- AND two observations, lock-test coverage or a now-passing bounded smoke cannot replace the seven-day criterion or prove that this expansion caused the smoke result

@@ -23,15 +23,18 @@
 - Keep universe per-row commits, merge complete-list commits and adjustment all-selected-events commit. No new bulk-upsert API, chunking policy, split algorithm or metadata semantic repair.
 - Do not lock `get_connection`, `execute`, `execute_returning_id`, telemetry, pipeline rows, heartbeats, ingestion logs, guardian bookkeeping, dividend throttle queue, circuit breakers, migrations or startup repair.
 - Do not wrap discovery, fetch, run, phases, loops or worker lifetimes with a locking decorator/context.
+- The only runner control-flow change is propagation of `WriterLockBusy` with `role="backfill-metadata"` through existing catch sites to the worker error adapter. Preserve every other error policy; no generic runner-success repair or scheduler refactor.
 - Preserve existing identity gates, real-bar-over-evidence, auxiliary dry-run, actual row counts, retry/resume and narrow BUSY behavior. No class/denominator exclusions.
 - Backend `fail_under = 95` remains unchanged. No new omission, pragma, xfail or reduced selector to manufacture a pass.
-- Standing production goal remains separately measured: ML-ready coverage at least 95%, freshness at most 4 hours, observed autonomous daily retry/resume.
+- Standing production goal remains a hard separate gate: one full scheduled daily first/derived cycle and seven consecutive days of autonomous complete daily cycles, without manual restart, pause or forced backfill; ML-ready coverage at least 95% and freshness at most 4 hours for every required cohort, using the unchanged canonical denominator. Two observations do not prove seven-day operation.
 
 ## Command root and evidence
 
 Commands run from the candidate worktree root. Use the existing interpreter `/home/hermes/algotrader/apps/api/.venv/bin/python`; imports must resolve to the candidate `apps/api/src`, not its main checkout. Do not install dependencies or create a venv for this bounded change.
 
 Documentation baseline actually run: canonical strict validation passed; `test_writer_inventory.py` returned **26 passed, 2 warnings** (Starlette/httpx and anyio deprecation), with cache and bytecode disabled. No runtime expansion or coverage claim was measured.
+
+Parent update, not reproduced by this docs-only preflight: reconciliation PR187 was merged/deployed at `b5ff088`; bounded production smoke now exits 0 with one instrument/two evidence rows and exact readback of two rows for ticker `RU000A10B420`. The prior SQLite BUSY/leaked-reconcile cause remains unproven. This expansion is not claimed necessary to solve that now-passing smoke. Keep this documentation HEAD unchanged while writing; the parent will later merge current main and reconcile its appended canonical requirement.
 
 ```bash
 env OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1 OPENSPEC_NO_UPDATE_CHECK=1 \
@@ -49,9 +52,9 @@ Future production modifications, all bounded to owners/adapters:
 
 - `apps/api/src/algotrader_api/ingestion/writer_lock.py:39-71`: Literal/runtime role and phase inventory only.
 - `apps/api/src/algotrader_api/ingestion/universe.py:63-124`: owner of each existing instrument-row transaction; remove the use of auto-committing `execute_returning_id` from this path only.
-- `apps/api/src/algotrader_api/ingestion/backfill.py:2841-2940`: three explicit row metadata owners; no broad runner refactor.
+- `apps/api/src/algotrader_api/ingestion/backfill.py:2841-2940,1217-1222,1254-1311`: three explicit row metadata owners and metadata-only BUSY propagation in `run`; no broad runner refactor.
 - `apps/api/src/algotrader_api/scripts_import/import_corporate_actions_common.py:32-70,124-160`: two merge transaction owners.
-- `apps/api/worker.py:440-454,807-855`: corporate adjustment owner and daily contention adapters only.
+- `apps/api/worker.py:61-137,440-454,774-804,807-855`: corporate adjustment owner, daily contention adapters, and metadata-only error adapter in `run_worker`; keep the existing supported trailing call `to=to_` unchanged.
 - `apps/api/scripts/derive_splits.py:60-64`: existing direct derivation CLI temporary-failure adapter.
 - `apps/api/src/algotrader_api/scripts_import/import_dividends_tinkoff.py:273-292`: existing dividend CLI temporary-failure adapter; fetch and queue functions remain non-owning.
 
@@ -216,8 +219,11 @@ def observed_lock(db_path, *, role, phase, state, events, **kwargs):
             events.append(("release", role, phase))
             state["held"] = False
 
-def connection_factory(real_connect, state, events, connections, failure=None):
+def connection_factory(real_connect, state, events, connections, failure=None,
+                       rollback_failure=None):
     class Tracked(sqlite3.Connection):
+        _injected_rollback_failure = False
+
         def execute(self, sql, parameters=()):
             operation = sql.lstrip().split(None, 1)[0].upper()
             if operation in {"BEGIN", "INSERT", "UPDATE", "DELETE", "REPLACE"}:
@@ -235,13 +241,19 @@ def connection_factory(real_connect, state, events, connections, failure=None):
         def rollback(self):
             assert state["held"]
             events.append(("rollback",))
+            if rollback_failure is not None:
+                self._injected_rollback_failure = True
+                raise rollback_failure
             return super().rollback()
 
         def close(self):
-            assert not state["held"]
-            assert not self.in_transaction
-            events.append(("close",))
-            return super().close()
+            try:
+                assert not state["held"]
+                if not self._injected_rollback_failure:
+                    assert not self.in_transaction
+            finally:
+                super().close()
+                events.append(("close",))
 
     def connect(database, *args, **kwargs):
         kwargs["factory"] = Tracked
@@ -259,7 +271,9 @@ Run these cases with `-k 'universe or metadata'`; expected RED is missing owner 
 
 - [ ] **Step 2: Add timeout and exception tests for all four owners.** Hold the real kernel lock through a separate open-file description with `fcntl.flock(LOCK_EX | LOCK_NB)` before invocation. Inject a 0.05-second lock via observer. Assert `WriterLockBusy.role` and `.phase` equal the exact identity, no pending mutation, no BEGIN, and unchanged full row snapshots. Release and retry; assert actual persisted fields.
 
-For owned transaction failure use `failure=sqlite3.IntegrityError("fixture-commit-failure")` in Tracked. Assert mutation occurred, rollback precedes release, persisted state equals before, and original exception object survives. Repeat with a custom `class Interrupted(BaseException): pass`; no partial state or held lock remains. Inject rollback failure separately and assert cleanup still releases flock and preserves the primary error; a rollback-failing connection may not be reusable, so never falsely require its successful reuse.
+For owned transaction failure use `failure=sqlite3.IntegrityError("fixture-commit-failure")` in Tracked. Assert mutation occurred, rollback precedes release, persisted state equals before, and original exception object survives. Repeat with a custom `class Interrupted(BaseException): pass`; no partial state or held lock remains. Inject `rollback_failure=sqlite3.OperationalError("fixture-rollback-failure")` separately: the per-connection flag is set only when that injected rollback actually raises. This is the only case allowed to be active at close; real `super().close()` must always run, including when an observer assertion fails. Assert the primary exception object survives, rollback precedes release and real close, each tracked connection rejects `execute("SELECT 1")` with `sqlite3.ProgrammingError`, independent DB rows equal the pre-failure snapshot, and a new independent connection/lock works. Never require reuse of the failed connection.
+
+Add a separate healthy-cleanup observer regression: with no rollback-failure injection, deliberately leave a test-owned transaction active before `close`. Require its idle assertion to fail **and** prove the native close still ran by the same closed-connection check. Successful commit and successful rollback cases still require idle before close. Do not weaken the healthy invariant to accept every active transaction.
 
 - [ ] **Step 3: Implement universe ownership without new batching.** At `universe.py:97-123`, keep filtering and row-count meaning. Prepare each parameter tuple before acquisition. Replace only this path's auto-committing helper with `conn = sqlite3.connect(db_path, timeout=30.0)` owned by the function, closed in outer finally. Execute `conn.execute("PRAGMA foreign_keys=ON")` before row transactions to preserve the old cached helper's constraint setting. Preserve the current 30000-millisecond SQLite busy timeout and existing database journal mode; do not add journal-mode changes. Retain per-row transactions; the slicing value 100 remains only an iteration detail. Copy the existing UPSERT text exactly into `sql` and the tuple at lines 112-121 into `params` before the lock. The mutation block is:
 
@@ -454,9 +468,9 @@ If new Python-heavy adjustment calculations appear, stop and revise design rathe
 
 ### Task 5: Numeric BUSY and fail-closed daily/CLI outcomes
 
-**Files:** Modify worker step adapters at `440-454,807-855`; existing derivation CLI at `scripts/derive_splits.py:60-64`; dividend package `main:273-292`; extend coordination module and diagnostic tests. Do not alter core scheduling or evidence/listed-till code.
+**Files:** Modify `apps/api/src/algotrader_api/ingestion/backfill.py:1217-1222,1254-1311`, `apps/api/worker.py:109-128,440-454,774-804,807-855`, existing derivation CLI at `apps/api/scripts/derive_splits.py:60-64`, and dividend package `apps/api/src/algotrader_api/scripts_import/import_dividends_tinkoff.py:273-292`; extend coordination module, `test_backfill_run_coverage.py`, daily-chain and diagnostic tests. Do not alter core scheduling or evidence/listed-till code.
 
-**Interfaces:** New owners raise existing `WriterLockBusy`; formatter stays `format_busy_defer(exc) -> str`; daily adapters return `(False, detail)`; existing auxiliary CLIs return 75. Non-BUSY failures retain current handling.
+**Interfaces:** New owners raise existing `WriterLockBusy`; formatter stays `format_busy_defer(exc) -> str`; daily adapters return `(False, detail)`; existing auxiliary CLIs return 75. Preserve `BackfillRunner.run(history_years=5, incremental_threshold_days=2, *, source="auto", limit_to=None) -> None`, `worker.run_worker(mode: str) -> int`, and `_step_gap_recovery(db_path: str) -> tuple[bool, str]`. The real per-FIGI signature is `_backfill_one(*, figi, from_, to, ticker=None, source="auto") -> int`: use `to=`, never invent `to_=`. Only metadata-role BUSY gains propagation through the runner/gap catch sites; other `WriterLockBusy` roles and non-BUSY failures keep their existing handling.
 
 - [ ] **Step 1: RED with real SQLite contention, not only mocked busy exceptions.** In each seven-owner case hold `BEGIN IMMEDIATE` on an independent saved-real connection that deliberately does **not** acquire flock. Candidate connects with short test-only SQLite timeout; candidate acquisition succeeds but BEGIN encounters real numeric SQLite BUSY. Assert rollback event under held flock, release after rollback, full row state unchanged, exact role/phase and `reason="sqlite-busy"`. Release the independent SQLite transaction and retry successfully.
 
@@ -466,12 +480,94 @@ For commit errors inject `sqlite3.OperationalError` carrying code 5 and extended
 
 For each existing CLI, invoke its `main` via controlled argv and a temporary database; replace broker construction only with the offline fake before invoking dividend CLI. Use derivation `--no-face-value`. Assert exactly one bounded line, rc=75 and no pending rows. A failed dividend merge must not call successful dequeue; earlier committed FIGI rows remain. On a repeated successful invocation assert PK semantics and natural retry reuse, not artificial “zero new rows means failure”.
 
+Add these scoped RED cases to the coordination module with real runner/owner bodies, not a stubbed `run`, `_backfill_one` or metadata helper:
+
+Verify both actual call signatures before the metadata RED: trailing recovery already calls `_backfill_one(..., to=to_, source=source)`, and historical recovery already uses `to=gap.to_`. Keep both calls unchanged. Assert the actual offline candle call reaches the metadata owner; do not invent `to_=` or accept a fixture's unexpected-keyword TypeError as metadata contention evidence. Do not replace the runner with a permissive mock.
+
+- `test_run_discovery_metadata_busy_propagates`: parameterize instrument UPSERT and metadata seed in actual `_discover_universe` with an offline client. Real metadata-owner timeout must escape `run`, leave state IDLE, emit final `done.status="error"`, never `done.status="ok"`, and preserve the exact exception identity/role/phase. Baseline catches it at `backfill.py:1217-1222` and returns normally.
+- `test_run_ticker_metadata_busy_not_done_ok`: call `await runner.run(history_years=1, incremental_threshold_days=2, source="tinkoff", limit_to=["FCOORD"])` with a file-backed seeded instrument, pending metadata and offline empty/valid candles. Deny network and set test-only `ALGOTRADER_INGEST_FAKE=1` to skip MOEX prefetch. Reach actual `_upsert_metadata` through `_backfill_one_tinkoff`. Baseline `_backfill_one_bounded` converts the exception to a string and final `done` says `ok`. Require error plus propagation instead. In a two-FIGI case, let already-started jobs settle before reporting failure; no task continues against a closed client.
+- `test_run_worker_metadata_busy_not_pipeline_ok`: parameterize `await worker.run_worker(mode)` over existing `scheduled`/`manual` modes and the discovery/per-ticker cases above. Patch `get_settings` to the fixture, token check to a non-secret test sentinel, client construction to the offline client and logging to test-owned sinks. Keep the actual `BackfillRunner` and pipeline writer against the temporary DB. Require rc=2, the exact pipeline phase row `status="err"` with `format_busy_defer(exc)`, no success row, and `client.aclose` executed. Returning `None` from an errored runner must not become pipeline `ok`/rc=0. Existing `run_backfill()` already checks final `done` and uses rc=1 on runner failure; retain that outcome without adding a mode/API.
+- `test_gap_recovery_trailing_metadata_busy_not_zero_success`: invoke actual `_step_gap_recovery` and runner on a seeded real DB. Freeze only `worker.date.today()` to `2024-05-17`, seed last bar `2024-05-15`, and keep real trailing-gap selection so its recent tail reaches the Tinkoff metadata path. Keep its real `to=to_` call unchanged; assert the offline client's candle call occurred, not a caught fixture TypeError. Metadata BUSY must not be swallowed by `worker.py:774-779` and returned as `(True, "...0 bars filled...")`; require `(False, format_busy_defer(exc))`, unchanged pending metadata and client closure. Also cover the real historical `recover_gaps(db_path, runner, gaps)` path; it already calls `_backfill_one(..., to=gap.to_)` and propagates.
+- `test_metadata_busy_adapters_preserve_other_error_policy`: use a non-metadata `WriterLockBusy` and ordinary `RuntimeError` in the same catch sites. Retain discovery's existing error-event/normal-return policy, per-ticker log-and-continue, trailing warning-and-continue, and `run_worker`'s existing generic rc=2 on a propagated ordinary error. Do not broaden this fix into “every errored event aborts every caller”.
+
+Use real kernel contention and the short owner wrapper for pre-write cases. For the post-bar-commit metadata case, inject the exact metadata-role `WriterLockBusy` only at that owner's acquisition symbol, label it an adapter injection, and keep the real bar writer/metadata body. Read back committed bars and prior successful FIGIs, verify pending metadata is unchanged, then remove contention/injection and repeat the real entrypoint successfully. Assert error rows/events rather than merely a nonzero bar count. Baseline RED must expose lost metadata failure, not a fixture/import/network/signature error.
+
 - [ ] **Step 3: GREEN adapters, with no whole-step lock.** At each daily step insert before its generic exception branch:
 
 ```python
 except WriterLockBusy as exc:
     return False, format_busy_defer(exc)
 ```
+
+Apply that catch to universe/corporate/dividend steps. For the runner and gap path use the following **metadata-only** adapters; they never acquire a lock. Import only `WriterLockBusy`/`format_busy_defer` as needed alongside the owner imports.
+
+In `run`'s discovery `except Exception as e`, before its existing generic body:
+
+```python
+if isinstance(e, WriterLockBusy) and e.role == "backfill-metadata":
+    with self._lock:
+        self.state = BackfillState.IDLE
+    await self._emit("done", {
+        "tickers_done": 0, "tickers_total": 0, "status": "error",
+        "detail": format_busy_defer(e),
+    })
+    raise
+```
+
+In `_backfill_one_bounded` retain the existing `(figi, bars, err)` shape, widen the internal error annotation from `str | None` to `str | WriterLockBusy | None`, and insert before its generic logging/string conversion:
+
+```python
+if isinstance(e, WriterLockBusy) and e.role == "backfill-metadata":
+    return figi, 0, e
+```
+
+Keep `asyncio.gather(..., return_exceptions=False)` so these returned metadata exceptions wait for all already-started jobs. Replace only result accounting/failure detection before the existing success-finalization block:
+
+```python
+metadata_busy = None
+for figi, bars, _err in results:
+    if isinstance(_err, WriterLockBusy) and _err.role == "backfill-metadata":
+        if metadata_busy is None:
+            metadata_busy = _err
+        continue
+    self.tickers_done += 1
+    self.total_bars += bars
+if metadata_busy is not None:
+    with self._lock:
+        self.state = BackfillState.IDLE
+    await self._emit("done", {
+        "tickers_done": self.tickers_done, "tickers_total": self.tickers_total,
+        "total_bars": self.total_bars, "status": "error",
+        "detail": format_busy_defer(metadata_busy),
+    })
+    raise metadata_busy
+```
+
+Do not count deferred FIGIs as completed or infer how many of their bars already committed from a lost return value; verify committed continuity by DB readback. No change is needed inside `_discover_universe`, `_backfill_one_tinkoff` or `recover_gaps`: their metadata errors already propagate to these catch sites.
+
+In the trailing `except Exception as exc` before the existing warning/continue:
+
+```python
+if isinstance(exc, WriterLockBusy) and exc.role == "backfill-metadata":
+    raise
+```
+
+Keep the client's existing outer `finally: await client.aclose()`. In `_step_gap_recovery`'s outer generic exception body before its old error return:
+
+```python
+if isinstance(exc, WriterLockBusy) and exc.role == "backfill-metadata":
+    return False, format_busy_defer(exc)
+```
+
+In `run_worker`'s existing `except Exception as e`, compute the following detail, replace only the two existing `str(e)` uses in its error logger and `pipeline_mod.end_phase(..., status="err", detail=detail)`, and retain rc=2 and client-finally cleanup:
+
+```python
+detail = (format_busy_defer(e)
+          if isinstance(e, WriterLockBusy) and e.role == "backfill-metadata"
+          else str(e))
+```
+
+Scope ruling: these exception-only adapters are required to expose the newly coordinated metadata owner's failed pending write. Existing call signatures stay unchanged. The adapters do not serialize orchestration or telemetry, repair ordinary caller success policies, add retries, or widen the seven-owner inventory.
 
 For derivation CLI wrap only its existing `run_derivation` call and for dividend package main only its existing `fetch_and_persist` call with this adapter:
 
@@ -589,10 +685,12 @@ Record report and exit code. `fail_under = 95`, existing omissions and exclusion
 
 - [ ] **Step 2: Independent exact-SHA review and PR.** Provide base-to-HEAD diff, seven-owner inventory, acquired-role/phase map, RED/GREEN output, measured process occupancy, remaining exclusions, full-suite counts and backend coverage. Reviewer must approve spec and quality without blocking findings. Publish only authorized feature branch; verify remote head/checks. Follow AGENTS.md: operator/cron owns merge; no manual self-merge, main commit, force push or moving another worktree.
 
-- [ ] **Step 3: Bounded zero-network smoke before production.** On a new file-backed fixture migrated by existing test helpers, execute actual public universe/metadata owner for one instrument, local derivation plus worker adjustment for one validated split, and dividend fetch with validated offline client for one FIGI plus retrospective revision. Invoke each twice and assert actual rows/counts, PK idempotency, local field preservation, expected adjusted close, lock release, no network and no telemetry locking. Bound fixture input explicitly; do not use an unbounded full historical backfill as a smoke test.
+- [ ] **Step 3: Bounded zero-network smoke before production.** On a new file-backed fixture migrated by existing test helpers, execute actual public universe/metadata owner for one instrument, local derivation plus worker adjustment for one validated split, and dividend fetch with validated offline client for one FIGI. The real `_to_row` always sets `revision_n=1`; do not expect a broker payload to create revision 2. On that fixture call `fetch_and_persist(db_path, client=offline_client, figis=["FCOORD"], from_year=2024)` twice with one valid `2024-06-15` event/amount 10.0 and no pending queue: require `(1, 0)` then `(0, 0)` and read back its unchanged revision-1 row. Separately construct `DividendRow(figi="FCOORD", ex_date="2024-06-15", period_year=2024, amount_per_share=12.0, retrieved_at="2024-09-15T12:00:00", revision_n=2)` and pass it to actual `merge_into_dividends(db_path, [revision_row])` twice: require 1 then 0 and both PK revisions/amounts `(1, 10.0)` and `(2, 12.0)` still stored. This is a merge-level retrospective revision test, not fetch-generated revision support. Invoke universe/split paths twice too; assert actual rows/counts, PK idempotency, local field preservation, expected adjusted close, lock release, no network and no telemetry locking. Bound fixture input explicitly; do not use an unbounded full historical backfill as a smoke test or change production dividend mapping.
 
 - [ ] **Step 4: Backup-first deployment, operator owned.** Confirm authorization for production reads/writes and process changes separately. Deploy only approved merged SHA. Create a restricted SQLite online backup with `sqlite3.Connection.backup`, verify its `PRAGMA integrity_check=ok`, back up/read back existing schedule/config and record previous/candidate SHAs. Provide exact restore/rollback scope and do not alter untracked operator files, scheduler topology, heartbeat frequency or excluded telemetry transactions. Never replace a live SQLite DB by copying only its main file without WAL-aware backup.
 
-- [ ] **Step 5: Observe actual pipeline, not a synthetic readiness report.** Observe complete scheduled `first` and `derived` work, then a subsequent natural retry/resume cycle without manual lock sequencing. Record transaction deferral fields, failed phase status, committed-row continuity, actual current-session bar freshness, cycle age, independent DB integrity result and ML-ready percentage/failed cohorts from existing readiness code. A derived cycle may overlap first; do not claim cross-process global phase ordering not enforced by the current scheduler.
+- [ ] **Step 5: Observe a full daily cycle, then seven consecutive days of autonomous full cycles.** A complete daily cycle includes all actual `first` phases (`migrations`, `universe_sync`, `backfill_moex`, `bonds_depth`, `gap_recovery`) and `derived` phases (`corporate_actions`, `dividends`, `freshness_check`, `guardian`). Observe these through the existing scheduler, not fixture commands or manually ordered locks. Record completion/status/rows for every phase, bounded deferral fields, unchanged committed-row continuity and successful natural retry/resume of deferred pending work. Then retain timestamped evidence of complete autonomous daily cycles for seven consecutive days with no manual restart, pause or forced backfill. An interrupted/missing day or manual intervention leaves this gate open and requires a new qualifying seven-day window. One full cycle plus a subsequent retry is useful evidence, not proof of this window. A derived cycle may overlap first; do not claim cross-process global phase ordering not enforced by the current scheduler.
 
-- [ ] **Step 6: Decide capability and standing-goal acceptance separately.** Capability requires seven-owner protection plus all retained regressions and explicit exclusion proofs. Standing goal requires measured ML-ready coverage at least 95%, freshness at most 4 hours and observed autonomous daily retry/resume. Neither Python test coverage nor successful fixture smoke proves ML readiness. If excluded telemetry still causes BUSY, retain deferral and report attribution as a separate proposed follow-up, not an automatic global lock fix. Apply/archive this change only after approved implementation and verified results; preserve the separate evidence-BUSY delta workflow.
+At each daily acceptance observation run the existing `ml.features.check_coverage(conn, figis, coverage_threshold=0.95)` against the complete canonical required FIGI population, with all required cohort/class breakdowns and no denominator/class exclusions. Use positive cached `instruments.expected_bars` exactly as the canonical gate does; NULL/zero remains `unknown_expected`, not “ready” or omitted. Preserve its last completed MOEX session, evidence and delisting rules; do not invent an adjusted denominator. Record ready/total counts, unrounded percentages and every failed FIGI/reason (`incomplete`, `both`, `stale`, `unknown_expected`). Require ML-ready coverage at least 95% **and** measured freshness at most 4 hours for every required cohort throughout the qualifying observations, not only a passing global average. Include actual per-cohort data/refresh timestamps and current-session bar status, cycle age and independent DB integrity result. Global pipeline age or admin ML row counts alone do not prove per-cohort freshness/readiness; missing cohort evidence blocks acceptance rather than being assumed green.
+
+- [ ] **Step 6: Decide capability and standing-goal acceptance separately.** Capability requires seven-owner protection plus all retained regressions and explicit exclusion proofs. Standing goal stays unaccepted until Step 5 proves one full scheduled daily cycle, seven consecutive days of autonomous complete daily cycles without manual restart/pause/forced backfill, natural retry/resume, and ML-ready coverage at least 95%/freshness at most 4 hours for every required cohort with the unchanged canonical denominator. Two observations, Python test coverage, a passing global average or successful bounded fixture/production smoke cannot replace these criteria. If excluded telemetry still causes BUSY, retain deferral and report attribution as a separate proposed follow-up, not an automatic global lock fix. Apply/archive this change only after approved implementation and verified results; preserve the separate evidence-BUSY delta workflow and reconcile current main's appended canonical requirement before implementation without discarding it.
