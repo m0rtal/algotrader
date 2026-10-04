@@ -43,6 +43,10 @@ WriterRole = Literal[
     "no-trade-evidence",
     "expected-bars",
     "evidence-reconcile",
+    "universe-sync",
+    "backfill-metadata",
+    "corporate-actions",
+    "dividends",
 ]
 
 WriterPhase = Literal[
@@ -51,6 +55,11 @@ WriterPhase = Literal[
     "evidence",
     "expected-bars",
     "reconcile",
+    "instruments",
+    "metadata",
+    "corporate-actions",
+    "adjusted-bars",
+    "dividends",
 ]
 
 VALID_ROLES: Final[frozenset[str]] = frozenset({
@@ -60,6 +69,10 @@ VALID_ROLES: Final[frozenset[str]] = frozenset({
     "no-trade-evidence",
     "expected-bars",
     "evidence-reconcile",
+    "universe-sync",
+    "backfill-metadata",
+    "corporate-actions",
+    "dividends",
 })
 
 VALID_PHASES: Final[frozenset[str]] = frozenset({
@@ -68,6 +81,11 @@ VALID_PHASES: Final[frozenset[str]] = frozenset({
     "evidence",
     "expected-bars",
     "reconcile",
+    "instruments",
+    "metadata",
+    "corporate-actions",
+    "adjusted-bars",
+    "dividends",
 })
 
 

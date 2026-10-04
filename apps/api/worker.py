@@ -49,6 +49,9 @@ from algotrader_api.pipeline.assertions import (
     snapshot_bars_count,
 )
 from algotrader_api.ingestion.backfill import BackfillRunner  # noqa: E402,F401
+from algotrader_api.ingestion.writer_lock import (  # noqa: E402
+    WriterLockBusy, format_busy_defer, is_sqlite_busy, writer_lock, writer_lock_path,
+)
 
 logger = get_logger("algotrader_api.worker")
 
@@ -118,12 +121,15 @@ async def run_worker(mode: str) -> int:
                 rows_processed=runner.total_bars,
             )
         except Exception as e:
-            logger.error("worker.run.failed", error=str(e))
+            detail = (format_busy_defer(e)
+                      if isinstance(e, WriterLockBusy) and e.role == "backfill-metadata"
+                      else str(e))
+            logger.error("worker.run.failed", error=detail)
             pipeline_mod.end_phase(
                 settings.sqlite_path,
                 run_id,
                 status="err",
-                detail=str(e),
+                detail=detail,
             )
             rc = 2
     finally:
@@ -450,6 +456,8 @@ def _step_universe_sync(db_path: str) -> tuple[bool, str]:
         client = client_mod.make_client(sqlite_path=db_path, )
         rows = asyncio.run(run_universe_sync(db_path, client))
         return True, f"universe: {rows} instruments synced from broker"
+    except WriterLockBusy as exc:
+        return False, format_busy_defer(exc)
     except Exception as exc:  # noqa: BLE001
         return False, f"universe sync failed: {exc}"
 
@@ -772,6 +780,8 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
                                 from_=from_, to=to_, source=source,
                             )
                         except Exception as exc:  # noqa: BLE001
+                            if isinstance(exc, WriterLockBusy) and exc.role == "backfill-metadata":
+                                raise
                             logger.warning(
                                 "worker.gap_recovery.fill_failed",
                                 figi=figi, error=str(exc),
@@ -801,12 +811,14 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
             f"tinkoff={trailing_by_source.get('tinkoff', 0)}])"
         )
     except Exception as exc:
+        if isinstance(exc, WriterLockBusy) and exc.role == "backfill-metadata":
+            return False, format_busy_defer(exc)
         return False, f"gap recovery failed: {exc}"
 
 
 def _step_corporate_actions(db_path: str) -> tuple[bool, str]:
     """Re-run split derivation against the freshly-updated bars,
-    then apply_all_pending to forward-adjust bars."""
+    then forward-adjust bars for the selected splits."""
     try:
         import importlib
         import sqlite3
@@ -814,16 +826,45 @@ def _step_corporate_actions(db_path: str) -> tuple[bool, str]:
             "algotrader_api.scripts_import.derive_splits"
         )
         from algotrader_api.data_quality.forward_adjustment import (
-            apply_all_pending,
+            apply_forward_split,
         )
         written = derive_splits.run_derivation(db_path)
         conn = sqlite3.connect(db_path)
         try:
-            adjusted = apply_all_pending(conn)
-            conn.commit()
+            selected = conn.execute(
+                "SELECT figi, ex_date, factor FROM corporate_actions "
+                "WHERE action_type = 'split' ORDER BY ex_date"
+            ).fetchall()
+            prepared = [
+                (figi, date.fromisoformat(ex_date) if isinstance(ex_date, str) else ex_date,
+                 float(factor))
+                for figi, ex_date, factor in selected
+            ]
+            adjusted = 0
+            with writer_lock(db_path, role="corporate-actions", phase="adjusted-bars"):
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    for figi, ex_date, factor in prepared:
+                        adjusted += apply_forward_split(conn, figi, ex_date, factor)
+                    conn.commit()
+                except BaseException as exc:
+                    try:
+                        conn.rollback()
+                    except BaseException:
+                        pass
+                    if is_sqlite_busy(exc):
+                        raise WriterLockBusy(
+                            role="corporate-actions", phase="adjusted-bars",
+                            database_path=str(writer_lock_path(db_path))[:-len(".writer.lock")],
+                            lock_path=str(writer_lock_path(db_path)),
+                            timeout_seconds=30.0, reason="sqlite-busy",
+                        ) from exc
+                    raise
         finally:
             conn.close()
         return True, f"splits derived={written} bars adjusted={adjusted}"
+    except WriterLockBusy as exc:
+        return False, format_busy_defer(exc)
     except Exception as exc:
         return False, f"corporate actions failed: {exc}"
 
@@ -851,6 +892,8 @@ def _step_dividends(db_path: str) -> tuple[bool, str]:
         return True, f"dividends: tinkoff={written} queued={queued}"
     except AssertionError as exc:
         return False, f"dividends stale: {exc}"
+    except WriterLockBusy as exc:
+        return False, format_busy_defer(exc)
     except Exception as exc:
         return False, f"dividends failed: {exc}"
 

@@ -11,6 +11,11 @@ from algotrader_api.ingestion import backfill as bf_mod
 from algotrader_api.ingestion.backfill import BackfillRunner, BackfillEvent
 
 
+@pytest.fixture(autouse=True)
+def offline_backfill_env(monkeypatch):
+    monkeypatch.setenv("ALGOTRADER_INGEST_FAKE", "1")
+
+
 def _seed_instruments_and_metadata(db_path: Path) -> None:
     con = sqlite3.connect(str(db_path))
     con.execute(
@@ -287,3 +292,49 @@ def test_candle_date_handles_invalid_date_string(tmp_path):
     import asyncio
     # Should not raise.
     asyncio.run(runner._backfill_one(figi="BBG001", from_=yesterday, to=yesterday))
+
+
+@pytest.mark.parametrize("stage", ["discovery", "ticker"])
+@pytest.mark.parametrize("error_kind", ["other-writer-busy", "ordinary-error"])
+@pytest.mark.asyncio
+async def test_metadata_busy_adapters_preserve_other_error_policy(fresh_db, monkeypatch, stage, error_kind):
+    from algotrader_api.ingestion.writer_lock import WriterLockBusy, writer_lock_path
+
+    con = sqlite3.connect(fresh_db)
+    try:
+        con.execute("INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+                    "VALUES ('SBER', 'BBG001', 'share', 'Sber', 'RUB', 1)")
+        con.execute("INSERT INTO instrument_metadata (figi, last_run_status, total_bars) "
+                    "VALUES ('BBG001', 'pending', 0)")
+        con.commit()
+        before = con.execute("SELECT * FROM instrument_metadata").fetchall()
+    finally:
+        con.close()
+    exc = (WriterLockBusy(role="bar-writer", phase="bars", database_path=fresh_db,
+                          lock_path=str(writer_lock_path(fresh_db)), timeout_seconds=0.03,
+                          reason="flock-timeout") if error_kind == "other-writer-busy" else
+           RuntimeError("ordinary-owner-error"))
+
+    def acquire(path, *, role, phase):
+        assert (role, phase) == ("backfill-metadata", "instruments" if stage == "discovery" else "metadata")
+        raise exc  # non-metadata-role / ordinary acquisition error, not real contention
+
+    monkeypatch.setattr(bf_mod, "writer_lock", acquire)
+    events = []
+    runner = BackfillRunner(client=_OKUniverseOKCandles(), db_path=fresh_db,
+                            event_sink=lambda ev: _async_noop(ev, events))
+    assert await runner.run(history_years=1, source="tinkoff",
+                            limit_to=None if stage == "discovery" else ["BBG001"]) is None
+    done = [event for event in events if event.type == "done"]
+    assert len(done) == 1
+    assert done[0].payload["status"] == ("error" if stage == "discovery" else "ok")
+    assert runner.state.value == ("idle" if stage == "discovery" else "done")
+    assert runner.tickers_done == (0 if stage == "discovery" else 1)
+    con = sqlite3.connect(fresh_db)
+    try:
+        assert con.execute("SELECT * FROM instrument_metadata").fetchall() == before
+        messages = con.execute("SELECT message FROM ingestion_logs").fetchall()
+        assert len(messages) == 1
+        assert messages[0][0].startswith("universe discovery failed: " if stage == "discovery" else "unhandled: ")
+    finally:
+        con.close()

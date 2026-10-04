@@ -72,6 +72,7 @@ def _patch_all_steps(monkeypatch, *, results: dict | None = None):
     monkeypatch.setattr(
         worker, "shutdown_tracing", lambda: None, raising=False
     )
+    monkeypatch.setattr(worker, "heartbeat_loop", lambda *args: None)
     monkeypatch.setattr(
         worker, "get_settings",
         lambda: type("S", (), {"sqlite_path": ":memory:",
@@ -485,21 +486,32 @@ def test_step_gap_recovery_exception(tmp_path):
     assert "gap recovery failed" in detail
 
 
-def test_step_corporate_actions_ok(tmp_path):
+def test_step_corporate_actions_ok(fresh_db):
     worker = _import_worker()
-    db = str(tmp_path / "x.db")
-    fake_ds = MagicMock()
-    fake_ds.run_derivation.return_value = 4
-    fake_fa = MagicMock()
-    fake_fa.apply_all_pending.return_value = 12
-    with patch.dict(sys.modules, {
-        "algotrader_api.scripts_import.derive_splits": fake_ds,
-        "algotrader_api.data_quality.forward_adjustment": fake_fa,
-    }):
-        ok, detail = worker._step_corporate_actions(db)
-    assert ok is True
-    assert "splits derived=4" in detail
-    assert "bars adjusted=12" in detail
+    con = sqlite3.connect(fresh_db)
+    try:
+        con.executemany(
+            "INSERT INTO bars (figi, ts, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [("FCOORD", "2024-05-14", 100, 100, 100, 100, 100),
+             ("FCOORD", "2024-05-15", 50, 50, 50, 50, 100)],
+        )
+        con.commit()
+    finally:
+        con.close()
+    assert worker._step_corporate_actions(fresh_db) == (True, "splits derived=1 bars adjusted=1")
+    con = sqlite3.connect(fresh_db)
+    try:
+        first = con.execute("SELECT * FROM bars_adjusted").fetchall()
+        assert con.execute("SELECT ts, adj_close, adj_volume FROM bars_adjusted").fetchall() == [
+            ("2024-05-15", 25.0, 100),
+        ]
+        assert worker._step_corporate_actions(fresh_db) == (True, "splits derived=0 bars adjusted=0")
+        assert con.execute("SELECT * FROM bars_adjusted").fetchall() == first
+        assert con.execute("SELECT ts, close FROM bars ORDER BY ts").fetchall() == [
+            ("2024-05-14", 100.0), ("2024-05-15", 50.0),
+        ]
+    finally:
+        con.close()
 
 
 def test_step_corporate_actions_exception(tmp_path):
@@ -724,7 +736,7 @@ def test_step_guardian_exception(tmp_path):
 def test_log_chain_phase_swallows_errors(tmp_path):
     """_log_chain_phase is best-effort; must never raise."""
     worker = _import_worker()
-    worker._log_chain_phase("/no/such/dir/abc.db", "x", "ok", detail="d")
+    worker._log_chain_phase(str(tmp_path / "missing" / "abc.db"), "x", "ok", detail="d")
 
 
 # --------------------------------------------------------------------------- #
@@ -868,6 +880,38 @@ def test_admin_data_pipeline_status_endpoint(tmp_path, monkeypatch):
     assert "last_run" in out
     assert "freshness" in out
     assert out["last_run"]["phases"] == []
+
+
+@pytest.mark.parametrize("phase,role,owner_phase,subset", [
+    ("universe_sync", "universe-sync", "instruments", "first"),
+    ("corporate_actions", "corporate-actions", "corporate-actions", "derived"),
+    ("dividends", "dividends", "dividends", "derived"),
+])
+def test_chain_records_defer_without_changing_critical_policy(
+    fresh_db, monkeypatch, phase, role, owner_phase, subset,
+):
+    from algotrader_api.ingestion.writer_lock import WriterLockBusy, format_busy_defer, writer_lock_path
+
+    exc = WriterLockBusy(role=role, phase=owner_phase, database_path=fresh_db,
+                         lock_path=str(writer_lock_path(fresh_db)), timeout_seconds=0.03,
+                         reason="flock-timeout")
+    detail = format_busy_defer(exc)
+    worker, calls = _patch_all_steps(monkeypatch, results={phase: detail, f"{phase}._ok": False})
+    monkeypatch.setattr(worker, "get_settings", lambda: type("S", (), {
+        "sqlite_path": fresh_db, "log_level": "INFO",
+    })())
+    assert worker.run_daily_chain(subset=subset) == 1
+    con = sqlite3.connect(fresh_db)
+    try:
+        rows = con.execute("SELECT phase, result, detail FROM pipeline_log ORDER BY id").fetchall()
+    finally:
+        con.close()
+    assert [row for row in rows if row[0] == phase] == [(phase, "error", detail)]
+    phases = [name for name, _ in calls]
+    if phase == "universe_sync":
+        assert phases == ["migrations", "universe_sync"]
+    else:
+        assert phases == ["corporate_actions", "dividends", "freshness_check", "guardian"]
 
 
 def test_admin_data_pipeline_status_with_log(tmp_path, monkeypatch):

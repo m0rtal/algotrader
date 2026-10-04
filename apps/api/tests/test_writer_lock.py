@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
@@ -22,7 +23,7 @@ _API_SRC = _API_ROOT / "src"
 if str(_API_SRC) not in sys.path:
     sys.path.insert(0, str(_API_SRC))
 
-from algotrader_api.ingestion import writer_lock  # noqa: E402
+from algotrader_api.ingestion import writer_lock as lock_module  # noqa: E402
 from algotrader_api.ingestion.writer_lock import (  # noqa: E402
     WriterLockBusy,
     WriterLockError,
@@ -36,6 +37,45 @@ from algotrader_api.ingestion.writer_lock import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Lock-path & validation
 # ---------------------------------------------------------------------------
+
+
+NEW_PAIRS = [
+    ("universe-sync", "instruments"),
+    ("backfill-metadata", "instruments"),
+    ("backfill-metadata", "metadata"),
+    ("corporate-actions", "corporate-actions"),
+    ("corporate-actions", "adjusted-bars"),
+    ("dividends", "dividends"),
+]
+
+
+@pytest.mark.parametrize("role,phase", NEW_PAIRS)
+def test_daily_role_phase_is_valid(tmp_path, role, phase):
+    assert role in get_args(lock_module.WriterRole)
+    assert role in lock_module.VALID_ROLES
+    assert phase in get_args(lock_module.WriterPhase)
+    assert phase in lock_module.VALID_PHASES
+    with writer_lock(tmp_path / "state.db", role=role, phase=phase,
+                     timeout_seconds=0.05):
+        pass
+
+
+@pytest.mark.parametrize("role,phase", [
+    ("bar-writer", "bars"),
+    ("foreign-bars", "bars"),
+    ("same-day", "listed-till"),
+    ("no-trade-evidence", "evidence"),
+    ("expected-bars", "expected-bars"),
+    ("evidence-reconcile", "reconcile"),
+])
+def test_original_role_phase_remains_valid(tmp_path, role, phase):
+    assert role in get_args(lock_module.WriterRole)
+    assert role in lock_module.VALID_ROLES
+    assert phase in get_args(lock_module.WriterPhase)
+    assert phase in lock_module.VALID_PHASES
+    with writer_lock(tmp_path / "state.db", role=role, phase=phase,
+                     timeout_seconds=0.05):
+        pass
 
 
 def test_writer_lock_path_derives_lockfile(tmp_path):
@@ -160,6 +200,31 @@ def test_writer_lock_release_on_body_exception(tmp_path):
     # Lock must be released — a fresh acquisition succeeds.
     with writer_lock(db, role="bar-writer", phase="bars",
                       timeout_seconds=0.5):
+        pass
+
+
+def test_daily_role_does_not_bypass_same_process_thread_guard(tmp_path):
+    db = tmp_path / "thread.db"
+    outcomes = []
+
+    def contender():
+        try:
+            with writer_lock(db, role="dividends", phase="dividends",
+                             timeout_seconds=0.05):
+                outcomes.append("entered")
+        except WriterLockReentrant as exc:
+            outcomes.append(exc)
+
+    with writer_lock(db, role="universe-sync", phase="instruments",
+                     timeout_seconds=0.05):
+        thread = threading.Thread(target=contender)
+        thread.start()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert len(outcomes) == 1
+        assert isinstance(outcomes[0], WriterLockReentrant)
+    with writer_lock(db, role="dividends", phase="dividends",
+                     timeout_seconds=0.05):
         pass
 
 

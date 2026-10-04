@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from algotrader_api.scripts_import import derive_splits  # noqa: E402
+from algotrader_api.ingestion.writer_lock import WriterLockBusy, format_busy_defer  # noqa: E402
 
 
 def main() -> int:
@@ -57,9 +58,13 @@ def main() -> int:
         face_values = derive_splits.lookup_face_values(figis_to_secids)
         print(f"  resolved {len(face_values)} face_values for {len(figis_to_secids)} figis")
 
-    written = derive_splits.run_derivation(
-        str(args.db_path), face_values=face_values
-    )
+    try:
+        written = derive_splits.run_derivation(
+            str(args.db_path), face_values=face_values
+        )
+    except WriterLockBusy as exc:
+        print(format_busy_defer(exc), file=sys.stderr)
+        return 75
     print(f"Wrote {written} split rows.")
     return 0
 

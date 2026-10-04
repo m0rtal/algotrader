@@ -15,6 +15,10 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
+from algotrader_api.ingestion.writer_lock import (
+    WriterLockBusy, is_sqlite_busy, writer_lock, writer_lock_path,
+)
+
 
 @dataclass(frozen=True)
 class CorporateActionRow:
@@ -32,39 +36,52 @@ class CorporateActionRow:
 def merge_into_corporate_actions(
     db_path: str, rows: list[CorporateActionRow]
 ) -> int:
-    """Insert rows, replacing any existing row with the same
+    """Insert rows, skipping any existing row with the same
     (figi, action_type, ex_date) PK. Returns number of rows actually
     written."""
     if not rows:
         return 0
+    prepared = [
+        (r.figi, r.action_type,
+         r.ex_date.isoformat() if hasattr(r.ex_date, "isoformat") else str(r.ex_date),
+         r.factor, r.cash_amount, r.note, r.source)
+        for r in rows
+    ]
     conn = sqlite3.connect(db_path)
     try:
         written = 0
-        for r in rows:
-            ex_date = r.ex_date.isoformat() if hasattr(r.ex_date, "isoformat") else str(r.ex_date)
-            cur = conn.execute(
-                "SELECT 1 FROM corporate_actions "
-                "WHERE figi=? AND action_type=? AND ex_date=?",
-                (r.figi, r.action_type, ex_date),
-            )
-            if cur.fetchone() is not None:
-                continue  # idempotent — skip duplicates
-            conn.execute(
-                "INSERT INTO corporate_actions "
-                "(figi, action_type, ex_date, factor, cash_amount, note, source) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    r.figi,
-                    r.action_type,
-                    ex_date,
-                    r.factor,
-                    r.cash_amount,
-                    r.note,
-                    r.source,
-                ),
-            )
-            written += 1
-        conn.commit()
+        with writer_lock(db_path, role="corporate-actions", phase="corporate-actions"):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for parameters in prepared:
+                    cur = conn.execute(
+                        "SELECT 1 FROM corporate_actions "
+                        "WHERE figi=? AND action_type=? AND ex_date=?",
+                        parameters[:3],
+                    )
+                    if cur.fetchone() is not None:
+                        continue  # idempotent — skip duplicates
+                    conn.execute(
+                        "INSERT INTO corporate_actions "
+                        "(figi, action_type, ex_date, factor, cash_amount, note, source) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        parameters,
+                    )
+                    written += 1
+                conn.commit()
+            except BaseException as exc:
+                try:
+                    conn.rollback()
+                except BaseException:
+                    pass
+                if is_sqlite_busy(exc):
+                    raise WriterLockBusy(
+                        role="corporate-actions", phase="corporate-actions",
+                        database_path=str(writer_lock_path(db_path))[:-len(".writer.lock")],
+                        lock_path=str(writer_lock_path(db_path)),
+                        timeout_seconds=30.0, reason="sqlite-busy",
+                    ) from exc
+                raise
         return written
     finally:
         conn.close()
@@ -126,35 +143,59 @@ def merge_into_dividends(db_path: str, rows: list[DividendRow]) -> int:
     Returns the number of rows actually written. Idempotent."""
     if not rows:
         return 0
+    prepared = [
+        (r.figi, r.ex_date, r.pay_date, r.record_date, r.declared_at,
+         r.period_year, r.period_no, r.currency, r.amount_per_share,
+         r.fx_rate_used, r.dividend_type, r.regularity, r.close_price,
+         r.yield_value, r.yield_pct, r.tax_withheld_pct, r.cancelled_at,
+         r.source, r.source_revision_ts, r.retrieved_at, r.revision_n,
+         r.note)
+        for r in rows
+    ]
+    prepared = [
+        (parameters, (parameters[0], parameters[1], parameters[5], parameters[6], parameters[20]))
+        for parameters in prepared
+    ]
     conn = sqlite3.connect(db_path)
     try:
         written = 0
-        for r in rows:
-            cur = conn.execute(
-                "SELECT 1 FROM dividends WHERE "
-                "figi=? AND ex_date=? AND period_year=? AND period_no=? AND revision_n=?",
-                (r.figi, r.ex_date, r.period_year, r.period_no, r.revision_n),
-            )
-            if cur.fetchone() is not None:
-                continue
-            conn.execute(
-                "INSERT INTO dividends ("
-                "  figi, ex_date, pay_date, record_date, declared_at,"
-                "  period_year, period_no, currency, amount_per_share,"
-                "  fx_rate_used, dividend_type, regularity, close_price,"
-                "  yield_value, yield_pct, tax_withheld_pct, cancelled_at,"
-                "  source, source_revision_ts, retrieved_at, revision_n, note"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "?, ?, ?, ?, ?, ?, ?)",
-                (r.figi, r.ex_date, r.pay_date, r.record_date, r.declared_at,
-                 r.period_year, r.period_no, r.currency, r.amount_per_share,
-                 r.fx_rate_used, r.dividend_type, r.regularity, r.close_price,
-                 r.yield_value, r.yield_pct, r.tax_withheld_pct, r.cancelled_at,
-                 r.source, r.source_revision_ts, r.retrieved_at, r.revision_n,
-                 r.note),
-            )
-            written += 1
-        conn.commit()
+        with writer_lock(db_path, role="dividends", phase="dividends"):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for parameters, primary_key in prepared:
+                    cur = conn.execute(
+                        "SELECT 1 FROM dividends WHERE "
+                        "figi=? AND ex_date=? AND period_year=? AND period_no=? AND revision_n=?",
+                        primary_key,
+                    )
+                    if cur.fetchone() is not None:
+                        continue
+                    conn.execute(
+                        "INSERT INTO dividends ("
+                        "  figi, ex_date, pay_date, record_date, declared_at,"
+                        "  period_year, period_no, currency, amount_per_share,"
+                        "  fx_rate_used, dividend_type, regularity, close_price,"
+                        "  yield_value, yield_pct, tax_withheld_pct, cancelled_at,"
+                        "  source, source_revision_ts, retrieved_at, revision_n, note"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                        "?, ?, ?, ?, ?, ?, ?)",
+                        parameters,
+                    )
+                    written += 1
+                conn.commit()
+            except BaseException as exc:
+                try:
+                    conn.rollback()
+                except BaseException:
+                    pass
+                if is_sqlite_busy(exc):
+                    raise WriterLockBusy(
+                        role="dividends", phase="dividends",
+                        database_path=str(writer_lock_path(db_path))[:-len(".writer.lock")],
+                        lock_path=str(writer_lock_path(db_path)),
+                        timeout_seconds=30.0, reason="sqlite-busy",
+                    ) from exc
+                raise
         return written
     finally:
         conn.close()

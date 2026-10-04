@@ -188,3 +188,56 @@ def test_apply_all_pending_walks_corporate_actions_chronologically(db):
             assert rows[ts] <= raw
     finally:
         con.close()
+
+
+@pytest.mark.parametrize("apply_pending", [False, True], ids=["single-split", "all-pending"])
+def test_adjustment_borrower_preserves_callers_active_transaction(db, monkeypatch, apply_pending):
+    from algotrader_api.ingestion import writer_lock as locks
+
+    _seed_bars(db, [("F1", "2024-05-15", 50, 50, 50, 50, 100)])
+
+    class Borrowed(sqlite3.Connection):
+        borrower_active = False
+
+        def commit(self):
+            assert not self.borrower_active, "borrower commits caller transaction"
+            return super().commit()
+
+        def rollback(self):
+            assert not self.borrower_active, "borrower rolls back caller transaction"
+            return super().rollback()
+
+        def close(self):
+            assert not self.borrower_active, "borrower closes caller connection"
+            return super().close()
+
+    def unexpected_acquisition(*args, **kwargs):
+        raise AssertionError("borrower acquires nested writer lock")
+
+    con = sqlite3.connect(db, factory=Borrowed)
+    observer = sqlite3.connect(db)
+    try:
+        with locks.writer_lock(db, role="corporate-actions", phase="adjusted-bars"):
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "INSERT INTO corporate_actions (figi, action_type, ex_date, factor, note) "
+                "VALUES ('F1', 'split', '2024-05-15', 2.0, 'uncommitted-marker')"
+            )
+            monkeypatch.setattr(locks, "writer_lock", unexpected_acquisition)
+            con.borrower_active = True
+            try:
+                written = apply_all_pending(con) if apply_pending else apply_forward_split(con, "F1", date(2024, 5, 15), 2.0)
+                assert written == 1
+                assert con.in_transaction
+                assert con.execute("SELECT note FROM corporate_actions").fetchall() == [("uncommitted-marker",)]
+                assert con.execute("SELECT adj_close, adj_volume FROM bars_adjusted").fetchall() == [(25.0, 100)]
+                assert observer.execute("SELECT * FROM corporate_actions").fetchall() == []
+                assert observer.execute("SELECT * FROM bars_adjusted").fetchall() == []
+            finally:
+                con.borrower_active = False
+            con.rollback()
+        assert con.execute("SELECT * FROM bars_adjusted").fetchall() == []
+        assert con.execute("SELECT close FROM bars").fetchall() == [(50.0,)]
+    finally:
+        con.close()
+        observer.close()

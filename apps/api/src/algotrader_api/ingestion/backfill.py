@@ -42,6 +42,7 @@ from typing import Any, Awaitable, Callable, Iterable
 from ..observability.logging import get_logger
 from .closed_candles import is_closed_candle
 from .no_trade_evidence import MOEXFetchOutcome  # noqa: F401  (re-exported)
+from .writer_lock import WriterLockBusy, format_busy_defer, is_sqlite_busy, writer_lock, writer_lock_path
 # Imported lazily inside the call sites that need it; this keeps the
 # module-level import surface minimal — `_backfill_one_moex` is the
 # only path that calls ``fetch_issuer_identity`` directly (the other
@@ -1214,7 +1215,15 @@ class BackfillRunner:
                     "status",
                     {"state": self.state.value, "tickers_total": total},
                 )
-            except Exception as e:  # pragma: no cover — universe discovery failure only fires during live broker run
+            except Exception as e:
+                if isinstance(e, WriterLockBusy) and e.role == "backfill-metadata":
+                    with self._lock:
+                        self.state = BackfillState.IDLE
+                    await self._emit("done", {
+                        "tickers_done": 0, "tickers_total": 0, "status": "error",
+                        "detail": format_busy_defer(e),
+                    })
+                    raise
                 await self._log("error", figi=None, message=f"universe discovery failed: {e}")
                 await self._emit("done", {"tickers_done": 0, "tickers_total": 0, "status": "error"})
                 with self._lock:
@@ -1251,7 +1260,7 @@ class BackfillRunner:
         parallel_limit = 10
         sem = asyncio.Semaphore(parallel_limit)
 
-        async def _backfill_one_bounded(inst: dict) -> tuple[str, int, str | None]:
+        async def _backfill_one_bounded(inst: dict) -> tuple[str, int, str | WriterLockBusy | None]:
             """Run _backfill_one inside the semaphore. Returns (figi, bars, err)."""
             figi = inst["figi"]
             ticker = inst.get("ticker")
@@ -1283,6 +1292,8 @@ class BackfillRunner:
                     )
                     return (figi, bars, None)
                 except Exception as e:  # noqa: BLE001
+                    if isinstance(e, WriterLockBusy) and e.role == "backfill-metadata":
+                        return (figi, 0, e)
                     await self._log("error", figi=figi, message=f"unhandled: {e}")
                     return (figi, 0, str(e))
 
@@ -1290,9 +1301,23 @@ class BackfillRunner:
             *[_backfill_one_bounded(inst) for inst in instruments],
             return_exceptions=False,
         )
+        metadata_busy = None
         for figi, bars, _err in results:
+            if isinstance(_err, WriterLockBusy) and _err.role == "backfill-metadata":
+                if metadata_busy is None:
+                    metadata_busy = _err
+                continue
             self.tickers_done += 1
             self.total_bars += bars
+        if metadata_busy is not None:
+            with self._lock:
+                self.state = BackfillState.IDLE
+            await self._emit("done", {
+                "tickers_done": self.tickers_done, "tickers_total": self.tickers_total,
+                "total_bars": self.total_bars, "status": "error",
+                "detail": format_busy_defer(metadata_busy),
+            })
+            raise metadata_busy
 
         # Step 3: finished.
         final_state = BackfillState.DONE
@@ -2853,30 +2878,48 @@ class BackfillRunner:
         # Update supplied broker fields by figi without resetting locally
         # computed coverage, source timestamps, or absent broker metadata.
         # Tickers are not unique: relisted figis may share one ticker.
+        params = (
+            ticker,
+            figi,
+            row.get("class"),
+            name,
+            currency,
+            lot_size,
+            row.get("isin"),
+            row.get("sector"),
+        )
+        phase = "instruments"
         con = sqlite3.connect(self.db_path)
         try:
-            con.execute(
-                "INSERT INTO instruments "
-                "(ticker, figi, class, name, currency, lot_size, isin, sector) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(figi) DO UPDATE SET "
-                "ticker=excluded.ticker, class=excluded.class, "
-                "name=excluded.name, currency=excluded.currency, "
-                "lot_size=excluded.lot_size, "
-                "isin=COALESCE(excluded.isin, instruments.isin), "
-                "sector=COALESCE(excluded.sector, instruments.sector)",
-                (
-                    ticker,
-                    figi,
-                    row.get("class"),
-                    name,
-                    currency,
-                    lot_size,
-                    row.get("isin"),
-                    row.get("sector"),
-                ),
-            )
-            con.commit()
+            with writer_lock(self.db_path, role="backfill-metadata", phase=phase):
+                try:
+                    con.execute("BEGIN IMMEDIATE")
+                    con.execute(
+                        "INSERT INTO instruments "
+                        "(ticker, figi, class, name, currency, lot_size, isin, sector) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(figi) DO UPDATE SET "
+                        "ticker=excluded.ticker, class=excluded.class, "
+                        "name=excluded.name, currency=excluded.currency, "
+                        "lot_size=excluded.lot_size, "
+                        "isin=COALESCE(excluded.isin, instruments.isin), "
+                        "sector=COALESCE(excluded.sector, instruments.sector)",
+                        params,
+                    )
+                    con.commit()
+                except BaseException as exc:
+                    try:
+                        con.rollback()
+                    except BaseException:
+                        pass
+                    if is_sqlite_busy(exc):
+                        raise WriterLockBusy(
+                            role="backfill-metadata", phase=phase,
+                            database_path=str(writer_lock_path(self.db_path))[:-len(".writer.lock")],
+                            lock_path=str(writer_lock_path(self.db_path)),
+                            timeout_seconds=30.0, reason="sqlite-busy",
+                        ) from exc
+                    raise
         finally:
             con.close()
 
@@ -2889,15 +2932,33 @@ class BackfillRunner:
         otherwise `decide_strategy` would re-do work the daily scheduler
         has already finished.
         """
+        params = (figi,)
+        phase = "metadata"
         con = sqlite3.connect(self.db_path)
         try:
-            con.execute(
-                "INSERT OR IGNORE INTO instrument_metadata "
-                "(figi, last_bar_ts, total_bars, last_run_status, last_run_at, last_error) "
-                "VALUES (?, NULL, 0, 'pending', NULL, NULL)",
-                (figi,),
-            )
-            con.commit()
+            with writer_lock(self.db_path, role="backfill-metadata", phase=phase):
+                try:
+                    con.execute("BEGIN IMMEDIATE")
+                    con.execute(
+                        "INSERT OR IGNORE INTO instrument_metadata "
+                        "(figi, last_bar_ts, total_bars, last_run_status, last_run_at, last_error) "
+                        "VALUES (?, NULL, 0, 'pending', NULL, NULL)",
+                        params,
+                    )
+                    con.commit()
+                except BaseException as exc:
+                    try:
+                        con.rollback()
+                    except BaseException:
+                        pass
+                    if is_sqlite_busy(exc):
+                        raise WriterLockBusy(
+                            role="backfill-metadata", phase=phase,
+                            database_path=str(writer_lock_path(self.db_path))[:-len(".writer.lock")],
+                            lock_path=str(writer_lock_path(self.db_path)),
+                            timeout_seconds=30.0, reason="sqlite-busy",
+                        ) from exc
+                    raise
         finally:
             con.close()
 
@@ -2911,31 +2972,49 @@ class BackfillRunner:
         error_msg: str | None,
     ) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
+        params = (
+            figi,
+            last_bar_ts,
+            now_iso if status == "ok" else None,
+            total_bars,
+            status,
+            now_iso,
+            error_msg,
+        )
+        phase = "metadata"
         con = sqlite3.connect(self.db_path)
         try:
-            con.execute(
-                "INSERT INTO instrument_metadata "
-                "(figi, last_bar_ts, last_backfilled_at, total_bars, "
-                " last_run_status, last_run_at, last_error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(figi) DO UPDATE SET "
-                "last_bar_ts = excluded.last_bar_ts, "
-                "last_backfilled_at = excluded.last_backfilled_at, "
-                "total_bars = excluded.total_bars, "
-                "last_run_status = excluded.last_run_status, "
-                "last_run_at = excluded.last_run_at, "
-                "last_error = excluded.last_error",
-                (
-                    figi,
-                    last_bar_ts,
-                    now_iso if status == "ok" else None,
-                    total_bars,
-                    status,
-                    now_iso,
-                    error_msg,
-                ),
-            )
-            con.commit()
+            with writer_lock(self.db_path, role="backfill-metadata", phase=phase):
+                try:
+                    con.execute("BEGIN IMMEDIATE")
+                    con.execute(
+                        "INSERT INTO instrument_metadata "
+                        "(figi, last_bar_ts, last_backfilled_at, total_bars, "
+                        " last_run_status, last_run_at, last_error) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(figi) DO UPDATE SET "
+                        "last_bar_ts = excluded.last_bar_ts, "
+                        "last_backfilled_at = excluded.last_backfilled_at, "
+                        "total_bars = excluded.total_bars, "
+                        "last_run_status = excluded.last_run_status, "
+                        "last_run_at = excluded.last_run_at, "
+                        "last_error = excluded.last_error",
+                        params,
+                    )
+                    con.commit()
+                except BaseException as exc:
+                    try:
+                        con.rollback()
+                    except BaseException:
+                        pass
+                    if is_sqlite_busy(exc):
+                        raise WriterLockBusy(
+                            role="backfill-metadata", phase=phase,
+                            database_path=str(writer_lock_path(self.db_path))[:-len(".writer.lock")],
+                            lock_path=str(writer_lock_path(self.db_path)),
+                            timeout_seconds=30.0, reason="sqlite-busy",
+                        ) from exc
+                    raise
         finally:
             con.close()
 

@@ -19,6 +19,7 @@ defer by ``test_bars_sqlite_reconcile_defer.py``.
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import sys
 from pathlib import Path
@@ -33,6 +34,8 @@ if str(_API_SRC) not in sys.path:
 from algotrader_api.ingestion.writer_lock import (  # noqa: E402
     WriterLockBusy,
     format_busy_defer,
+    writer_lock,
+    writer_lock_path,
 )
 
 
@@ -84,6 +87,39 @@ def test_format_busy_defer_has_all_eight_fields(tmp_path):
     assert "timeout=1.5s" in line, f"timeout missing: {line!r}"
     assert f"reason={exc.reason}" in line
     assert f"result={exc.result}" in line
+
+
+@pytest.mark.parametrize("role,phase", [
+    ("universe-sync", "instruments"),
+    ("backfill-metadata", "instruments"),
+    ("backfill-metadata", "metadata"),
+    ("corporate-actions", "corporate-actions"),
+    ("corporate-actions", "adjusted-bars"),
+    ("dividends", "dividends"),
+])
+def test_daily_role_timeout_has_exact_diagnostic_identity(tmp_path, role, phase):
+    db = tmp_path / "state.db"
+    lock = writer_lock_path(db)
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        # A separate open-file description contends without the Python guard.
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(WriterLockBusy) as raised:
+            with writer_lock(db, role=role, phase=phase, timeout_seconds=0.03):
+                pytest.fail("contended daily lock body must not execute")
+    finally:
+        os.close(fd)
+    exc = raised.value
+    assert (exc.role, exc.phase) == (role, phase)
+    assert exc.database_path == str(db)
+    assert exc.lock_path == str(lock)
+    assert format_busy_defer(exc) == (
+        f"DEFER writer-lock-busy role={role} phase={phase} pid={os.getpid()} "
+        f"database_path={db} lock_path={lock} timeout=0.03s "
+        "reason=flock-timeout result=deferred"
+    )
+    with writer_lock(db, role=role, phase=phase, timeout_seconds=0.03):
+        pass
 
 
 def test_format_busy_defer_strips_control_characters(tmp_path):
@@ -441,3 +477,17 @@ def test_format_busy_defer_no_payload_or_extra_attrs(tmp_path):
     # No reserved markers that an injection could carry.
     assert "payload" not in line.lower()
     assert "bearer" not in line.lower()
+
+
+@pytest.mark.parametrize("phase", ["instruments", "metadata"])
+def test_metadata_defer_ignores_raw_failure_payload(tmp_path, phase):
+    exc = _busy(str(tmp_path / "state.db"), str(tmp_path / "state.db.writer.lock"),
+                role="backfill-metadata", phase=phase)
+    exc.args = ("RAW-FIXTURE-PAYLOAD",)
+    exc.__cause__ = RuntimeError("RAW-FIXTURE-PAYLOAD")
+    line = format_busy_defer(exc)
+    assert "RAW-FIXTURE-PAYLOAD" not in line
+    assert len(line.splitlines()) == 1
+    assert line == (f"DEFER writer-lock-busy role=backfill-metadata phase={phase} pid={os.getpid()} "
+                    f"database_path={tmp_path / 'state.db'} lock_path={tmp_path / 'state.db.writer.lock'} "
+                    "timeout=1.5s reason=flock-timeout result=deferred")

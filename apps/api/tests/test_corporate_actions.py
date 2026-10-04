@@ -108,7 +108,7 @@ def test_import_corporate_actions_via_operator_wrapper(tmp_path):
     db = tmp_path / "state.db"
     r = subprocess.run(
         [sys.executable, "-m", "scripts.import_corporate_actions", str(db)],
-        cwd="/home/hermes/algotrader/apps/api",
+        cwd=str(Path(__file__).resolve().parents[1]),
         capture_output=True, text=True, timeout=30,
     )
     assert r.returncode == 0, r.stderr
