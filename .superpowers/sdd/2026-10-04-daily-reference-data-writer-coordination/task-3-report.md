@@ -118,3 +118,97 @@ Module counts из JUnit: coordination 128; forward 7; derive 15; worker daily c
 4. Финальные 5 warnings: два существующих dependency deprecations плюс три `AsyncLimiter` cross-loop reuse warnings из неизменных throttle tests. Migration 016 setup logs уже наблюдались до source edits; это не failures данной задачи. Эти соседние проблемы не исправлялись.
 5. Local commits используют command-scoped `core.hooksPath=/dev/null`: штатный hook обновляет global codebase memory вне leaf scope. Hook configuration не менялась. Нет installs, network, production/secrets/cron access, push, merge, deployment, delegation или global memory writes.
 6. Parent должен независимо review implementation SHA и этот отчёт, затем продолжить Task 4 последовательно. Branch/worktree сохранены.
+
+---
+
+## ScopeCorrection — обязательный dividend owner Task 3
+
+### Исправление прежней области и текущий статус
+
+Прежняя директива parent ошибочно исключила `merge_into_dividends` из Task 3 и включила worker adjustment из Task 4. Поэтому прежний отчёт и approvals закрывали только указанную corporate/adjustment область, **не весь утверждённый Task 3**. Формулировки выше о переносе dividend owner в Task 4 и о завершённом Task 3 являются историческими и этой секцией исправлены. Утверждённые brief и план не менялись.
+
+Обязательный dividend merge теперь реализован по Step 3 исходного `task-3-brief.md`. Все implementation/test критерии Task 3 выполнены; независимый review parent остаётся обязательным перед dispatch Task 5. Adapters, CLI deferral и worker error formatting в этой коррекции не изменены.
+
+- База коррекции: `09be80378bebe4ec708ec59a798e7ed13e25a8c1`.
+- Implementation commit: `a034a8001141b301388897509a455f5ef32ba5db` — `feat(ingestion): coordinate reference data merges`.
+- Implementation commit содержит ровно два файла: `apps/api/src/algotrader_api/scripts_import/import_corporate_actions_common.py` и `apps/api/tests/test_daily_reference_writer_coordination.py`.
+- Эта append-only секция отчёта добавлена отдельным documentation commit. Совокупная область коррекции — ровно эти два файла плюс текущий `task-3-report.md`.
+
+### Сохранённые контракты и новый owner
+
+- Все исходные 22 INSERT-параметра и пятикомпонентный PK tuple готовятся для полного списка **до connection/acquisition**. При ошибке preparation поздней строки нет connection, lock-файла или SQL. Значения полей, nullable fields, строки дат/timestamps, monetary values и revision numbering не нормализуются заново.
+- Ровно один owner `dividends/dividends` охватывает `BEGIN IMMEDIATE`, все прежние PK SELECT/skip/INSERT и один commit всего списка. Duplicate checks остаются внутри активной транзакции; возвращается число фактических INSERT. Повтор одинакового PK, включая изменённый amount/source/retrieved_at/note, не перезаписывает существующую строку. Revisions 1/2 остаются двумя строками; каждый исходный компонент PK проверен отдельно.
+- BEGIN входит в try. Exact Step 3 `except BaseException` block сначала пытается rollback под flock. Rollback failure не маскирует исходный exception. Только `is_sqlite_busy` классифицирует numeric BUSY 5/517; `WriterLockBusy` сохраняет cause, canonical paths, `role="dividends"`, `phase="dividends"`, timeout 30.0 и `reason="sqlite-busy"`. Code 1/6, string code `"5"` и text-only `database is locked` остаются исходными объектами.
+- Function-owned connection открывается до acquisition и закрывается после release; native close выполняется даже после injected rollback failure. Исходные foreign_keys=0, SQLite timeout 5000 ms и WAL/DELETE journal modes сохранены. Empty list возвращает 0 без connection/acquisition.
+- Queue/dequeue, rate-limit/throttle, fetch/mapping source, schema, существующие imports и corporate owner не изменены. Нет вложенных corporate/queue writes, нового helper owner, retry, sleep или тяжёлой preparation под lock.
+
+### Реальное TDD и проверенные результаты
+
+Использован прежний безопасный bootstrap `/home/hermes/.hermes/cache/scratch/task3_offline_pytest.py` и project interpreter `/home/hermes/algotrader/apps/api/.venv/bin/python`, Python 3.11.16. Candidate imports берутся из этого worktree. `PYTHONPATH`/`PYTHONHOME` удалены из окружения; HOME/data/pytest paths временные и находятся в scratch. Outbound sockets, DNS и настоящий `urlopen` запрещены. Dividend wrapper/fetch/throttle cases используют только явные конечные offline fakes; настоящий SDK client не запускался.
+
+1. До production edits: безопасный baseline **169 passed, 5 warnings**, exit 0.
+2. Initial RED по обязательному selector `-k 'corporate_merge or dividend_merge'`: **47 failed, 38 passed, 91 deselected, 2 warnings**, exit 1. Все 47 failures — новые dividend owner/preparation cases; 37 ранее существовавших corporate cases и существующий dividend empty-list contract прошли. JUnit: 85 testcase, 47 failures, 0 errors, 0 skipped. Production source в этот момент byte-identical базе.
+3. После первого GREEN обнаружена отдельная граница подготовки PK: добавленный opcode-tracing test дал **1 failed, 176 deselected, 2 warnings**, exit 1 с точным `dividend parameter tuple constructed under flock`. PK tuple тоже перенесён до acquisition; trace охватывает реальную функцию и её comprehension code objects.
+4. Финальный тот же owner selector: **86 passed, 91 deselected, 2 warnings**, exit 0; 49 dividend cases, 37 существующих corporate cases.
+5. Финальный расширенный безопасный regression run: **401 passed, 5 warnings**, exit 0. JUnit программно проверен: 401 перечисленный testcase, 0 failures, 0 errors, 0 skipped; нет подмены результатов skip/xfail.
+
+RED command:
+
+```bash
+env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 \
+  /home/hermes/algotrader/apps/api/.venv/bin/python \
+  /home/hermes/.hermes/cache/scratch/task3_offline_pytest.py \
+  apps/api/tests/test_daily_reference_writer_coordination.py \
+  -k 'corporate_merge or dividend_merge' \
+  -q -p no:cacheprovider --tb=short \
+  --junitxml=/home/hermes/.hermes/cache/scratch/task3-dividend-red.xml
+```
+
+Final GREEN command:
+
+```bash
+env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 \
+  /home/hermes/algotrader/apps/api/.venv/bin/python \
+  /home/hermes/.hermes/cache/scratch/task3_offline_pytest.py \
+  apps/api/tests/test_daily_reference_writer_coordination.py \
+  apps/api/tests/test_derive_splits.py \
+  apps/api/tests/test_dividends_fetcher.py \
+  apps/api/tests/test_dividends_schema.py \
+  apps/api/tests/test_dividends_tinkoff_wrapper.py \
+  apps/api/tests/test_dividends_throttling.py \
+  apps/api/tests/test_dividends_throttle_queue.py \
+  apps/api/tests/test_dividends_throttle_queue_visibility.py \
+  apps/api/tests/test_writer_inventory.py \
+  apps/api/tests/test_writer_lock.py \
+  apps/api/tests/test_writer_lock_diagnostics.py \
+  apps/api/tests/test_forward_adjustment.py \
+  apps/api/tests/test_bars_adjusted_after_phase.py \
+  -q -p no:cacheprovider --tb=short \
+  --junitxml=/home/hermes/.hermes/cache/scratch/task3-dividend-green-final.xml
+```
+
+Logs: `task3-dividend-baseline.log`, `task3-dividend-red.log`, `task3-dividend-red-pk.log`, `task3-dividend-green-owners-final.log`, `task3-dividend-green-final.log` в `/home/hermes/.hermes/cache/scratch/`. Соответствующие JUnit XML сохранены там же.
+
+Verified GREEN module counts: coordination 177; derivation 15; dividend fetcher 6; dividend schema 5; offline dividend wrapper 6; throttling 4; throttle queue 3; queue visibility 2; inventory 87; writer lock 53; diagnostics 34; forward adjustment 7; bars-adjusted phase 2.
+
+### Доказательства и критерии исходного Task 3
+
+- [x] **Step 1: оба реальных merge owners.** Corporate RED evidence сохранён выше; новый dividend RED выполнен до source edits. Реальные migrated file DBs, полные snapshots семи таблиц, все 24 dividend columns, exact owner/transaction order, numeric BUSY и kernel contention проверены. Нет mocked merge return.
+- [x] **Step 2: corporate GREEN.** Ранее проверенный corporate owner byte-identical базе коррекции. Его существующие tests и derivation idempotency regressions снова проходят; duplicate-skip и actual insert counts сохранены.
+- [x] **Step 3: dividend GREEN.** Один full-list transaction; preparation всех полей/tuples вне flock; точная identity и exact error block; connection lifecycle, empty input, revisions, PK и duplicate policy проверены.
+- [x] **Step 4: регрессии и local commit.** Оба owner selectors, все offline derive/dividend mapping/merge/throttle tests и смежные writer checks прошли; implementation SHA указан выше. Coverage omission/threshold не изменены. Независимый review ещё не выполнен этой leaf.
+
+Новые transaction/error tests наблюдают rollback до release и реальное native close. Две вставки откатываются при injected commit error/BaseException, BEGIN/first/second SELECT/INSERT interruption и реальном NOT NULL violation второй строки. При rollback failure primary object identity/cause сохранены, native close завершает cleanup; healthy observer не ослаблен. После неудачи повторная вставка и fresh acquisition проходят, полный snapshot остальных таблиц неизменён.
+
+Kernel contention использует независимое open-file description и настоящий `fcntl.flock`: canonical/symlink callers получают timeout 0.05 секунды только из test wrapper, без BEGIN/DML. Same-PID guard проверен в том же и другом thread для canonical/symlink/`..` aliases; после освобождения holder повтор проходит. Настоящий non-participating SQLite `BEGIN IMMEDIATE` вызывает numeric BUSY на BEGIN, rollback под lock и успешный retry. Commit BUSY 5/517 остаётся явно deterministic injection, не заявляется live commit reproduction.
+
+`/home/hermes/.hermes/cache/scratch/task3_dividend_scope_check.py` выполнен с exit 0: public signature, все прежние module nodes кроме `merge_into_dividends`, exact SELECT/INSERT SQL, исходный 22-field order и PK mapping сохранены; error handler AST-identical exact Step 3 block. Под lock нет tuple-construction AST nodes; выполняемый opcode test отдельно подтверждает preparation boundary. Все pre-existing coordination definitions/helpers AST-identical. Report append-only, diff ограничен тремя разрешёнными файлами. `git diff --check` и staged check прошли.
+
+Первый scratch scope-check ошибочно трактовал `ast.Tuple(ctx=Store)` loop unpacking как tuple construction; проверка уточнена до `ctx=Load`. Это ошибка scratch проверки, не production correction и не изменение тестового контракта.
+
+### Оставшиеся ограничения
+
+- Full operational suite, backend 95% coverage gate, owner-level interprocess stress и production acceptance не запускались. Этот focused GREEN их не заменяет; Task 6 остаётся отдельным gate parent.
+- Пять warnings совпадают с baseline: две dependency deprecations и три `AsyncLimiter` cross-loop reuse warnings в неизменных throttle tests. Existing migration 016 setup logs также не исправлялись.
+- Local commits используют только command-scoped `core.hooksPath=/dev/null`, чтобы hook не менял global codebase memory. Конфигурация hooks не менялась. Нет installs, network, production/secrets/cron access, push/merge/deployment/delegation или global memory writes.
+- Branch/worktree сохранены. Parent должен независимо review `a034a8001141b301388897509a455f5ef32ba5db` и эту ScopeCorrection перед Task 5.
