@@ -124,3 +124,92 @@ git diff --check
 The local commit stages only the four source/test paths above and this exact report path, with message `test(ingestion): define daily writer scope and identities`. Use command-local `-c core.hooksPath=/dev/null -c commit.gpgsign=false`: repository hooks invoke secret/package/codebase-memory operations outside this leaf's no-secrets/no-install/no-network/no-global-memory scope. No hook, signature or index-refresh success is claimed.
 
 No delegation, global-memory/skill update, production DB/process/schedule/secret access, installation, network operation, push, merge, deployment or archive application was performed. Full backend regression/coverage gates remain for the parent to rerun in the established isolated environment; this report claims only the scoped gates above. Independent Task 1 review must precede Task 2. Runtime coordination of the seven daily owners, later adapters/concurrency tests, rollout and the full scheduled cycle/seven-day standing-goal acceptance remain unimplemented or unverified by this leaf.
+
+## R1: relative-import alias bypass correction
+
+### Status and exact scope
+
+- R1 status: **DONE**, ready for the parent's independent exact-SHA re-review. This does not supersede the original Task 1 scope concern or authorize Task 2.
+- R1 base: `2211cb8ca468252783ab4ce418df47f0f23c1640`; worktree and implementation branch are unchanged.
+- Changed implementation: only `apps/api/tests/test_writer_inventory.py`. Appended R1 evidence to this report and the existing same-directory `task-1-brief.md`; the previously ignored brief is force-added by that exact path.
+- Production `writer_lock.py`, role/phase identities, owner code, other regression files, inventory maps, marker/raw-bar assertions, dependencies and coverage configuration are unchanged from the R1 base.
+- The R1 review SHA is the local commit containing this appended section. Resolve it with `git log -1 --format=%H -- .superpowers/sdd/2026-10-04-daily-reference-data-writer-coordination/task-1-report.md`; the exact commit SHA is also returned to the parent after commit readback, rather than embedding a self-referential hash here.
+
+### Root cause and correction
+
+The baseline reproduction parsed `from .. import ingestion as ingest` with `level=2`, `module=None`; the scanner returned only `['writer_lock']` and found **0** acquisitions in the injected `discover_universe`. It formed `None.ingestion` instead of resolving the relative import against its package.
+
+`_lock_acquisition_names` now accepts the actual source path. The inventory fixture and every available-path call site pass it; `_writer_lock_calls` forwards optional path metadata when names were not already resolved. The package is derived from contiguous real `__init__.py` parents of that path, including initializer source files. Stdlib `importlib.util.resolve_name` resolves both `ImportFrom.level` and nullable `module`, and raises `ImportError` for missing package context or traversal beyond the top-level package. No fixed canonical package is guessed for arbitrary trees.
+
+The existing bare-name, import/module-alias, exception/formatter-adapter, decorator and returned-context matching logic remains. No general AST interpreter or production owner change was added. Injected acquisitions are AST-only: no evaluation of their imports, functions or decorators, and no lock/network/DB operation is performed by those negative cases.
+
+Thirteen new cases cover forbidden calls and locking decorators through level-1/level-2 package aliases with `module=None`, direct relative lock-module aliases, qualified relative imports, initializer handling, invalid relative imports, omitted metadata and an unrelated real package. The rejection uses the existing non-owner assertion and names the unauthorized function `discover_universe`.
+
+### RED and GREEN commands and output
+
+All commands ran from the worktree root with the existing interpreter, no dependency installation, cache provider disabled and parent bytecode disabled.
+
+```bash
+# Baseline before editing; final GREEN uses the same six-file gate.
+env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 \
+  /home/hermes/algotrader/apps/api/.venv/bin/python -m pytest \
+  apps/api/tests/test_writer_lock.py apps/api/tests/test_writer_lock_diagnostics.py \
+  apps/api/tests/test_writer_inventory.py apps/api/tests/test_sqlite_evidence_busy_defer.py \
+  apps/api/tests/test_sqlite_reconcile_commit_rollback.py \
+  apps/api/tests/test_bars_sqlite_reconcile_defer.py -q -p no:cacheprovider \
+  --junitxml=/home/hermes/.hermes/cache/scratch/daily-writer-task-1-r1-baseline.xml
+
+# New cases first, before changing the scanner; exit 1 is expected RED.
+env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 \
+  /home/hermes/algotrader/apps/api/.venv/bin/python -m pytest \
+  apps/api/tests/test_writer_inventory.py -k 'relative_import or canonical_package' \
+  -q -p no:cacheprovider --tb=short \
+  --junitxml=/home/hermes/.hermes/cache/scratch/daily-writer-task-1-r1-red.xml
+
+# New-case GREEN: repeat the preceding selection after the fix, using
+# --junitxml=/home/hermes/.hermes/cache/scratch/daily-writer-task-1-r1-new-green.xml
+
+env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 \
+  /home/hermes/algotrader/apps/api/.venv/bin/python -m pytest \
+  apps/api/tests/test_writer_inventory.py -q -p no:cacheprovider \
+  --junitxml=/home/hermes/.hermes/cache/scratch/daily-writer-task-1-r1-inventory-green.xml
+
+# Final GREEN: repeat the full baseline six-file command above, using
+# --junitxml=/home/hermes/.hermes/cache/scratch/daily-writer-task-1-r1-final-green.xml
+
+env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 \
+  /home/hermes/algotrader/apps/api/.venv/bin/python \
+  /home/hermes/.hermes/cache/scratch/daily-writer-task-1-r1-legacy-mutation.py
+
+env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 \
+  /home/hermes/algotrader/apps/api/.venv/bin/python \
+  /home/hermes/.hermes/cache/scratch/daily-writer-task-1-r1-self-review.py
+
+git diff --check
+git diff --quiet 2211cb8ca468252783ab4ce418df47f0f23c1640 -- \
+  apps/api/src apps/api/worker.py apps/api/pyproject.toml \
+  apps/api/tests/test_writer_lock.py apps/api/tests/test_writer_lock_diagnostics.py \
+  apps/api/tests/test_sqlite_evidence_busy_defer.py \
+  apps/api/tests/test_sqlite_reconcile_commit_rollback.py \
+  apps/api/tests/test_bars_sqlite_reconcile_defer.py
+```
+
+Observed output:
+
+- Baseline: **198 passed, 0 failed, 0 errors, 0 skipped, 2 warnings**, exit 0.
+- New-case RED: **8 failed, 5 passed, 74 deselected, 2 warnings**, exit 1. Four failures were the exact forbidden call/decorator bypasses at relative levels 1 and 2 (`DID NOT RAISE AssertionError`); four were missing relative-import error handling (`DID NOT RAISE ImportError`). There were no fixture/import errors.
+- New-case GREEN: **13 passed, 74 deselected, 2 warnings**, exit 0.
+- Entire inventory GREEN: **87 passed, 0 failed, 0 errors, 0 skipped, 2 warnings**, exit 0.
+- Final six-file GREEN after the formatting-only refactor: **211 passed, 0 failed, 0 errors, 0 skipped, 2 warnings**, exit 0. Per-file counts: inventory **87**, primitive/thread guard **53**, diagnostics **34**, SQLite evidence busy-defer **18**, reconciliation commit/rollback **15**, bar reconciliation-defer **4**.
+- Final-test legacy mutation: the base matcher was injected in memory through a shim that accepts but ignores source metadata. The final eight acquisition regressions returned **4 failed, 4 passed, 79 deselected, 2 warnings**, pytest exit 1. The exact four package-alias call/decorator failures were asserted; the verification runner exits 0. No repository file was reverted or production source mutated.
+- Read-only self-review compared JUnit identities: all **198** original cases remain present and passed, with exactly **13** additional passing cases. All **10** original inventory assignments and **12** original test-function ASTs unaffected by path plumbing are unchanged; scanner call-site metadata checks pass.
+- Both Git checks passed, exit 0. The only warnings are the same baseline Starlette/httpx and anyio deprecations; no suppression was added. One ambiguous patch-context attempt was rejected atomically and changed no files; no blocker remains.
+
+### Blob, evidence and remaining gates
+
+- Candidate `apps/api/tests/test_writer_inventory.py` Git blob: `ae52a234588818fb962be45f672b6b52ca38f7bc`.
+- R1 self-review script SHA-256: `41a6d75c9185f2f5600db15bcf06d953e46d3e061b2fcb6cc9e2eb51668d071d`.
+- Legacy-mutation script SHA-256: `f9e5d273441b400431c53fd84f100c96d51b237eeaffc08d461f55905910030b`.
+- JUnit and verification scripts are in the configured scratch directory, not committed and subject to pruning.
+- The local commit contains exactly the scanner test file, appended Task 1 brief and appended Task 1 report. As in the original Task 1 commit, use command-local `-c core.hooksPath=/dev/null -c commit.gpgsign=false` to avoid hooks that perform secret/package/codebase-memory operations outside this leaf's scope. No hook, signing or index-refresh success is claimed.
+- No redelegation, production-state/secret access, network operation, install, global-memory/skill write, push or merge was performed. Full operational/coverage tests and later-task implementation remain outside R1; the parent must independently review the returned exact commit before proceeding.

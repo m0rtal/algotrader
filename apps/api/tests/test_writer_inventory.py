@@ -19,6 +19,7 @@ Asserts that:
 from __future__ import annotations
 
 import ast
+from importlib.util import resolve_name
 from pathlib import Path
 
 import pytest
@@ -133,7 +134,7 @@ def source_inventory():
         assert path.exists(), f"missing inventory file {path}"
         if path.suffix == ".py":
             tree = _parse(path)
-            sources[path] = tree, _lock_acquisition_names(tree)
+            sources[path] = tree, _lock_acquisition_names(tree, path)
     return sources
 
 
@@ -267,20 +268,29 @@ def test_async_backfill_impl_has_no_raw_insert_into_bars():
 # ---------------------------------------------------------------------------
 
 
-def _lock_acquisition_names(tree: ast.AST) -> set[str]:
+def _lock_acquisition_names(tree: ast.AST, source_path: Path | None = None) -> set[str]:
     names = {"writer_lock"}
     module = "algotrader_api.ingestion.writer_lock"
+    package_parts = []
+    if source_path is not None:
+        # __init__.py belongs to its own directory's package, just like a module.
+        for parent in source_path.resolve().parents:
+            if not (parent / "__init__.py").is_file():
+                break
+            package_parts.append(parent.name)
+    package = ".".join(reversed(package_parts))
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
+            imported_module = resolve_name("." * node.level + (node.module or ""), package)
             for alias in node.names:
                 bound = alias.asname or alias.name
-                if (node.module or "").split(".")[-1] == "writer_lock":
+                if imported_module.split(".")[-1] == "writer_lock":
                     if alias.name == "writer_lock":
                         names.add(bound)
                 elif alias.name == "writer_lock":
                     names.add(f"{bound}.writer_lock")
                 else:
-                    imported = f"{node.module}.{alias.name}"
+                    imported = f"{imported_module}.{alias.name}"
                     if module.startswith(imported + "."):
                         names.add(f"{bound}{module[len(imported):]}.writer_lock")
         elif isinstance(node, ast.Import):
@@ -296,8 +306,11 @@ def _lock_acquisition_names(tree: ast.AST) -> set[str]:
     return names
 
 
-def _writer_lock_calls(tree: ast.AST, acquisition_names=None) -> list[ast.Call]:
-    names = _lock_acquisition_names(tree) if acquisition_names is None else acquisition_names
+def _writer_lock_calls(
+    tree: ast.AST, acquisition_names=None, *, source_path: Path | None = None,
+) -> list[ast.Call]:
+    names = (_lock_acquisition_names(tree, source_path)
+             if acquisition_names is None else acquisition_names)
     return [
         n
         for n in ast.walk(tree)
@@ -334,7 +347,7 @@ def test_writer_lock_scan_resolves_import_aliases(import_statement, acquisition)
         f"with {acquisition}(db, role='dividends', phase='dividends'):\n"
         "    pass\n"
     )
-    assert len(_writer_lock_calls(tree)) == 1
+    assert len(_writer_lock_calls(tree, source_path=_INGEST / "universe.py")) == 1
 
 
 def test_writer_lock_scan_allows_exception_and_formatter_adapters():
@@ -342,7 +355,7 @@ def test_writer_lock_scan_allows_exception_and_formatter_adapters():
         "from algotrader_api.ingestion.writer_lock import WriterLockBusy, format_busy_defer\n"
         "format_busy_defer(error)\n"
     )
-    assert _writer_lock_calls(tree) == []
+    assert _writer_lock_calls(tree, source_path=_INGEST / "no_trade_evidence.py") == []
 
 
 @pytest.mark.parametrize("decorator", ["acquire", "acquire(db)", "locks.writer_lock"])
@@ -352,8 +365,72 @@ def test_non_owner_scan_detects_lock_decorators(decorator):
         "from algotrader_api.ingestion import writer_lock as locks\n"
         f"@{decorator}\ndef fetch(): pass\n"
     )
+    path = _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py"
     assert len(_acquisition_sites(_qualified_function(tree, "fetch"),
-                                  _lock_acquisition_names(tree))) == 1
+                                  _lock_acquisition_names(tree, path))) == 1
+
+
+@pytest.mark.parametrize("path,import_statement,acquisition", [
+    pytest.param(_SRC_ROOT / "__init__.py", "from . import ingestion as ingest",
+                 "ingest.writer_lock.writer_lock", id="level-1-package-alias"),
+    pytest.param(_INGEST / "universe.py", "from .. import ingestion as ingest",
+                 "ingest.writer_lock.writer_lock", id="level-2-package-alias"),
+    pytest.param(_INGEST / "universe.py", "from . import writer_lock as locks",
+                 "locks.writer_lock", id="level-1-lock-module-alias"),
+    pytest.param(_SRC_ROOT / "data_quality" / "service.py",
+                 "from ..ingestion import writer_lock as locks",
+                 "locks.writer_lock", id="level-2-qualified-module-alias"),
+])
+@pytest.mark.parametrize("site", ["call", "decorator"])
+def test_non_owner_scan_rejects_relative_import_acquisitions(
+    source_inventory, path, import_statement, acquisition, site,
+):
+    """An imported package alias must not hide discovery's lock ownership."""
+    assert path.is_file()
+    lock_call = f"{acquisition}(db, role='dividends', phase='dividends')"
+    if site == "call":
+        source = f"def discover_universe(db):\n    with {lock_call}:\n        pass\n"
+    else:
+        source = f"@{lock_call}\ndef discover_universe(db):\n    pass\n"
+    tree = ast.parse(f"{import_statement}\n{source}", filename=str(path))
+    sources = {**source_inventory, path: (tree, _lock_acquisition_names(tree, path))}
+    with pytest.raises(AssertionError, match="discover_universe acquires writer lock"):
+        test_non_owner_does_not_acquire_writer_lock("discover_universe", path, sources)
+
+
+@pytest.mark.parametrize("path,import_statement", [
+    pytest.param(_SRC_ROOT / "__init__.py", "from .. import ingestion as ingest",
+                 id="root-package-beyond-top-level"),
+    pytest.param(_INGEST / "__init__.py", "from ... import ingestion as ingest",
+                 id="nested-package-beyond-top-level"),
+    pytest.param(_REPO_ROOT / "apps" / "api" / "worker.py",
+                 "from . import ingestion as ingest", id="standalone-module"),
+])
+def test_writer_lock_scan_rejects_invalid_relative_imports(path, import_statement):
+    tree = ast.parse(import_statement, filename=str(path))
+    with pytest.raises(ImportError):
+        _lock_acquisition_names(tree, path)
+
+
+def test_writer_lock_scan_requires_relative_import_source_path():
+    tree = ast.parse("from .. import ingestion as ingest")
+    with pytest.raises(ImportError):
+        _lock_acquisition_names(tree)
+
+
+def test_writer_lock_scan_does_not_assume_canonical_package(tmp_path):
+    package = tmp_path / "src" / "other_api"
+    package.mkdir(parents=True)
+    path = package / "__init__.py"
+    path.write_text("")
+    tree = ast.parse(
+        "from . import ingestion as ingest\n"
+        "def discover_universe(db):\n"
+        "    with ingest.writer_lock.writer_lock(db, role='dividends', phase='dividends'):\n"
+        "        pass\n",
+        filename=str(path),
+    )
+    assert _writer_lock_calls(tree, source_path=path) == []
 
 
 def _enclosing_with_for_call(tree: ast.Module, target: ast.AST):
@@ -425,7 +502,7 @@ def test_process_scan_follows_returned_lock_context(source_inventory, owner_file
         "def lock_factory(db):\n    return acquire(db, role='dividends', phase='dividends')\n"
         "with lock_factory(db):\n    subprocess.run([])\n"
     )
-    sources = {**source_inventory, owner_file: (tree, _lock_acquisition_names(tree))}
+    sources = {**source_inventory, owner_file: (tree, _lock_acquisition_names(tree, owner_file))}
     with pytest.raises(pytest.fail.Exception, match="forbidden subprocess.run"):
         test_no_process_creation_inside_writer_lock_body(sources)
 
