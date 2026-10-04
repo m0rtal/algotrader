@@ -72,10 +72,22 @@ Checker output: `/home/hermes/.hermes/cache/scratch/verified-delisting-doc-prefl
 
 ## Future Execution Gate — Not Performed Here
 
-- [ ] Capture actual RED output and counts from planned CLI regressions before production edits.
-- [ ] Implement narrow CLI change; capture GREEN, related and full backend ≥95% reports.
+- [x] Capture actual RED output and counts from planned CLI regressions before production edits.
+- [x] Implement narrow CLI change; capture GREEN, related and full backend ≥95% reports.
 - [ ] Independent exact-SHA spec/quality review; approved PR/CI and parent-owned merge under the latest specific user/operator authorization.
 - [ ] Restricted WAL-aware backup, integrity and exact-SHA deployment/readback in authorized parent flow.
 - [ ] Bounded offline fixture smoke, exact SQL preservation/idempotency and remaining standing-goal report.
 
 Store future execution reports under a distinct scratch `verified-delisting-metadata` namespace and link exact paths/SHA/counts here after execution. This docs-only pass does not run tests, change source/test/config, read production/secrets, access live network, push, merge or deploy. It makes no seven-day autonomous acceptance claim. A temporary syntax-check wrapper lacked the loop for a caller fragment; correcting the checker context made all five blocks compile without changing source or tests.
+
+## Task 1 implementation execution
+
+Implementation SHA: `e9bc594917209266803a573e1ec3c8d3c8475ea0`; authorized base `7e0f6dd84b9a76c45d9b30471a2a841df79a0cad`. Exact commands, safety envelope, fixture-gap ruling and artifacts: `.superpowers/sdd/2026-10-04-verified-delisting-metadata/task-1-report.md`.
+
+- RED before source edits: 34 cases, 26 failed/8 passed; complete initial matrix 193 cases, 147 failed/46 passed. Actual state assertion failures; no fixture/import errors. Baseline replay exposes invalid HTTP500 NULL-date stale-to-ready (`gate_after=[]`).
+- Final targeted matrix plus seven requested existing files: 441 passed, no skips; expanded auxiliary/SQLite suites: 237 passed, no skips.
+- Final full backend: 1829 passed, 8 existing disabled sandbox skips, 1 existing XPASS, 47 warnings; exit 0. Package line/branch coverage 97.34%, unchanged exclusions. New acceptance file: 210 passing cases, no skips.
+- Full-suite discovery required three additional inactive tuple adaptations in two legacy fixture files; all original assertions retained. Independent baseline `ad58b28` full run: 1619 passed, same skips/XPASS/warnings, exit 0, coverage 97.34%.
+- Tests ran inside offline mount/PID/network namespaces with production paths masked and existing venv read-only. Candidate copy includes uncommitted tests. Scratch artifacts: `/home/hermes/.hermes/cache/scratch/delisting-task1-safe/`; baseline `/home/hermes/.hermes/cache/scratch/delisting-task1-baseline-safe/`.
+- Per-command safe credential-scanner hook passed; codebase-memory index not updated. No install/shared configuration/source-worker changes, push, merge, canonical apply/archive or production access.
+- Independent exact-SHA review and release gates remain pending.

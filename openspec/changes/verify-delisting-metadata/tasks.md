@@ -2,9 +2,9 @@
 
 ## 1. Narrow implementation with TDD and SDD
 
-- [ ] 1.1 Read canonical authorities, this delta, design, plan and evidence; verify branch/base and execution authorization.
-- [ ] 1.2 Add real CLI/SQL regression scaffold and matrix from the plan; capture RED failures for invalid metadata before production edits.
-- [ ] 1.3 Correct only the CLI-private metadata probe and inactive-path identity ordering; preserve independent valid delisting, window, foreign-bar and transaction contracts.
+- [x] 1.1 Read canonical authorities, this delta, design, plan and evidence; verify branch/base and execution authorization.
+- [x] 1.2 Add real CLI/SQL regression scaffold and matrix from the plan; capture RED failures for invalid metadata before production edits.
+- [x] 1.3 Correct only the CLI-private metadata probe and inactive-path identity ordering; preserve independent valid delisting, window, foreign-bar and transaction contracts.
 - [ ] 1.4 Capture GREEN targeted regressions and offline full backend suite/coverage ≥95% without changed exclusions or denominator; commit and obtain independent exact-SHA spec/quality review.
 
 ## 2. Release verification
