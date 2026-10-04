@@ -8,6 +8,8 @@ The worker SHALL account for relevant error events from historical as well as tr
 
 Successful empty responses without error events SHALL remain successful. The worker SHALL preserve actual successful bar counters, committed bars, subsequent recovery calls, owned client cleanup, existing metadata-BUSY defer/rollback/exception policy and noncritical daily continuation with rc=1. The change SHALL NOT alter runner/helper signatures, upstream routing or producers, cached expected bars, instrument universe, identity validation, no-trade evidence rules, coverage thresholds or scheduling. It SHALL NOT certify production freshness or seven-day autonomy.
 
+This requirement SHALL extend `Truthful Best-Effort Trailing Gap Recovery`: its prior trailing-only `failed=N` scope and historical-event exclusion SHALL be superseded for the ordinary phase-wide summary by the distinct historical/trailing union defined above. Historical errors for requested FIGIs SHALL no longer be excluded from that phase result. Unrelated identities SHALL remain excluded, and all other trailing recovery, cleanup, deferral and continuation requirements SHALL remain binding.
+
 #### Scenario: Real historical upstream error fails the phase
 
 - GIVEN a migrated temporary DB with one instrument and bars on 2026-09-07 and 2026-09-09, producing a real historical gap on 2026-09-08
