@@ -46,6 +46,30 @@ Validator/probe artifact: `/home/hermes/.hermes/cache/scratch/verified-delisting
 
 Existing full review package: `/home/hermes/worktrees/algotrader-verified-delisting/.superpowers/sdd/2026-10-04-verified-delisting-metadata/review-ad58b28..7063f05.diff`; brief: `task-1-brief.md` in that same directory. Parent regenerates the package after this documentation commit; this leaf does not substitute its own review artifact.
 
+## Docs Preflight Amendment — Round 2 Active/Inactive Path Separation
+
+Scope: remaining P2 path blocker only, starting at `54d41a52a7bff098f8f19630b5b72d339451da73`. Modified only this progress report, plan, design and data-quality delta. No source/test/config, production, network, secrets, push, merge or deployment access.
+
+- [x] Reproduced the incorrect primary rejection assumption with the actual extracted `_get_meta_moex`: TQBR `1`, `True` and `1.0` return active metadata; string `"1"` returns None. The shared parser remains unchanged.
+- [x] Put all 13 strict inactive-probe rejection forms on non-primary `OTHER`, alone or alongside inactive TQBR. All 26 payloads return actual active metadata None and strict reference None. Strict inactive acceptance remains only `0`, `False`, `"0"`; both floats remain rejected by the inactive probe.
+- [x] Added separate active-primary controls for the three accepted forms, both bar dates and prior NULL/non-NULL listed-till. They require ordinary partial history and no delisting UPDATE, not fictional no-history rejection.
+- [x] Corrected the documented first-history observer to declare expected mutation: false for active controls, true for validated inactive metadata. SQL readback and a CLI-local connection trace check UPDATE before the observer records history. No shared SQLite or requests binding is mutated.
+- [x] Ran the documented observer and actual extracted metadata/year-parser functions through transport-only fakes and scratch SQLite: 12 active history checks preserve instrument state with no UPDATE; 6 inactive history checks observe committed mutation/UPDATE; 6 valid inactive empty windows request no history. This is a reference-ordering check, not actual CLI RED/GREEN or a migrated fixture acceptance run. No parser outcome was faked.
+- [x] Five Python fenced blocks compile. Retained real year-parser partial check returns `partial`, one row and one HTTP call. Prior board SECID and strict metadata checks still pass. Three canonical/retained authority files remain byte-identical to `ad58b28`.
+- [x] Strict change and canonical data-quality validations exit 0; existing informational long-requirement notices only. `git diff --check` exits 0.
+- [x] Documented ruling cost in design ruling 6: preserving existing active-parser semantics may leave an active-path metadata weakness if this scope choice is wrong; investigate that in a separate audit, not by silently widening this delisting fix.
+
+Exact offline checker command (exit 0):
+
+```bash
+env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 /home/hermes/algotrader/apps/api/.venv/bin/python /home/hermes/.hermes/cache/scratch/verified-delisting-doc-preflight-round2/check_paths.py
+openspec validate verify-delisting-metadata --strict --no-interactive
+openspec validate data-quality --type spec --strict --no-interactive
+git diff --check
+```
+
+Checker output: `/home/hermes/.hermes/cache/scratch/verified-delisting-doc-preflight-round2/validation.txt`. The round-2 checker reuses the prior scoped checker for syntax, strict-reference, board identity, partial parser and authority checks, then verifies actual active routing and documented observer behavior. Parent regenerates the brief/diff and obtains scoped independent re-review after this commit. Future implementation/release gates remain unchecked.
+
 ## Future Execution Gate — Not Performed Here
 
 - [ ] Capture actual RED output and counts from planned CLI regressions before production edits.

@@ -115,7 +115,7 @@ def coverage(db):
 
 def exercise(tmp_path, monkeypatch, payload, *, status=200,
              bar="2026-09-10", prior=None, history="complete", dry=False,
-             local_isin=ISIN, customize=None):
+             local_isin=ISIN, customize=None, expect_delisting=True):
     db = tmp_path / "state.db"
     sqlitedb.close_all()
     sqlitedb.run_migrations(str(db), MIGRATIONS_DIR)
@@ -140,6 +140,15 @@ def exercise(tmp_path, monkeypatch, payload, *, status=200,
     for module in (cli, backfill, no_trade_evidence, features):
         monkeypatch.setattr(module, "date", FrozenDate)
     events = []
+    def traced_connect(*args, **kw):
+        raw = sqlite3.connect(*args, **kw)
+        def trace(statement):
+            if statement.lstrip().upper().startswith("UPDATE INSTRUMENTS SET LISTED_TILL"):
+                events.append("listed-till-update")
+        raw.set_trace_callback(trace)
+        return raw
+    monkeypatch.setattr(cli, "sqlite3", SimpleNamespace(
+        Row=sqlite3.Row, connect=traced_connect))
 
     class Response:
         def __init__(self, body, code=200):
@@ -155,12 +164,14 @@ def exercise(tmp_path, monkeypatch, payload, *, status=200,
             if isinstance(payload, ConnectionError):
                 raise payload
             return Response(payload, status)
-        # A first-history observer verifies identity/status before mutation.
+        # Before first history: inactive metadata is committed; active routing is not delisting.
         assert status == 200
         identity = {r[0]: r[2] for r in payload["description"]["data"]}
         assert identity["SECID"] == "GAZP" and identity["ISIN"] == ISIN
+        changed = snapshot(db)["instruments"][0] != before["instruments"][0]
+        assert changed is expect_delisting
+        assert ("listed-till-update" in events) is expect_delisting
         events.append("history")
-        assert snapshot(db)["instruments"][0] != before["instruments"][0]
         body = {
             "history": {
                 "columns": ["TRADEDATE", "SECID", "BOARDID", "OPEN", "HIGH",
@@ -299,7 +310,9 @@ Expected semantic failures include HTTP500/wrong SECID/ISIN/suffix date making `
 
 - [ ] **Step 3: Complete retained edge/transaction tests before GREEN.** Extend the same fixture with local ISIN parameter and existing evidence setup; assert invalid metadata preserves non-empty evidence including observed/expiry fields and local ISIN NULL/empty cannot certify delisting. Add malformed description/boards container cases (`None`, list, string), missing/duplicate required columns/identity rows, long rows, the exact accepted/rejected activity forms below, empty board id and second-board invalid date. Add two valid inactive boards to verify the latest end wins and no history is requested when equal to last bar. Use the actual metadata payload through the fake session, not stubbed probe tuples for trust tests.
 
-Inactive forms are exactly integer `0` (bool excluded from that integer branch), boolean `False`, and exact string `"0"`. Active forms are exactly integer `1`, boolean `True`, and exact string `"1"`; each prevents delisting, including on a non-primary board. Every other form is invalid/unknown, including `0.0`, `1.0`, `""`, `None`, `" 0"`, `"0 "`, `"false"`, `"true"`, `"unknown"`, and integer `2`. Never use general truthiness or integer coercion.
+For the CLI-private inactive candidate probe, inactive forms are exactly integer `0` (bool excluded from that integer branch), boolean `False`, and exact string `"0"`. Active exact integer `1`, boolean `True`, and exact string `"1"` prevent delisting; every other form is invalid/unknown, including `0.0`, `1.0`, `""`, `None`, `" 0"`, `"0 "`, `"false"`, `"true"`, `"unknown"`, and integer `2`. Never use general truthiness or integer coercion in that probe. Put the rejection matrix on a non-primary `OTHER` board, alone or alongside inactive TQBR, so actual `_get_meta_moex` returns None and the strict probe is reached.
+
+Preserve existing active-primary routing: actual `_get_meta_moex` uses `is_traded == 1`, accepting `1`, `True` and `1.0` on TQBR, but not string `"1"`. Test those three accepted controls separately with both bar dates and prior NULL/non-NULL listed-till. Ordinary history is permitted and required by these controls; partial transport isolates unchanged SQL/evidence. Require no delisting UPDATE, not no history. The first-history observer declares `expect_delisting=False` for active controls and `True` for validated inactive metadata, checks SQL state and traced UPDATE before recording history, and uses actual metadata/year parsers with transport-only fakes. Do not change the shared active parser to force fictional rejection.
 
 The partial-history transport returns one valid zero-trade row and cursor columns `INDEX`, `TOTAL`, `PAGESIZE`, data `[[0, 2, 2]]`. The actual year parser must retain that one row, return `partial`, and make exactly one HTTP call. Never monkeypatch `_fetch_year_moex_outcome`; its real parser is the acceptance boundary.
 
@@ -344,20 +357,36 @@ def test_exact_inactive_activity_accepts_empty_window(tmp_path, monkeypatch, act
 
 @pytest.mark.parametrize("activity", [1, True, "1", 0.0, 1.0, "", None,
                                        " 0", "0 ", "false", "true", "unknown", 2])
-@pytest.mark.parametrize("other_board", [False, True])
+@pytest.mark.parametrize("layout", ["nonprimary_only", "inactive_primary_plus_other"])
 @pytest.mark.parametrize("bar", ["2026-09-10", "2026-08-31"])
-def test_active_or_invalid_activity_preserves_state(
-        tmp_path, monkeypatch, activity, other_board, bar):
+def test_inactive_candidate_activity_rejection_preserves_state(
+        tmp_path, monkeypatch, activity, layout, bar):
     body = metadata()
-    if other_board:
-        row = body["boards"]["data"][0].copy()
-        row[1] = "OTHER"
-        body["boards"]["data"].append(row)
+    if layout == "inactive_primary_plus_other":
+        body["boards"]["data"].append(body["boards"]["data"][0].copy())
+    # No active primary board: the actual _get_meta_moex must return None.
+    body["boards"]["data"][-1][1] = "OTHER"
     body["boards"]["data"][-1][8] = activity
     rc, before, after, gate_before, gate_after, events = exercise(
-        tmp_path, monkeypatch, body, bar=bar, prior="2026-09-30")
+        tmp_path, monkeypatch, body, bar=bar, prior="2026-09-30",
+        expect_delisting=False)
     assert rc == 0 and before == after and gate_before == gate_after
-    assert "history" not in events
+    assert "history" not in events and "listed-till-update" not in events
+
+
+@pytest.mark.parametrize("activity", [1, True, 1.0], ids=["int1", "true", "float1"])
+@pytest.mark.parametrize("bar", ["2026-09-10", "2026-08-31"])
+@pytest.mark.parametrize("prior", [None, "2026-09-30"])
+def test_active_primary_preserves_delisting_but_allows_history(
+        tmp_path, monkeypatch, activity, bar, prior):
+    body = metadata()
+    body["boards"]["data"][0][8] = activity
+    rc, before, after, gate_before, gate_after, events = exercise(
+        tmp_path, monkeypatch, body, bar=bar, prior=prior,
+        history="partial", expect_delisting=False)
+    assert rc == 0 and before == after and gate_before == gate_after
+    assert events.count("history") == 1
+    assert "listed-till-update" not in events
 
 
 def test_partial_cursor_uses_real_year_parser(monkeypatch):
