@@ -158,3 +158,60 @@ No full-suite coverage percentage or gate exit code is claimed here. `apps/api/p
 - Temporary migration seeding emits migration 016 cleanup diagnostics (`no such table: instruments_new`, `no such savepoint: _mig_016_cleanup`). Final domain/schema readback and integrity checks pass; migrations are unchanged.
 - The local commit uses per-command `core.hooksPath=/dev/null`: the normal hook refreshes global codebase-memory outside leaf authorization. No persistent hook configuration is changed. No index-refresh claim is made. The credential scanner is run explicitly on the staged slice; the three staged test files return exit 0, and staged blobs equal the verified worktree files. The report is scanned again with the final staged scope before commit.
 - The SDD directory is ignored; only this authorized report is force-added. Final staged scope is checked against the exact three-test/report set. Independent parent review of actual owner implementations remains required before promotion.
+
+## Final fixture-contamination fix wave (baseline `6547319`)
+
+This section supersedes the earlier statement that the full backend gate remains unrun. The fix wave changes only `apps/api/tests/test_daily_reference_writer_coordination.py` and this report. Production logic, dependencies, coverage configuration and source contracts remain unchanged. The resulting local commit SHA is returned separately; the exact verified test-file SHA-256 is `f16559d606ee8326e39beaf3b364895d99a5e23ddde9dcd959e37bb9be3ef7f8`.
+
+### Proven root cause
+
+The original `owner_trace.install()` mutates the shared stdlib modules at `time.sleep` and `sqlite3.connect`. The preceding `tests/cli/test_worker_heartbeat.py` tests create two daemon threads with `worker.heartbeat_loop` as their target and interval `0.1`; the first test explicitly does not join its infinite thread, and the second also leaves its thread running. The production loop is designed to run until process exit. These are test-created lingering heartbeat jobs, not leaked backfill owner jobs and not evidence of a new production transaction defect.
+
+A scratch-only diagnostic plugin records each thread's creation test, target, arguments, current test identity, connection creator thread/ID, database path and stack. The ordered baseline replay records **14 foreign tracked connections**. Both thread origins are the two heartbeat tests. During `test_universe_or_metadata_flock_timeout_is_retryable[universe]`, their connections still target their own earlier heartbeat-test databases, and the stacks pass through `worker.py:389` into the current coordination fixture's tracked connection factory. The original shared `time.sleep` replacement also reaches their `worker.py:405` sleep. Thus unrelated close events enter the owner's exact event list, unrelated INSERT/commit operations violate the owner-lock assertions, and main-thread `assert_closed` encounters SQLite thread-affinity errors instead of a closed-connection result. The source loop's own `finally: conn.close()` remains present.
+
+Artifacts: `/home/hermes/.hermes/cache/scratch/coordination-thread-provenance.jsonl`, `coordination-provenance-red.txt`, `coordination-ordered-red.txt`, and `coordination-regressions-red.txt`. The plugin changes no ownership assertions. No thread-name, main-thread, database-path or event filtering is introduced into the fix.
+
+### Minimal test-only isolation and retained invariants
+
+- `owner_trace` replaces caller-module `sqlite3` and `time` bindings with stdlib-backed `SimpleNamespace` proxies. The actual stdlib modules and cached `sqlitedb` helper remain untouched. Borrowed cached connections remain native and usable after an owner closes its private connection.
+- The corporate worker owner performs a local `import sqlite3`, so a module binding alone cannot observe it. `corporate_trace` creates a `FunctionType` with the exact original code object and live worker globals, but function-local import builtins returning the scoped SQLite proxy. It does not rewrite source/code, replace `sys.modules`, globally patch imports, or route heartbeat imports through the observer. The original worker function and globals are restored by the fixture. Later preparation date/float patches still reach the live globals.
+- The dividend preparation test wraps `corporate.sqlite3.connect` instead of the shared stdlib function. Its complete-row preparation and exact event assertions remain unchanged.
+- Six new regression cases cover unrelated foreign SQL and sleep, unchanged stdlib function identities, borrowed cached-helper isolation, and all four actual universe/metadata owners running through `asyncio.to_thread`. Every owned thread is observed. Native `ProgrammingError` matching `closed` is checked inside the connection's creator thread; exact BEGIN/mutation/commit/release/close sequences and real saved rows remain asserted. The scoped owner sleep assertion still fails while its owner state is held.
+- Existing assertions in `connection_factory`, `assert_closed`, contention/error tests and exact owner event lists are not loosened, dropped or regex-relaxed. No skip, xfail or coverage exclusion is added.
+
+### RED/GREEN commands and results
+
+Use `PY=/home/hermes/algotrader/apps/api/.venv/bin/python` and `L=/home/hermes/.hermes/cache/scratch/task4_offline_pytest.py`, from the worktree's `apps/api`. The scratch baseline module is the complete `git show 6547319:apps/api/tests/test_daily_reference_writer_coordination.py` plus the new regression tests; the worktree is never reverted.
+
+```bash
+# Deterministic regression RED against the original fixture:
+"$PY" "$L" -q /home/hermes/.hermes/cache/scratch/coordination-fixture-red -k owner_trace
+# 2 failed, 4 passed, 234 deselected: foreign close event; foreign sleep assertion.
+
+# Minimal real prior-test prefix RED:
+"$PY" "$L" -q tests/cli/test_worker_heartbeat.py tests/test_daily_reference_writer_coordination.py \
+  -k 'heartbeat or flock_timeout_is_retryable or commit_failure_preserves_primary'
+# Before the fixture fix: 2 failed, 28 passed, 211 deselected.
+
+# Provenance replay of original fixture, with read-only diagnostic observations:
+PYTHONPATH=/home/hermes/.hermes/cache/scratch/coordination-fixture-red \
+  "$PY" "$L" -q -p diagnostic tests/cli/test_worker_heartbeat.py \
+  /home/hermes/.hermes/cache/scratch/coordination-fixture-red/test_daily_reference_writer_coordination.py \
+  -k 'heartbeat or flock_timeout_is_retryable or commit_failure_preserves_primary'
+# 7 failed, 23 passed, 212 deselected; both original failure mechanisms reproduced.
+
+# Intermediate GREEN for the complete coordination module plus real leaking prefix:
+"$PY" "$L" -q tests/cli/test_worker_heartbeat.py tests/test_daily_reference_writer_coordination.py
+# 241 passed, 2 installed-package warnings, before splitting SQL/sleep into two cases.
+
+# Final isolated full backend gate, including all six final regression cases:
+A=/home/hermes/.hermes/cache/scratch/coordination-final-full-gate
+bash "$A/isolated-suite.sh" preflight
+bash "$A/isolated-suite.sh" gate
+```
+
+The final launcher is a new copy of the parent's proven full-gate launcher with only its scratch base changed. `git archive 6547319` plus the single candidate test-file overlay supplies the code. The archive does not include ignored files or secrets. The launcher isolates mount/user/network/PID namespaces, masks `.hermes`, supplies separate HOME/data/tmp, mounts the existing venv read-only, and supplies existing cached coverage packages. Preflight passes with an empty IPv4 route table. It does not edit the previous gate's captured files or production paths.
+
+Final full-gate result: **exit 0; 1628 collected, 1619 passed, 8 existing sandbox skips, 1 existing non-strict XPASS, 0 failures, 0 errors; 47 warnings in 196.74 seconds**. The coordination module contributes **240 cases**. Coverage: **97.34% combined, 97.73% lines, 95.81% branches**, with the unchanged **95%** gate passing. The 8 sandbox skips and XPASS are not claimed as passed tests. The prior 2 heartbeat-thread exception warnings disappear; the other warnings remain existing SDK/package/limiter warnings. The real Task 5 started-FIGI settlement test also executes successfully in this full run.
+
+Final artifacts: `coordination-final-full-gate/{isolated-suite.sh,full-gate-output.txt,pytest.xml,coverage.json,.coverage}`. JUnit and coverage counts are parsed programmatically. The candidate test file is byte-identical to the archived overlay exercised by that gate. Scope for parent review is only this fixture-contamination finding; production contracts already reviewed remain unchanged. No push, merge, production job control or deployment was performed.

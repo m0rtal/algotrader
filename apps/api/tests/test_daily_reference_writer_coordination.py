@@ -12,7 +12,7 @@ import json
 import os
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 from pathlib import Path
 import socket
 import sqlite3
@@ -184,16 +184,21 @@ def owner_trace(coordinated_db, monkeypatch):
             assert not state["held"], "sleep inside owner lock"
             return real_sleep(seconds)
 
-        monkeypatch.setattr(time, "sleep", sleep)
+        # Patch caller bindings, never the process-wide stdlib modules. Prior
+        # heartbeat tests leave daemon threads using sqlite3/time via local imports.
+        time_proxy = SimpleNamespace(**{**vars(time), "sleep": sleep})
+        sqlite_proxy = SimpleNamespace(**{**vars(sqlite3), "connect": connection_factory(
+            real_connect, state, events, connections, **kwargs,
+        )})
+        for module in (universe, backfill, corporate, derive_splits, forward_adjustment):
+            monkeypatch.setattr(module, "sqlite3", sqlite_proxy, raising=False)
+            monkeypatch.setattr(module, "time", time_proxy, raising=False)
 
         def acquire(path, *, role, phase, **lock_kwargs):
             return observed_lock(path, role=role, phase=phase, state=state,
                                  events=events, **lock_kwargs)
         monkeypatch.setattr(universe, "writer_lock", acquire, raising=False)
         monkeypatch.setattr(backfill, "writer_lock", acquire, raising=False)
-        monkeypatch.setattr(sqlite3, "connect", connection_factory(
-            real_connect, state, events, connections, **kwargs,
-        ))
 
         class FixedDatetime(datetime):
             @classmethod
@@ -205,7 +210,7 @@ def owner_trace(coordinated_db, monkeypatch):
         monkeypatch.setattr(backfill, "datetime", FixedDatetime)
 
     yield state, events, connections, install
-    # sqlite3 is shared by owner modules and cached helpers. Undo first.
+    # Restore owner bindings before the existing cached-helper cleanup.
     monkeypatch.undo()
     sqlitedb.close_all()
 
@@ -299,6 +304,76 @@ def assert_busy(exc, db, role, phase, *, reason, timeout):
     assert exc.database_path == str(locks.writer_lock_path(db))[:-len(".writer.lock")]
     assert exc.lock_path == str(locks.writer_lock_path(db))
     assert exc.timeout_seconds == timeout
+
+
+@pytest.mark.parametrize("operation", ["sql", "sleep"])
+def test_owner_trace_does_not_capture_foreign_sql_or_sleep(coordinated_db, owner_trace, operation):
+    db, real_connect = coordinated_db
+    state, events, connections, install = owner_trace
+    real_sleep = time.sleep
+    install()
+    errors = []
+
+    def foreign_work():
+        try:
+            # Same database and different thread: scope is the caller, not path/thread.
+            if operation == "sql":
+                with closing(sqlite3.connect(db)) as con:
+                    assert con.execute("SELECT 1").fetchone() == (1,)
+            else:
+                time.sleep(0)
+        except BaseException as exc:
+            errors.append(exc)
+
+    state["held"] = operation == "sleep"
+    try:
+        thread = threading.Thread(target=foreign_work, name="foreign-sql")
+        thread.start()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    finally:
+        state["held"] = False
+    assert errors == []
+    assert events == [] and connections == []
+    assert sqlite3.connect is real_connect and time.sleep is real_sleep
+    state["held"] = True
+    try:
+        with pytest.raises(AssertionError, match="sleep inside owner lock"):
+            backfill.time.sleep(0)
+    finally:
+        state["held"] = False
+    cached = sqlitedb.get_connection(db)
+    assert cached.execute("SELECT 1").fetchone()[0] == 1
+    assert events == [] and connections == []
+    invoke_owner("universe", db)
+    assert events == [("acquire", "universe-sync", "instruments"), ("BEGIN",),
+                      ("INSERT",), ("commit",), ("release", "universe-sync", "instruments"), ("close",)]
+    assert_closed(connections)
+    assert cached.execute("SELECT 1").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("owner,role,phase", OWNER_CASES)
+@pytest.mark.asyncio
+async def test_owner_trace_captures_to_thread_owner_and_native_cleanup(
+    coordinated_db, owner_trace, owner, role, phase,
+):
+    db, real_connect = coordinated_db
+    _, events, connections, install = owner_trace
+    prepare_metadata_update(db, real_connect, owner)
+    install()
+    creator_threads = []
+
+    def own_work():
+        creator_threads.append(threading.get_ident())
+        invoke_owner(owner, db)
+        assert len(connections) == 1
+        assert_closed(connections)  # Native closed check in the SQLite creator thread.
+
+    await asyncio.to_thread(own_work)
+    assert creator_threads != [threading.get_ident()]
+    assert events == [("acquire", role, phase), ("BEGIN",), ("INSERT",),
+                      ("commit",), ("release", role, phase), ("close",)]
+    assert_saved(owner, db, real_connect)
 
 
 @pytest.mark.parametrize("owner,role,phase", OWNER_CASES)
@@ -804,6 +879,7 @@ def corporate_trace(corporate_db, owner_trace, monkeypatch):
     db, _ = corporate_db
     state, events, connections, base_install = owner_trace
     worker = importlib.import_module("worker")
+    original_step = worker._step_corporate_actions
     probe_preparation = False
 
     @contextmanager
@@ -840,6 +916,21 @@ def corporate_trace(corporate_db, owner_trace, monkeypatch):
         # A deliberately held competing writer may coexist with preparation reads.
         probe_preparation = probe_reads
         base_install(sql_observer=observe_sql, **kwargs)
+        # This owner imports sqlite3 inside its body. Give only this function
+        # scoped import builtins; execute its unchanged code with live worker globals.
+        sqlite_proxy = corporate.sqlite3
+        real_import = original_step.__builtins__["__import__"]
+
+        def scoped_import(name, *args, **kwargs):
+            if name == "sqlite3":
+                return sqlite_proxy
+            return real_import(name, *args, **kwargs)
+
+        with monkeypatch.context() as patcher:
+            patcher.setitem(worker.__dict__, "__builtins__",
+                            {**original_step.__builtins__, "__import__": scoped_import})
+            step = FunctionType(original_step.__code__, worker.__dict__, original_step.__name__)
+        monkeypatch.setattr(worker, "_step_corporate_actions", step)
         monkeypatch.setattr(corporate, "writer_lock", acquire, raising=False)
         monkeypatch.setattr(worker, "writer_lock", acquire, raising=False)
         if not real_derivation:
@@ -1467,7 +1558,7 @@ def test_dividend_merge_prepares_all_22_fields_before_connection_and_acquisition
     ]
     events.clear()  # __post_init__ validates identity before merge preparation.
     install()
-    tracked_connect = sqlite3.connect
+    tracked_connect = corporate.sqlite3.connect
     prepared_events = [("parameter", name) for name in DIVIDEND_FIELDS] * 2
 
     def connect(*args, **kwargs):
@@ -1475,7 +1566,7 @@ def test_dividend_merge_prepares_all_22_fields_before_connection_and_acquisition
         events.append(("open",))
         return tracked_connect(*args, **kwargs)
 
-    monkeypatch.setattr(sqlite3, "connect", connect)
+    monkeypatch.setattr(corporate.sqlite3, "connect", connect)
     assert corporate.merge_into_dividends(db, rows) == 2
     assert events == [*prepared_events, ("open",), *dividend_transaction_events(inserts=2)]
     assert snapshot(db, real_connect) == {
