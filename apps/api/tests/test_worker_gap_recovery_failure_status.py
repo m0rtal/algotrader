@@ -257,12 +257,14 @@ def test_historical_and_trailing_share_loop(offline):
     assert_closed(e)
 
 
-def test_historical_error_event_is_not_trailing_failure(offline):
+def test_historical_error_event_fails_phase_and_continues_trailing(offline):
     e = offline
     seed(e, "A", dates=("2026-09-16", "2026-09-18"),
          answers=(RuntimeError("offline historical failure"), []))
     ok, detail = e.worker._step_gap_recovery(e.db)
-    assert ok is True and "failed=0" in detail
+    assert ok is False and "failed=1" in detail
+    assert len(e.broker.calls) == 2
+    assert [call["figi"] for call in e.broker.calls] == ["A", "A"]
     assert any(t == "ticker_progress" and p.get("status") == "error" for t, p in e.events)
     assert_closed(e)
 
