@@ -25,6 +25,7 @@ import fcntl
 import math
 import os
 import re
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -128,6 +129,16 @@ class WriterLockBusy(WriterLockError):
             f"writer lock busy: role={self.role} phase={self.phase} "
             f"reason={self.reason}"
         )
+
+
+def is_sqlite_busy(exc: BaseException) -> bool:
+    """Recognize numeric SQLite BUSY, including extended BUSY codes only."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    return (
+        isinstance(exc, sqlite3.OperationalError)
+        and isinstance(code, int)
+        and (code & 255) == sqlite3.SQLITE_BUSY
+    )
 
 
 class WriterLockReentrant(WriterLockError):
