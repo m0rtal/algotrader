@@ -477,3 +477,17 @@ def test_format_busy_defer_no_payload_or_extra_attrs(tmp_path):
     # No reserved markers that an injection could carry.
     assert "payload" not in line.lower()
     assert "bearer" not in line.lower()
+
+
+@pytest.mark.parametrize("phase", ["instruments", "metadata"])
+def test_metadata_defer_ignores_raw_failure_payload(tmp_path, phase):
+    exc = _busy(str(tmp_path / "state.db"), str(tmp_path / "state.db.writer.lock"),
+                role="backfill-metadata", phase=phase)
+    exc.args = ("RAW-FIXTURE-PAYLOAD",)
+    exc.__cause__ = RuntimeError("RAW-FIXTURE-PAYLOAD")
+    line = format_busy_defer(exc)
+    assert "RAW-FIXTURE-PAYLOAD" not in line
+    assert len(line.splitlines()) == 1
+    assert line == (f"DEFER writer-lock-busy role=backfill-metadata phase={phase} pid={os.getpid()} "
+                    f"database_path={tmp_path / 'state.db'} lock_path={tmp_path / 'state.db.writer.lock'} "
+                    "timeout=1.5s reason=flock-timeout result=deferred")

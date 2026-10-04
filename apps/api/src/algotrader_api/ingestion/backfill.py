@@ -42,7 +42,7 @@ from typing import Any, Awaitable, Callable, Iterable
 from ..observability.logging import get_logger
 from .closed_candles import is_closed_candle
 from .no_trade_evidence import MOEXFetchOutcome  # noqa: F401  (re-exported)
-from .writer_lock import WriterLockBusy, is_sqlite_busy, writer_lock, writer_lock_path
+from .writer_lock import WriterLockBusy, format_busy_defer, is_sqlite_busy, writer_lock, writer_lock_path
 # Imported lazily inside the call sites that need it; this keeps the
 # module-level import surface minimal — `_backfill_one_moex` is the
 # only path that calls ``fetch_issuer_identity`` directly (the other
@@ -1215,7 +1215,15 @@ class BackfillRunner:
                     "status",
                     {"state": self.state.value, "tickers_total": total},
                 )
-            except Exception as e:  # pragma: no cover — universe discovery failure only fires during live broker run
+            except Exception as e:
+                if isinstance(e, WriterLockBusy) and e.role == "backfill-metadata":
+                    with self._lock:
+                        self.state = BackfillState.IDLE
+                    await self._emit("done", {
+                        "tickers_done": 0, "tickers_total": 0, "status": "error",
+                        "detail": format_busy_defer(e),
+                    })
+                    raise
                 await self._log("error", figi=None, message=f"universe discovery failed: {e}")
                 await self._emit("done", {"tickers_done": 0, "tickers_total": 0, "status": "error"})
                 with self._lock:
@@ -1252,7 +1260,7 @@ class BackfillRunner:
         parallel_limit = 10
         sem = asyncio.Semaphore(parallel_limit)
 
-        async def _backfill_one_bounded(inst: dict) -> tuple[str, int, str | None]:
+        async def _backfill_one_bounded(inst: dict) -> tuple[str, int, str | WriterLockBusy | None]:
             """Run _backfill_one inside the semaphore. Returns (figi, bars, err)."""
             figi = inst["figi"]
             ticker = inst.get("ticker")
@@ -1284,6 +1292,8 @@ class BackfillRunner:
                     )
                     return (figi, bars, None)
                 except Exception as e:  # noqa: BLE001
+                    if isinstance(e, WriterLockBusy) and e.role == "backfill-metadata":
+                        return (figi, 0, e)
                     await self._log("error", figi=figi, message=f"unhandled: {e}")
                     return (figi, 0, str(e))
 
@@ -1291,9 +1301,23 @@ class BackfillRunner:
             *[_backfill_one_bounded(inst) for inst in instruments],
             return_exceptions=False,
         )
+        metadata_busy = None
         for figi, bars, _err in results:
+            if isinstance(_err, WriterLockBusy) and _err.role == "backfill-metadata":
+                if metadata_busy is None:
+                    metadata_busy = _err
+                continue
             self.tickers_done += 1
             self.total_bars += bars
+        if metadata_busy is not None:
+            with self._lock:
+                self.state = BackfillState.IDLE
+            await self._emit("done", {
+                "tickers_done": self.tickers_done, "tickers_total": self.tickers_total,
+                "total_bars": self.total_bars, "status": "error",
+                "detail": format_busy_defer(metadata_busy),
+            })
+            raise metadata_busy
 
         # Step 3: finished.
         final_state = BackfillState.DONE

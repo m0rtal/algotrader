@@ -882,6 +882,38 @@ def test_admin_data_pipeline_status_endpoint(tmp_path, monkeypatch):
     assert out["last_run"]["phases"] == []
 
 
+@pytest.mark.parametrize("phase,role,owner_phase,subset", [
+    ("universe_sync", "universe-sync", "instruments", "first"),
+    ("corporate_actions", "corporate-actions", "corporate-actions", "derived"),
+    ("dividends", "dividends", "dividends", "derived"),
+])
+def test_chain_records_defer_without_changing_critical_policy(
+    fresh_db, monkeypatch, phase, role, owner_phase, subset,
+):
+    from algotrader_api.ingestion.writer_lock import WriterLockBusy, format_busy_defer, writer_lock_path
+
+    exc = WriterLockBusy(role=role, phase=owner_phase, database_path=fresh_db,
+                         lock_path=str(writer_lock_path(fresh_db)), timeout_seconds=0.03,
+                         reason="flock-timeout")
+    detail = format_busy_defer(exc)
+    worker, calls = _patch_all_steps(monkeypatch, results={phase: detail, f"{phase}._ok": False})
+    monkeypatch.setattr(worker, "get_settings", lambda: type("S", (), {
+        "sqlite_path": fresh_db, "log_level": "INFO",
+    })())
+    assert worker.run_daily_chain(subset=subset) == 1
+    con = sqlite3.connect(fresh_db)
+    try:
+        rows = con.execute("SELECT phase, result, detail FROM pipeline_log ORDER BY id").fetchall()
+    finally:
+        con.close()
+    assert [row for row in rows if row[0] == phase] == [(phase, "error", detail)]
+    phases = [name for name, _ in calls]
+    if phase == "universe_sync":
+        assert phases == ["migrations", "universe_sync"]
+    else:
+        assert phases == ["corporate_actions", "dividends", "freshness_check", "guardian"]
+
+
 def test_admin_data_pipeline_status_with_log(tmp_path, monkeypatch):
     """Endpoint surfaces pipeline_log rows when present."""
     monkeypatch.setenv("ALGOTRADER_DATA_DIR", str(tmp_path))

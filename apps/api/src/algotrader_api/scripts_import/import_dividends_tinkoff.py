@@ -17,6 +17,7 @@ from datetime import date, datetime, timezone, timedelta
 from typing import Any, Protocol
 
 from algotrader_api.ingestion.retry import _is_rate_limit_error
+from algotrader_api.ingestion.writer_lock import WriterLockBusy, format_busy_defer
 from algotrader_api.observability.logging import get_logger
 from algotrader_api.scripts_import.import_corporate_actions_common import (
     DividendRow,
@@ -287,7 +288,11 @@ def main() -> int:  # pragma: no cover
         print("ERROR: no broker_token in secrets", file=sys.stderr)
         return 2
     client = real_client.RealTinkoffClient(token=row[0])
-    written, _queued = fetch_and_persist(args.db_path, client=client)
+    try:
+        written, _queued = fetch_and_persist(args.db_path, client=client)
+    except WriterLockBusy as exc:
+        print(format_busy_defer(exc), file=sys.stderr)
+        return 75
     print(f"Wrote {written} dividend rows")
     return 0
 

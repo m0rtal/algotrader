@@ -65,6 +65,7 @@ OUT_OF_SCOPE_MODULES = [
 
 NON_OWNING_FUNCTIONS = {
     "discover_universe": _INGEST / "universe.py",
+    "main": _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py",
     "fetch_and_persist": _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py",
     "fetch_and_persist._run": _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py",
     "_list_tradeable_figis": _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py",
@@ -84,6 +85,10 @@ NON_OWNING_FUNCTIONS = {
     "BackfillRunner._log": _INGEST / "backfill.py",
     "BackfillRunner._emit": _INGEST / "backfill.py",
     "BackfillRunner._discover_universe": _INGEST / "backfill.py",
+    "BackfillRunner.run": _INGEST / "backfill.py",
+    "BackfillRunner.run._backfill_one_bounded": _INGEST / "backfill.py",
+    "run_worker": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "_step_gap_recovery": _REPO_ROOT / "apps" / "api" / "worker.py",
     "_tinkoff_breaker_record_failure": _INGEST / "backfill.py",
     "_tinkoff_breaker_record_success": _INGEST / "backfill.py",
 }

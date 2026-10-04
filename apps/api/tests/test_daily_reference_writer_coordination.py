@@ -4,8 +4,12 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, datetime, timezone
+import asyncio
 import importlib
+import importlib.util
 import fcntl
+import sys
+from types import SimpleNamespace
 from pathlib import Path
 import socket
 import sqlite3
@@ -123,6 +127,7 @@ OWNER_CASES = [
 
 @pytest.fixture(autouse=True)
 def deny_outbound_network(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent.parent))
     real_connect = socket.socket.connect
     real_connect_ex = socket.socket.connect_ex
 
@@ -1734,3 +1739,850 @@ def test_dividend_merge_constructs_pk_parameter_tuple_before_acquisition(coordin
     }
     assert_closed(connections)
     assert_unlocked(db, state)
+
+
+# Task 5: adapters exercise real owners; only external broker I/O is offline.
+class OfflineBroker:
+    def __init__(self, *, shares=None, candles=None):
+        self.shares = [BROKER_ROW] if shares is None else shares
+        self.candles = candles or {}
+        self.candle_calls = []
+        self.dividend_calls = []
+        self.closed = False
+        self.active = set()
+
+    async def get_shares(self):
+        assert not self.closed
+        return self.shares
+
+    async def get_bonds(self):
+        return []
+
+    async def get_etfs(self):
+        return []
+
+    async def get_futures(self):
+        raise AssertionError("non-tradeable-fetch")
+
+    async def get_options(self):
+        raise AssertionError("non-tradeable-fetch")
+
+    async def get_candles(self, *, figi, date_from, date_to, interval):
+        assert not self.closed
+        assert interval == "CANDLE_INTERVAL_DAY"
+        self.candle_calls.append((figi, date_from, date_to, interval))
+        self.active.add(asyncio.current_task())
+        try:
+            await asyncio.sleep(0)
+            assert not self.closed
+            return [row for row in self.candles.get(figi, [])
+                    if date_from <= date.fromisoformat(row["ts"]) <= date_to]
+        finally:
+            self.active.remove(asyncio.current_task())
+
+    async def get_dividends(self, figi, from_, to):
+        assert not self.closed and from_ <= to
+        self.dividend_calls.append(figi)
+        return [{"ex_date": "2024-06-15", "amount_per_share": 10.0, "currency": "rub"}]
+
+    async def __aenter__(self):
+        assert not self.closed
+        return self
+
+    async def __aexit__(self, *args):
+        await self.aclose()
+
+    async def aclose(self):
+        assert not self.active, "client closed before started broker jobs settled"
+        self.closed = True
+
+
+class TestLog:
+    __test__ = False
+
+    def __init__(self):
+        self.rows = []
+
+    def info(self, event, **fields):
+        self.rows.append((event, fields))
+
+    warning = warn = error = info
+
+
+@pytest.fixture
+def adapter_env(coordinated_db, monkeypatch):
+    db, real_connect = coordinated_db
+    worker = importlib.import_module("worker")
+    dividends = importlib.import_module("algotrader_api.scripts_import.import_dividends_tinkoff")
+    log, busy, lock_entries = TestLog(), [], []
+
+    @contextmanager
+    def acquire(path, *, role, phase, **kwargs):
+        try:
+            with locks.writer_lock(path, role=role, phase=phase, timeout_seconds=0.03):
+                lock_entries.append((role, phase))
+                yield
+        except locks.WriterLockBusy as exc:
+            busy.append(exc)
+            raise
+
+    for module in (universe, backfill, corporate, worker):
+        monkeypatch.setattr(module, "writer_lock", acquire)
+    monkeypatch.setattr(worker, "setup_logging", lambda **kwargs: None)
+    monkeypatch.setattr(worker, "heartbeat_loop", lambda *args: None)
+    monkeypatch.setattr(worker, "get_settings", lambda: SimpleNamespace(
+        sqlite_path=db, log_level="INFO", history_years=1,
+    ))
+    monkeypatch.setattr(worker, "logger", log)
+    monkeypatch.setattr(backfill, "logger", log)
+    monkeypatch.setattr(dividends, "_LOG", log)
+    monkeypatch.setenv("ALGOTRADER_INGEST_FAKE", "1")
+    monkeypatch.setattr(dividends._rl, "_GLOBAL", dividends._rl.RateLimiter())
+
+    class FixedAdjustmentTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return FIXED_NOW
+
+    monkeypatch.setattr(forward_adjustment, "datetime", FixedAdjustmentTime)
+    return SimpleNamespace(db=db, real_connect=real_connect, worker=worker,
+                           dividends=dividends, log=log, busy=busy,
+                           acquire=acquire, lock_entries=lock_entries)
+
+
+@contextmanager
+def adapter_contention(env, monkeypatch, kind):
+    if kind == "flock":
+        with open(locks.writer_lock_path(env.db), "a+b") as descriptor:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+        return
+    assert kind == "sqlite"
+    # Real SQLite writer deliberately bypasses flock. Timeout is test-only.
+    blocker = env.real_connect(env.db)
+    blocker.execute("BEGIN IMMEDIATE")
+
+    def connect(database, *args, **kwargs):
+        kwargs["timeout"] = 0.03
+        return env.real_connect(database, *args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patcher:
+            patcher.setattr(sqlite3, "connect", connect)
+            yield
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
+def assert_adapter_defer(detail, exc, env, role, phase, kind):
+    reason, timeout = ("sqlite-busy", 30.0) if kind == "sqlite" else ("flock-timeout", 0.03)
+    assert_busy(exc, env.db, role, phase, reason=reason, timeout=timeout)
+    assert detail == locks.format_busy_defer(exc)
+    assert detail.startswith(f"DEFER writer-lock-busy role={role} phase={phase} ")
+    assert len(detail.splitlines()) == 1
+    for field in ("pid=", "database_path=", "lock_path=", "timeout=", "reason=", "result=deferred"):
+        assert field in detail
+    assert "RAW-FIXTURE-PAYLOAD" not in detail
+    if kind == "sqlite":
+        assert exc.__cause__.sqlite_errorcode == sqlite3.SQLITE_BUSY
+
+
+@pytest.mark.parametrize("phase,role,owner_phase", [
+    ("universe_sync", "universe-sync", "instruments"),
+    ("corporate_actions", "corporate-actions", "corporate-actions"),
+    ("dividends", "dividends", "dividends"),
+])
+@pytest.mark.parametrize("kind", ["flock", "sqlite"])
+def test_daily_actual_reference_step_defer_and_retry(
+    corporate_db, adapter_env, monkeypatch, phase, role, owner_phase, kind,
+):
+    env = adapter_env
+    clients = []
+
+    def make_client(*, sqlite_path):
+        assert sqlite_path == env.db
+        monkeypatch.setattr(env.dividends._rl, "_GLOBAL", env.dividends._rl.RateLimiter())
+        broker = OfflineBroker()
+        clients.append(broker)
+        return broker
+
+    monkeypatch.setattr(env.worker.client_mod, "make_client", make_client)
+    step = getattr(env.worker, f"_step_{phase}")
+    before = snapshot(env.db, env.real_connect)
+    with adapter_contention(env, monkeypatch, kind):
+        ok, detail = step(env.db)
+    assert ok is False
+    assert len(env.busy) == 1
+    assert_adapter_defer(detail, env.busy[0], env, role, owner_phase, kind)
+    assert snapshot(env.db, env.real_connect) == before
+    if phase == "dividends":
+        assert clients[0].closed
+        assert clients[0].dividend_calls == ["FCOORD"]
+    assert step(env.db)[0] is True
+    saved = snapshot(env.db, env.real_connect)
+    assert step(env.db)[0] is True  # zero new rows / existing PKs are success
+    repeated = snapshot(env.db, env.real_connect)
+    assert repeated == saved
+    assert saved["bars"] == before["bars"]
+    if phase == "corporate_actions":
+        assert_adjustment_saved(env.db, env.real_connect)
+    elif phase == "dividends":
+        assert len(saved["dividends"]) == 1
+    else:
+        assert saved["instruments"][0][3] == "Updated"
+
+
+def load_derivation_cli():
+    path = Path(__file__).resolve().parent.parent / "scripts" / "derive_splits.py"
+    spec = importlib.util.spec_from_file_location("task5_derive_cli", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("kind", ["flock", "sqlite"])
+def test_actual_derivation_cli_busy_rc75_and_retry(
+    corporate_db, adapter_env, monkeypatch, capsys, kind,
+):
+    env = adapter_env
+    cli = load_derivation_cli()
+    monkeypatch.setattr(sys, "argv", ["derive_splits.py", env.db, "--no-face-value"])
+    before = snapshot(env.db, env.real_connect)
+    with adapter_contention(env, monkeypatch, kind):
+        rc = cli.main()
+    assert rc == 75
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == locks.format_busy_defer(env.busy[0]) + "\n"
+    assert_adapter_defer(captured.err.rstrip("\n"), env.busy[0], env,
+                         "corporate-actions", "corporate-actions", kind)
+    assert snapshot(env.db, env.real_connect) == before
+    assert cli.main() == 0
+    assert capsys.readouterr().out == "Wrote 1 split rows.\n"
+    saved = snapshot(env.db, env.real_connect)
+    assert cli.main() == 0
+    assert capsys.readouterr().out == "Wrote 0 split rows.\n"
+    assert snapshot(env.db, env.real_connect) == saved
+
+
+@pytest.mark.parametrize("kind", ["flock", "sqlite"])
+def test_actual_dividend_cli_busy_rc75_and_retry(adapter_env, monkeypatch, capsys, kind):
+    from algotrader_api.ingestion import real_client
+
+    env = adapter_env
+    con = env.real_connect(env.db)
+    try:
+        con.execute("INSERT OR REPLACE INTO secrets (key, value) VALUES ('broker_token', 'offline-test-sentinel')")
+        con.execute("INSERT INTO dividends_throttle_pending VALUES ('FCOORD', 'first', 'last', 3)")
+        con.commit()
+    finally:
+        con.close()
+    clients = []
+
+    def make_client(*, token):
+        assert token == "offline-test-sentinel"
+        monkeypatch.setattr(env.dividends._rl, "_GLOBAL", env.dividends._rl.RateLimiter())
+        broker = OfflineBroker()
+        clients.append(broker)
+        return broker
+
+    monkeypatch.setattr(real_client, "RealTinkoffClient", make_client)
+    monkeypatch.setattr(sys, "argv", ["import_dividends_tinkoff", env.db])
+    before = snapshot(env.db, env.real_connect)
+    with adapter_contention(env, monkeypatch, kind):
+        rc = env.dividends.main()
+    assert rc == 75
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == locks.format_busy_defer(env.busy[0]) + "\n"
+    assert_adapter_defer(captured.err.rstrip("\n"), env.busy[0], env, "dividends", "dividends", kind)
+    assert snapshot(env.db, env.real_connect) == before
+    assert clients[0].closed
+    con = env.real_connect(env.db)
+    try:
+        assert con.execute("SELECT * FROM dividends_throttle_pending").fetchall() == [
+            ("FCOORD", "first", "last", 3),
+        ]  # failed merge must not reach successful dequeue
+    finally:
+        con.close()
+    assert env.dividends.main() == 0
+    assert capsys.readouterr().out == "Wrote 1 dividend rows\n"
+    saved = snapshot(env.db, env.real_connect)
+    assert env.dividends.main() == 0
+    assert capsys.readouterr().out == "Wrote 0 dividend rows\n"
+    assert snapshot(env.db, env.real_connect) == saved
+    con = env.real_connect(env.db)
+    try:
+        assert con.execute("SELECT * FROM dividends_throttle_pending").fetchall() == []
+    finally:
+        con.close()
+    assert all(client.closed for client in clients)
+
+
+@pytest.fixture
+def pending_runner(adapter_env, monkeypatch):
+    env = adapter_env
+    con = env.real_connect(env.db)
+    try:
+        con.execute("INSERT INTO instrument_metadata "
+                    "(figi, last_bar_ts, total_bars, last_run_status) "
+                    "VALUES ('FCOORD', '2024-05-15', 1, 'pending')")
+        con.commit()
+    finally:
+        con.close()
+
+    class FrozenRunnerDate(date):
+        @classmethod
+        def today(cls):
+            return date(2024, 5, 17)
+
+    monkeypatch.setattr(backfill, "date", FrozenRunnerDate)
+    return env
+
+
+@contextmanager
+def metadata_kernel_contention(env, monkeypatch, phase):
+    # Arm a real independent flock only when the selected metadata owner is reached.
+    with open(locks.writer_lock_path(env.db), "a+b") as descriptor:
+        def acquire(path, *, role, phase: str, **kwargs):
+            if role == "backfill-metadata" and phase == target_phase:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return env.acquire(path, role=role, phase=phase, **kwargs)
+
+        target_phase = phase
+        with monkeypatch.context() as patcher:
+            patcher.setattr(backfill, "writer_lock", acquire)
+            yield
+
+
+def adapter_injected_busy(env, *, role="backfill-metadata", phase="metadata"):
+    exc = locks.WriterLockBusy(role=role, phase=phase, database_path=env.db,
+                              lock_path=str(locks.writer_lock_path(env.db)),
+                              timeout_seconds=0.03, reason="flock-timeout")
+    # Adapter injection, not live contention. Raw failure payload must not leak.
+    exc.args = ("RAW-FIXTURE-PAYLOAD",)
+    return exc
+
+
+def collect_runner(env, client):
+    events = []
+
+    async def collect(event):
+        events.append(event)
+
+    return backfill.BackfillRunner(client=client, db_path=env.db, event_sink=collect), events
+
+
+def assert_run_deferred(runner, events, exc, *, done, total, bars=0):
+    assert runner.state == backfill.BackfillState.IDLE
+    assert (runner.tickers_done, runner.tickers_total, runner.total_bars) == (done, total, bars)
+    assert [event.payload for event in events if event.type == "done"] == [{
+        "tickers_done": done, "tickers_total": total, "status": "error",
+        **({"total_bars": bars} if total else {}), "detail": locks.format_busy_defer(exc),
+    }]
+
+
+@pytest.mark.parametrize("phase", ["instruments", "metadata"])
+@pytest.mark.asyncio
+async def test_run_discovery_metadata_busy_propagates(adapter_env, monkeypatch, phase):
+    env = adapter_env
+    client = OfflineBroker()
+    runner, events = collect_runner(env, client)
+    before = snapshot(env.db, env.real_connect)
+    with metadata_kernel_contention(env, monkeypatch, phase):
+        with pytest.raises(locks.WriterLockBusy) as caught:
+            await runner.run(history_years=1)
+    assert caught.value is env.busy[0]
+    assert_adapter_defer(locks.format_busy_defer(caught.value), caught.value, env,
+                         "backfill-metadata", phase, "flock")
+    assert_run_deferred(runner, events, caught.value, done=0, total=0)
+    after = snapshot(env.db, env.real_connect)
+    assert after["instrument_metadata"] == before["instrument_metadata"]
+    assert after["bars"] == before["bars"]
+    # Instrument UPSERT commits before the seed owner in the metadata case.
+    assert after["instruments"][0][3] == ("Original" if phase == "instruments" else "Updated")
+    await runner.run(history_years=1)
+    assert [event.payload["status"] for event in events if event.type == "done"] == ["error", "ok"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_run_ticker_metadata_busy_not_done_ok(pending_runner, monkeypatch):
+    env = pending_runner
+    client = OfflineBroker()
+    runner, events = collect_runner(env, client)
+    before = snapshot(env.db, env.real_connect)
+    with metadata_kernel_contention(env, monkeypatch, "metadata"):
+        with pytest.raises(locks.WriterLockBusy) as caught:
+            await runner.run(history_years=1, incremental_threshold_days=2,
+                             source="tinkoff", limit_to=["FCOORD"])
+    assert caught.value is env.busy[0]
+    assert client.candle_calls == [("FCOORD", date(2024, 5, 16), date(2024, 5, 17), "CANDLE_INTERVAL_DAY")]
+    assert_run_deferred(runner, events, caught.value, done=0, total=1)
+    assert snapshot(env.db, env.real_connect) == before
+    await runner.run(history_years=1, source="tinkoff", limit_to=["FCOORD"])
+    assert events[-1].payload["status"] == "ok"
+    assert runner.tickers_done == 1
+    await client.aclose()
+
+
+VALID_CANDLE = {"ts": "2024-05-16", "open": 51.0, "high": 52.0, "low": 49.0,
+                "close": 50.0, "volume": 100, "is_complete": True}
+
+
+@pytest.mark.asyncio
+async def test_run_ticker_post_bar_metadata_acquisition_injection(pending_runner, monkeypatch):
+    env = pending_runner
+    client = OfflineBroker(candles={"FCOORD": [VALID_CANDLE]})
+    runner, events = collect_runner(env, client)
+    before = snapshot(env.db, env.real_connect)
+    exc = adapter_injected_busy(env)
+    at_acquisition = []
+
+    def acquire(path, *, role, phase, **kwargs):
+        assert (role, phase) == ("backfill-metadata", "metadata")
+        at_acquisition.extend(snapshot(env.db, env.real_connect)["instrument_metadata"])
+        raise exc  # post-bar-commit metadata acquisition adapter injection
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(backfill, "writer_lock", acquire)
+        with pytest.raises(locks.WriterLockBusy) as caught:
+            await runner.run(history_years=1, incremental_threshold_days=2,
+                             source="tinkoff", limit_to=["FCOORD"])
+    assert caught.value is exc
+    assert_run_deferred(runner, events, exc, done=0, total=1)
+    after = snapshot(env.db, env.real_connect)
+    # The real bar writer already commits aggregate/status metadata. The rejected
+    # explicit metadata owner must leave that acquisition-time state untouched.
+    assert after["instrument_metadata"] == at_acquisition
+    assert at_acquisition[0][2] == before["instrument_metadata"][0][2] is None  # last_backfilled_at
+    con = env.real_connect(env.db)
+    try:
+        assert con.execute("SELECT ts, close FROM bars WHERE figi='FCOORD' ORDER BY ts").fetchall() == [
+            ("2024-05-15", 50.0), ("2024-05-16", 50.0),
+        ]
+    finally:
+        con.close()
+    assert "RAW-FIXTURE-PAYLOAD" not in str([event.payload for event in events])
+    assert "RAW-FIXTURE-PAYLOAD" not in str(after["ingestion_logs"])
+    await runner.run(history_years=1, source="tinkoff", limit_to=["FCOORD"])
+    assert events[-1].payload["status"] == "ok"
+    assert snapshot(env.db, env.real_connect)["bars"] == after["bars"]
+    metadata = runner._get_metadata("FCOORD")
+    assert metadata is not None and metadata["last_run_status"] == "ok"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_run_metadata_busy_waits_for_other_started_figi(pending_runner, monkeypatch):
+    env = pending_runner
+    con = env.real_connect(env.db)
+    try:
+        con.execute("INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+                    "VALUES ('SETTLE', 'FSETTLE', 'share', 'Settle', 'RUB', 1)")
+        con.execute("INSERT INTO instrument_metadata "
+                    "(figi, last_bar_ts, total_bars, last_run_status) "
+                    "VALUES ('FSETTLE', '2024-05-15', 1, 'pending')")
+        con.commit()
+    finally:
+        con.close()
+    started, failed = asyncio.Event(), asyncio.Event()
+
+    class WaitingBroker(OfflineBroker):
+        async def get_candles(self, *, figi, date_from, date_to, interval):
+            assert not self.closed and interval == "CANDLE_INTERVAL_DAY"
+            assert (date_from, date_to) == (date(2024, 5, 16), date(2024, 5, 17))
+            task = asyncio.current_task()
+            self.active.add(task)
+            self.candle_calls.append((figi, date_from, date_to, interval))
+            try:
+                if figi == "FCOORD":
+                    await asyncio.wait_for(started.wait(), timeout=1)
+                else:
+                    assert figi == "FSETTLE"
+                    started.set()
+                    await asyncio.wait_for(failed.wait(), timeout=1)
+                    await asyncio.sleep(0)
+                assert not self.closed
+                return [VALID_CANDLE]
+            finally:
+                self.active.remove(task)
+
+    client = WaitingBroker()
+    runner, events = collect_runner(env, client)
+    before = snapshot(env.db, env.real_connect)
+    exc = adapter_injected_busy(env)
+    at_acquisition = []
+
+    def acquire(path, *, role, phase, **kwargs):
+        if not failed.is_set():
+            at_acquisition.extend(row for row in snapshot(env.db, env.real_connect)["instrument_metadata"]
+                                  if row[0] == "FCOORD")
+            assert client.active, "second broker job must have started before metadata failure"
+            failed.set()
+            raise exc  # acquisition-only adapter injection after first FIGI's bar commit
+        return env.acquire(path, role=role, phase=phase, **kwargs)
+
+    jobs_before = set(asyncio.all_tasks())
+    with monkeypatch.context() as patcher:
+        patcher.setattr(backfill, "writer_lock", acquire)
+        try:
+            with pytest.raises(locks.WriterLockBusy) as caught:
+                await asyncio.wait_for(runner.run(history_years=1, source="tinkoff",
+                    limit_to=["FCOORD", "FSETTLE"]), timeout=2)
+        finally:
+            await client.aclose()
+    assert caught.value is exc
+    assert client.closed and not client.active
+    assert not (set(asyncio.all_tasks()) - jobs_before), "runner left background jobs pending"
+    assert_run_deferred(runner, events, exc, done=1, total=2, bars=1)
+    after = snapshot(env.db, env.real_connect)
+    assert [row for row in after["instrument_metadata"] if row[0] == "FCOORD"] == at_acquisition
+    assert at_acquisition[0][2] == before["instrument_metadata"][0][2] is None
+    metadata = runner._get_metadata("FSETTLE")
+    assert metadata is not None and metadata["last_run_status"] == "ok"
+    con = env.real_connect(env.db)
+    try:
+        assert con.execute("SELECT figi, ts, close FROM bars ORDER BY figi, ts").fetchall() == [
+            ("FCOORD", "2024-05-15", 50.0), ("FCOORD", "2024-05-16", 50.0),
+            ("FSETTLE", "2024-05-16", 50.0),
+        ]
+    finally:
+        con.close()
+    runner.client = OfflineBroker(candles={"FCOORD": [VALID_CANDLE], "FSETTLE": [VALID_CANDLE]})
+    await runner.run(history_years=1, source="tinkoff", limit_to=["FCOORD", "FSETTLE"])
+    assert events[-1].payload["status"] == "ok" and runner.tickers_done == 2
+    assert snapshot(env.db, env.real_connect)["bars"] == after["bars"]
+    await runner.client.aclose()
+
+
+@pytest.mark.parametrize("mode", ["scheduled", "manual"])
+@pytest.mark.parametrize("case", ["discovery-instruments", "discovery-seed", "ticker-empty", "ticker-bars"])
+@pytest.mark.asyncio
+async def test_run_worker_metadata_busy_not_pipeline_ok(pending_runner, monkeypatch, mode, case):
+    env = pending_runner
+    clients = []
+
+    def make_client(*, sqlite_path):
+        assert sqlite_path == env.db
+        client = OfflineBroker(candles={"FCOORD": [VALID_CANDLE]} if case == "ticker-bars" else {})
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(env.worker.client_mod, "make_client", make_client)
+    # Legacy run_worker token check references a removed client symbol; isolate that boundary only.
+    monkeypatch.setattr(env.worker.client_mod, "read_token_file",
+                        lambda: "offline-test-sentinel", raising=False)
+    before = snapshot(env.db, env.real_connect)
+    at_acquisition = []
+    if case == "ticker-bars":
+        exc = adapter_injected_busy(env)
+
+        def acquire(path, *, role, phase, **kwargs):
+            con = env.real_connect(path)
+            try:
+                committed = con.execute("SELECT 1 FROM bars WHERE figi='FCOORD' AND ts='2024-05-16'").fetchone()
+            finally:
+                con.close()
+            if phase == "metadata" and committed:
+                at_acquisition.extend(snapshot(env.db, env.real_connect)["instrument_metadata"])
+                env.busy.append(exc)
+                raise exc  # adapter injection at metadata acquisition after real bars commit
+            return env.acquire(path, role=role, phase=phase, **kwargs)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(backfill, "writer_lock", acquire)
+            rc = await env.worker.run_worker(mode)
+    else:
+        phase = "instruments" if case == "discovery-instruments" else "metadata"
+        # For per-ticker empty response, seed metadata must first succeed.
+        if case == "ticker-empty":
+            with open(locks.writer_lock_path(env.db), "a+b") as descriptor:
+                def acquire(path, *, role, phase, **kwargs):
+                    if phase == "metadata" and clients and clients[0].candle_calls:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return env.acquire(path, role=role, phase=phase, **kwargs)
+
+                with monkeypatch.context() as patcher:
+                    patcher.setattr(backfill, "writer_lock", acquire)
+                    rc = await env.worker.run_worker(mode)
+        else:
+            with metadata_kernel_contention(env, monkeypatch, phase):
+                rc = await env.worker.run_worker(mode)
+        assert len(env.busy) == 1
+        exc = env.busy[0]
+    assert rc == 2
+    assert clients[0].closed and not clients[0].active
+    con = env.real_connect(env.db)
+    try:
+        rows = con.execute("SELECT phase, status, rows_processed, detail, finished_at FROM pipeline").fetchall()
+        assert len(rows) == 1
+        assert rows[0][:4] == ("fetch_universe_bars", "err", 0, locks.format_busy_defer(exc))
+        assert rows[0][4] is not None
+    finally:
+        con.close()
+    assert [fields["error"] for event, fields in env.log.rows if event == "worker.run.failed"] == [
+        locks.format_busy_defer(exc),
+    ]
+    assert snapshot(env.db, env.real_connect)["instrument_metadata"] == (
+        at_acquisition if case == "ticker-bars" else before["instrument_metadata"]
+    )
+    if case.startswith("ticker"):
+        assert clients[0].candle_calls, "actual Tinkoff candle path must reach metadata"
+    if case == "ticker-bars":
+        con = env.real_connect(env.db)
+        try:
+            assert con.execute("SELECT ts, close FROM bars ORDER BY ts").fetchall() == [
+                ("2024-05-15", 50.0), ("2024-05-16", 50.0),
+            ]
+        finally:
+            con.close()
+    assert "RAW-FIXTURE-PAYLOAD" not in str(env.log.rows)
+    assert await env.worker.run_worker(mode) == 0
+    assert all(client.closed for client in clients)
+    con = env.real_connect(env.db)
+    try:
+        assert con.execute("SELECT status FROM pipeline ORDER BY id").fetchall() == [("err",), ("ok",)]
+    finally:
+        con.close()
+
+
+@pytest.fixture
+def gap_env(adapter_env, monkeypatch):
+    env = adapter_env
+    con = env.real_connect(env.db)
+    try:
+        con.execute("INSERT INTO instrument_metadata "
+                    "(figi, last_bar_ts, total_bars, last_run_status) "
+                    "VALUES ('FCOORD', '2024-05-15', 1, 'pending')")
+        con.commit()
+    finally:
+        con.close()
+
+    class FrozenWorkerDate(date):
+        @classmethod
+        def today(cls):
+            return date(2024, 5, 17)
+
+    # Only the worker's calendar is frozen; keep actual runner dates/signatures.
+    monkeypatch.setattr(env.worker, "date", FrozenWorkerDate)
+    return env
+
+
+@pytest.mark.parametrize("historical", [False, True], ids=["trailing", "historical"])
+def test_gap_recovery_metadata_busy_not_zero_success(gap_env, monkeypatch, historical):
+    from algotrader_api.data_quality.gap_recovery import find_gaps, recover_gaps
+
+    env = gap_env
+    if historical:
+        con = env.real_connect(env.db)
+        try:
+            con.execute("INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+                        "VALUES ('FCOORD', '2024-05-13', 50, 50, 50, 50, 100)")
+            con.commit()
+        finally:
+            con.close()
+    clients = []
+
+    def make_client(*, sqlite_path):
+        assert sqlite_path == env.db
+        broker = OfflineBroker()
+        clients.append(broker)
+        return broker
+
+    monkeypatch.setattr(env.worker.client_mod, "make_client", make_client)
+    before = snapshot(env.db, env.real_connect)
+    with metadata_kernel_contention(env, monkeypatch, "metadata"):
+        ok, detail = env.worker._step_gap_recovery(env.db)
+    assert ok is False
+    assert len(env.busy) == 1
+    assert_adapter_defer(detail, env.busy[0], env, "backfill-metadata", "metadata", "flock")
+    expected_range = (date(2024, 5, 14), date(2024, 5, 14)) if historical else (
+        date(2024, 5, 16), date(2024, 5, 17))
+    assert clients[0].candle_calls == [("FCOORD", *expected_range, "CANDLE_INTERVAL_DAY")]
+    assert clients[0].closed and not clients[0].active
+    assert snapshot(env.db, env.real_connect) == before
+    if historical:
+        # Also call the real historical helper directly; it already propagates metadata BUSY.
+        runner, _ = collect_runner(env, OfflineBroker())
+        with metadata_kernel_contention(env, monkeypatch, "metadata"):
+            with pytest.raises(locks.WriterLockBusy) as caught:
+                asyncio.run(recover_gaps(env.db, runner, find_gaps(env.db)))
+        assert caught.value is env.busy[-1]
+        assert runner.client.candle_calls == [("FCOORD", *expected_range, "CANDLE_INTERVAL_DAY")]
+        asyncio.run(runner.client.aclose())
+    assert env.worker._step_gap_recovery(env.db)[0] is True
+    assert clients[-1].closed
+    assert snapshot(env.db, env.real_connect)["bars"] == before["bars"]
+
+
+@pytest.mark.parametrize("historical", [False, True], ids=["trailing", "historical"])
+@pytest.mark.parametrize("error_kind", ["other-writer-busy", "ordinary-error"])
+def test_gap_metadata_adapters_preserve_other_error_policy(gap_env, monkeypatch, historical, error_kind):
+    env = gap_env
+    if historical:
+        con = env.real_connect(env.db)
+        try:
+            con.execute("INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+                        "VALUES ('FCOORD', '2024-05-13', 50, 50, 50, 50, 100)")
+            con.commit()
+        finally:
+            con.close()
+    exc = (adapter_injected_busy(env, role="bar-writer", phase="bars")
+           if error_kind == "other-writer-busy" else RuntimeError("ordinary-owner-error"))
+    if error_kind == "other-writer-busy":
+        exc.args = ("other-role-owner-error",)
+
+    def acquire(path, *, role, phase, **kwargs):
+        assert (role, phase) == ("backfill-metadata", "metadata")
+        raise exc  # ordinary/non-metadata adapter injection; retain old handling
+
+    client = OfflineBroker()
+    monkeypatch.setattr(env.worker.client_mod, "make_client", lambda *, sqlite_path: client)
+    monkeypatch.setattr(backfill, "writer_lock", acquire)
+    before = snapshot(env.db, env.real_connect)
+    ok, detail = env.worker._step_gap_recovery(env.db)
+    if historical:
+        assert ok is False and detail == f"gap recovery failed: {exc}"
+    else:
+        assert ok is True and detail.startswith("gap recovery: 0 bars filled ")
+        assert [fields["error"] for event, fields in env.log.rows
+                if event == "worker.gap_recovery.fill_failed"] == [str(exc)]
+    assert client.candle_calls and client.closed
+    assert snapshot(env.db, env.real_connect) == before
+
+
+@pytest.mark.parametrize("mode", ["scheduled", "manual"])
+@pytest.mark.asyncio
+async def test_run_worker_propagated_ordinary_error_keeps_generic_rc2(adapter_env, monkeypatch, mode):
+    env = adapter_env
+    client = OfflineBroker()
+    monkeypatch.setattr(env.worker.client_mod, "make_client", lambda *, sqlite_path: client)
+    monkeypatch.setattr(env.worker.client_mod, "read_token_file", lambda: "offline-test-sentinel", raising=False)
+    exc = RuntimeError("ordinary-run-error")
+
+    class BrokenClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            raise exc  # real run/_emit body, ordinary dependency failure before metadata writes
+
+    monkeypatch.setattr(backfill, "datetime", BrokenClock)
+    assert await env.worker.run_worker(mode) == 2
+    assert client.closed
+    con = env.real_connect(env.db)
+    try:
+        assert con.execute("SELECT phase, status, detail FROM pipeline").fetchall() == [
+            ("fetch_universe_bars", "err", "ordinary-run-error"),
+        ]
+    finally:
+        con.close()
+    assert [fields["error"] for event, fields in env.log.rows if event == "worker.run.failed"] == [str(exc)]
+
+
+def test_run_backfill_retains_rc1_for_metadata_busy(adapter_env, monkeypatch):
+    from algotrader_api.db import secrets
+
+    env = adapter_env
+    client = OfflineBroker()
+    monkeypatch.setattr(secrets, "get_broker_token", lambda db_path: "offline-test-sentinel")
+    monkeypatch.setattr(env.worker.client_mod, "make_client", lambda *, sqlite_path, use_fake: client)
+    try:
+        with metadata_kernel_contention(env, monkeypatch, "instruments"):
+            assert env.worker.run_backfill() == 1
+        assert len(env.busy) == 1
+        assert [fields["payload"]["status"] for event, fields in env.log.rows
+                if event == "worker.backfill.event" and fields["type"] == "done"] == ["error"]
+    finally:
+        # The existing synchronous run_backfill owns no client-finally; test owns this fake.
+        asyncio.run(client.aclose())
+
+
+@pytest.mark.parametrize("entrypoint", ["daily", "cli"])
+def test_dividend_partial_commit_keeps_prior_figi_and_failed_queue(
+    adapter_env, monkeypatch, capsys, entrypoint,
+):
+    from algotrader_api.ingestion import real_client
+
+    env = adapter_env
+    con = env.real_connect(env.db)
+    try:
+        con.execute("INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+                    "VALUES ('PRIOR', 'FPRIOR', 'share', 'Prior', 'RUB', 1)")
+        con.executemany("INSERT INTO dividends_throttle_pending VALUES (?, ?, ?, ?)", [
+            ("FPRIOR", "first", "01", 2), ("FCOORD", "first", "02", 3),
+        ])
+        con.execute("INSERT OR REPLACE INTO secrets (key, value) VALUES ('broker_token', 'offline-test-sentinel')")
+        con.commit()
+    finally:
+        con.close()
+    clients = []
+
+    def make_client(**kwargs):
+        assert kwargs == ({"sqlite_path": env.db} if entrypoint == "daily" else {"token": "offline-test-sentinel"})
+        monkeypatch.setattr(env.dividends._rl, "_GLOBAL", env.dividends._rl.RateLimiter())
+        client = OfflineBroker()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(env.worker.client_mod, "make_client", make_client)
+    monkeypatch.setattr(real_client, "RealTinkoffClient", make_client)
+    monkeypatch.setattr(sys, "argv", ["import_dividends_tinkoff", env.db])
+    blocker = env.real_connect(env.db)
+    calls = []
+
+    def acquire(path, *, role, phase, **kwargs):
+        assert (role, phase) == ("dividends", "dividends")
+        calls.append((role, phase))
+        if len(calls) == 2:
+            # Real numeric BUSY on second FIGI; the first FIGI merge/dequeue has committed.
+            blocker.execute("BEGIN IMMEDIATE")
+        return env.acquire(path, role=role, phase=phase, **kwargs)
+
+    def connect(database, *args, **kwargs):
+        kwargs["timeout"] = 0.03
+        return env.real_connect(database, *args, **kwargs)
+
+    def invoke():
+        return env.worker._step_dividends(env.db) if entrypoint == "daily" else env.dividends.main()
+
+    try:
+        with monkeypatch.context() as patcher:
+            patcher.setattr(corporate, "writer_lock", acquire)
+            patcher.setattr(sqlite3, "connect", connect)
+            outcome = invoke()
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert len(env.busy) == 1
+    detail = locks.format_busy_defer(env.busy[0])
+    assert_adapter_defer(detail, env.busy[0], env, "dividends", "dividends", "sqlite")
+    assert outcome == ((False, detail) if entrypoint == "daily" else 75)
+    captured = capsys.readouterr()
+    assert captured.err == ("" if entrypoint == "daily" else detail + "\n")
+    assert captured.out == ""
+    assert clients[0].closed and clients[0].dividend_calls == ["FPRIOR", "FCOORD"]
+    con = env.real_connect(env.db)
+    try:
+        prior = con.execute("SELECT * FROM dividends WHERE figi='FPRIOR'").fetchall()
+        assert len(prior) == 1
+        assert con.execute("SELECT figi, amount_per_share FROM dividends").fetchall() == [("FPRIOR", 10.0)]
+        assert con.execute("SELECT * FROM dividends_throttle_pending").fetchall() == [
+            ("FCOORD", "first", "02", 3),
+        ]
+    finally:
+        con.close()
+    assert invoke() == ((True, "dividends: tinkoff=1 queued=0") if entrypoint == "daily" else 0)
+    capsys.readouterr()
+    con = env.real_connect(env.db)
+    try:
+        assert con.execute("SELECT * FROM dividends WHERE figi='FPRIOR'").fetchall() == prior
+        assert con.execute("SELECT figi, amount_per_share FROM dividends ORDER BY figi").fetchall() == [
+            ("FCOORD", 10.0), ("FPRIOR", 10.0),
+        ]
+        assert con.execute("SELECT * FROM dividends_throttle_pending").fetchall() == []
+    finally:
+        con.close()
+    assert invoke() == ((True, "dividends: tinkoff=0 queued=0") if entrypoint == "daily" else 0)
+    assert all(client.closed for client in clients)
