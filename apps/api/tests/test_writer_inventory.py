@@ -11,6 +11,10 @@ Asserts that:
   ``subprocess``, or ``multiprocessing`` calls (no process creation
   inside the critical section).
 * Out-of-scope modules do not import or call ``writer_lock``.
+* Daily owner symbols are explicit; their runtime protection is tested
+  when each owner is implemented, not inferred from this inventory.
+* Non-owning orchestration and adjustment borrowers never acquire; the
+  borrowers do not commit, roll back, or close the caller's connection.
 """
 from __future__ import annotations
 
@@ -32,16 +36,61 @@ IN_SCOPE_FUNCTIONS = {
     "cron_expected_bars.sh": _REPO_ROOT / "apps" / "api" / "scripts" / "cron_expected_bars.sh",
 }
 
+DAILY_TRANSACTION_OWNERS = {
+    "universe-sync/instruments:upsert_instruments": _INGEST / "universe.py",
+    "backfill-metadata/instruments:BackfillRunner._upsert_instrument": _INGEST / "backfill.py",
+    "backfill-metadata/metadata:BackfillRunner._seed_metadata_for_figi": _INGEST / "backfill.py",
+    "backfill-metadata/metadata:BackfillRunner._upsert_metadata": _INGEST / "backfill.py",
+    "corporate-actions/corporate-actions:merge_into_corporate_actions": _SRC_ROOT / "scripts_import" / "import_corporate_actions_common.py",
+    "corporate-actions/adjusted-bars:_step_corporate_actions": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "dividends/dividends:merge_into_dividends": _SRC_ROOT / "scripts_import" / "import_corporate_actions_common.py",
+}
+SUPPLEMENTAL_BAR_OWNERS = {
+    "bar-writer/bars:replace_bars_for_figi_with_rowcount": _SRC_ROOT / "db" / "bars_sqlite.py",
+}
+OWNER_MODULES = set(IN_SCOPE_FUNCTIONS.values()) | set(DAILY_TRANSACTION_OWNERS.values()) | set(SUPPLEMENTAL_BAR_OWNERS.values())
+
 OUT_OF_SCOPE_MODULES = [
     _SRC_ROOT / "pipeline" / "assertions.py",
     _SRC_ROOT / "data_quality" / "service.py",
     _SRC_ROOT / "data_quality" / "completeness.py",
     _SRC_ROOT / "maintenance" / "cleanup.py",
-    _INGEST / "universe.py",
     _INGEST / "universe_sync.py",
     _SRC_ROOT / "scripts_import" / "import_corporate_actions.py",
-    _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py",
+    _SRC_ROOT / "db" / "sqlite.py",
+    _SRC_ROOT / "db" / "migrations_runner.py",
 ]
+
+
+NON_OWNING_FUNCTIONS = {
+    "discover_universe": _INGEST / "universe.py",
+    "fetch_and_persist": _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py",
+    "fetch_and_persist._run": _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py",
+    "_list_tradeable_figis": _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py",
+    "_read_pending_figis": _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py",
+    "_queue_throttled_figi": _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py",
+    "_dequeue_figi": _SRC_ROOT / "scripts_import" / "import_dividends_tinkoff.py",
+    "heartbeat_loop": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "_heartbeat_loop": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "_log_chain_phase": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "_write_pipeline_run": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "_step_guardian": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "_step_freshness_check": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "_step_universe_sync": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "_step_dividends": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "run_daily_chain": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "run_live_mode": _REPO_ROOT / "apps" / "api" / "worker.py",
+    "BackfillRunner._log": _INGEST / "backfill.py",
+    "BackfillRunner._emit": _INGEST / "backfill.py",
+    "BackfillRunner._discover_universe": _INGEST / "backfill.py",
+    "_tinkoff_breaker_record_failure": _INGEST / "backfill.py",
+    "_tinkoff_breaker_record_success": _INGEST / "backfill.py",
+}
+BORROWED_ADJUSTMENT_FUNCTIONS = {
+    "apply_all_pending": _SRC_ROOT / "data_quality" / "forward_adjustment.py",
+    "apply_forward_split": _SRC_ROOT / "data_quality" / "forward_adjustment.py",
+    "_already_applied": _SRC_ROOT / "data_quality" / "forward_adjustment.py",
+}
 
 
 def _parse(path: Path) -> ast.Module:
@@ -58,6 +107,34 @@ def _async_functions_in_tree(tree: ast.Module) -> set[str]:
         for n in ast.walk(tree)
         if isinstance(n, ast.AsyncFunctionDef)
     }
+
+
+def _qualified_function(tree: ast.Module, qualified_name: str):
+    parts = qualified_name.split(".")
+    body = tree.body
+    # Descend only through the named class/function, including nested _run.
+    for scope_name in parts[:-1]:
+        scopes = [n for n in body if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                  and n.name == scope_name]
+        assert len(scopes) == 1, qualified_name
+        body = scopes[0].body
+    functions = [n for n in body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and n.name == parts[-1]]
+    assert len(functions) == 1, qualified_name
+    return functions[0]
+
+
+@pytest.fixture(scope="module")
+def source_inventory():
+    paths = (OWNER_MODULES | set(OUT_OF_SCOPE_MODULES)
+             | set(NON_OWNING_FUNCTIONS.values()) | set(BORROWED_ADJUSTMENT_FUNCTIONS.values()))
+    sources = {}
+    for path in sorted(paths):
+        assert path.exists(), f"missing inventory file {path}"
+        if path.suffix == ".py":
+            tree = _parse(path)
+            sources[path] = tree, _lock_acquisition_names(tree)
+    return sources
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +183,27 @@ def test_listed_till_present_in_backfill():
 def test_expected_bars_present_in_populate_script():
     text = IN_SCOPE_FUNCTIONS["expected_bars"].read_text()
     assert "expected_bars" in text
+
+
+@pytest.mark.parametrize("identity,path", list(DAILY_TRANSACTION_OWNERS.items()),
+                         ids=list(DAILY_TRANSACTION_OWNERS))
+def test_daily_owner_symbol_present(identity, path, source_inventory):
+    _qualified_function(source_inventory[path][0], identity.split(":", 1)[1])
+
+
+@pytest.mark.parametrize("identity,path", list(SUPPLEMENTAL_BAR_OWNERS.items()),
+                         ids=list(SUPPLEMENTAL_BAR_OWNERS))
+def test_supplemental_bar_owner_symbol_present(identity, path, source_inventory):
+    _qualified_function(source_inventory[path][0], identity.split(":", 1)[1])
+
+
+def test_qualified_function_does_not_match_another_class():
+    tree = ast.parse(
+        "class Other:\n    def _upsert_metadata(self): pass\n"
+        "class BackfillRunner:\n    pass\n"
+    )
+    with pytest.raises(AssertionError, match="BackfillRunner._upsert_metadata"):
+        _qualified_function(tree, "BackfillRunner._upsert_metadata")
 
 
 # ---------------------------------------------------------------------------
@@ -169,40 +267,123 @@ def test_async_backfill_impl_has_no_raw_insert_into_bars():
 # ---------------------------------------------------------------------------
 
 
-def _writer_lock_calls(tree: ast.Module) -> list[ast.Call]:
+def _lock_acquisition_names(tree: ast.AST) -> set[str]:
+    names = {"writer_lock"}
+    module = "algotrader_api.ingestion.writer_lock"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                if (node.module or "").split(".")[-1] == "writer_lock":
+                    if alias.name == "writer_lock":
+                        names.add(bound)
+                elif alias.name == "writer_lock":
+                    names.add(f"{bound}.writer_lock")
+                else:
+                    imported = f"{node.module}.{alias.name}"
+                    if module.startswith(imported + "."):
+                        names.add(f"{bound}{module[len(imported):]}.writer_lock")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if module == alias.name or module.startswith(alias.name + "."):
+                    names.add(f"{alias.asname or alias.name}{module[len(alias.name):]}.writer_lock")
+    # Existing evidence ownership returns a context; entry happens at its caller.
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if any(isinstance(n, ast.Return) and isinstance(n.value, ast.Call)
+                   and ast.unparse(n.value.func) in names for n in node.body):
+                names.add(node.name)
+    return names
+
+
+def _writer_lock_calls(tree: ast.AST, acquisition_names=None) -> list[ast.Call]:
+    names = _lock_acquisition_names(tree) if acquisition_names is None else acquisition_names
     return [
         n
         for n in ast.walk(tree)
         if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Name)
-        and n.func.id == "writer_lock"
+        and ast.unparse(n.func) in names
     ]
 
 
+def _acquisition_sites(node: ast.AST, names: set[str]) -> list[ast.AST]:
+    calls = _writer_lock_calls(node, names)
+    bare_decorators = [
+        decorator
+        for scope in ast.walk(node)
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        for decorator in scope.decorator_list
+        if ast.unparse(decorator) in names
+    ]
+    return [*calls, *bare_decorators]
+
+
+@pytest.mark.parametrize("import_statement,acquisition", [
+    ("from algotrader_api.ingestion.writer_lock import writer_lock as acquire", "acquire"),
+    ("from algotrader_api.ingestion import writer_lock as locks", "locks.writer_lock"),
+    ("from .writer_lock import writer_lock as acquire", "acquire"),
+    ("from . import writer_lock as locks", "locks.writer_lock"),
+    ("import algotrader_api.ingestion.writer_lock as locks", "locks.writer_lock"),
+    ("import algotrader_api.ingestion.writer_lock", "algotrader_api.ingestion.writer_lock.writer_lock"),
+    ("from algotrader_api import ingestion as ingest", "ingest.writer_lock.writer_lock"),
+    ("import algotrader_api as api", "api.ingestion.writer_lock.writer_lock"),
+])
+def test_writer_lock_scan_resolves_import_aliases(import_statement, acquisition):
+    tree = ast.parse(
+        f"{import_statement}\n"
+        f"with {acquisition}(db, role='dividends', phase='dividends'):\n"
+        "    pass\n"
+    )
+    assert len(_writer_lock_calls(tree)) == 1
+
+
+def test_writer_lock_scan_allows_exception_and_formatter_adapters():
+    tree = ast.parse(
+        "from algotrader_api.ingestion.writer_lock import WriterLockBusy, format_busy_defer\n"
+        "format_busy_defer(error)\n"
+    )
+    assert _writer_lock_calls(tree) == []
+
+
+@pytest.mark.parametrize("decorator", ["acquire", "acquire(db)", "locks.writer_lock"])
+def test_non_owner_scan_detects_lock_decorators(decorator):
+    tree = ast.parse(
+        "from algotrader_api.ingestion.writer_lock import writer_lock as acquire\n"
+        "from algotrader_api.ingestion import writer_lock as locks\n"
+        f"@{decorator}\ndef fetch(): pass\n"
+    )
+    assert len(_acquisition_sites(_qualified_function(tree, "fetch"),
+                                  _lock_acquisition_names(tree))) == 1
+
+
 def _enclosing_with_for_call(tree: ast.Module, target: ast.AST):
-    """Find the `with` statement whose body contains `target`, if any."""
+    """Find the `with` statement that acquires `target`, not an outer body."""
     for node in ast.walk(tree):
-        if isinstance(node, ast.With):
-            for sub in ast.walk(node):
-                if sub is target:
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if any(sub is target for sub in ast.walk(item.context_expr)):
                     return node
     return None
 
 
-def test_no_process_creation_inside_writer_lock_body():
+def test_no_process_creation_inside_writer_lock_body(source_inventory):
     """No `os.fork`, `subprocess`, or `multiprocessing` calls inside
     any `with writer_lock(...)` body.
     """
     forbidden_names = {"fork", "Popen", "run", "spawn", "Process"}
     forbidden_modules = {"os", "subprocess", "multiprocessing"}
 
-    for path in IN_SCOPE_FUNCTIONS.values():
+    for path in sorted(OWNER_MODULES):
         if path.suffix != ".py":
             continue
-        tree = _parse(path)
-        for call in _writer_lock_calls(tree):
+        tree, names = source_inventory[path]
+        for call in _writer_lock_calls(tree, names):
             ctx = _enclosing_with_for_call(tree, call)
-            assert ctx is not None, "writer_lock(...) must be inside a `with`"
+            if ctx is None:
+                assert any(isinstance(n, ast.Return) and n.value is call for n in ast.walk(tree)), (
+                    f"{path}:{call.lineno}: writer lock context must be used by `with` or returned"
+                )
+                continue
             for inner in ast.walk(ctx):
                 if not isinstance(inner, ast.Call):
                     continue
@@ -233,12 +414,29 @@ def test_no_process_creation_inside_writer_lock_body():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("owner_file", [
+    _REPO_ROOT / "apps" / "api" / "worker.py",
+    _SRC_ROOT / "scripts_import" / "import_corporate_actions_common.py",
+])
+def test_process_scan_follows_returned_lock_context(source_inventory, owner_file):
+    tree = ast.parse(
+        "from algotrader_api.ingestion.writer_lock import writer_lock as acquire\n"
+        "import subprocess\n"
+        "def lock_factory(db):\n    return acquire(db, role='dividends', phase='dividends')\n"
+        "with lock_factory(db):\n    subprocess.run([])\n"
+    )
+    sources = {**source_inventory, owner_file: (tree, _lock_acquisition_names(tree))}
+    with pytest.raises(pytest.fail.Exception, match="forbidden subprocess.run"):
+        test_no_process_creation_inside_writer_lock_body(sources)
+
+
 @pytest.mark.parametrize(
     "path",
-    [p for p in OUT_OF_SCOPE_MODULES if p.exists()],
+    OUT_OF_SCOPE_MODULES,
     ids=lambda p: str(p.relative_to(_REPO_ROOT)),
 )
 def test_out_of_scope_does_not_import_writer_lock(path):
+    assert path.exists(), f"missing inventory file {path}"
     text = path.read_text()
     assert "writer_lock" not in text, (
         f"{path.relative_to(_REPO_ROOT)} mentions writer_lock — out-of-scope"
@@ -247,11 +445,12 @@ def test_out_of_scope_does_not_import_writer_lock(path):
 
 @pytest.mark.parametrize(
     "path",
-    [p for p in OUT_OF_SCOPE_MODULES if p.exists()],
+    OUT_OF_SCOPE_MODULES,
     ids=lambda p: str(p.relative_to(_REPO_ROOT)),
 )
 def test_out_of_scope_does_not_import_writer_lock_module(path):
     """No `from ... import writer_lock` style imports."""
+    assert path.exists(), f"missing inventory file {path}"
     tree = _parse(path)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -264,3 +463,22 @@ def test_out_of_scope_does_not_import_writer_lock_module(path):
                 assert "writer_lock" not in alias.name, (
                     f"{path.relative_to(_REPO_ROOT)} imports writer_lock"
                 )
+
+
+@pytest.mark.parametrize("name,path", list(NON_OWNING_FUNCTIONS.items()),
+                         ids=list(NON_OWNING_FUNCTIONS))
+def test_non_owner_does_not_acquire_writer_lock(name, path, source_inventory):
+    tree, names = source_inventory[path]
+    node = _qualified_function(tree, name)
+    assert not _acquisition_sites(node, names), f"{path}:{name} acquires writer lock"
+
+
+@pytest.mark.parametrize("name,path", list(BORROWED_ADJUSTMENT_FUNCTIONS.items()),
+                         ids=list(BORROWED_ADJUSTMENT_FUNCTIONS))
+def test_adjustment_borrower_does_not_own_transaction(name, path, source_inventory):
+    tree, names = source_inventory[path]
+    node = _qualified_function(tree, name)
+    assert not _acquisition_sites(node, names), f"borrower {name} acquires writer lock"
+    forbidden = [n.func.attr for n in ast.walk(node) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute) and n.func.attr in {"commit", "rollback", "close"}]
+    assert not forbidden, f"borrower {name} takes transaction ownership: {forbidden}"
