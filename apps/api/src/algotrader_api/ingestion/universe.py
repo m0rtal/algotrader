@@ -4,9 +4,9 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from ..db.sqlite import execute_returning_id
 from ..domain.tradeable import TRADEABLE_CLASSES, filter_tradeable
 from ..observability.logging import get_logger
+from .writer_lock import WriterLockBusy, is_sqlite_busy, writer_lock, writer_lock_path
 
 logger = get_logger("algotrader_api.ingestion.universe")
 
@@ -78,7 +78,7 @@ def upsert_instruments(db_path: str, rows: list[dict]) -> int:
     preserves both rows. Same ticker is allowed; the backfill layer
     addresses data by figi so duplicates are harmless.
 
-    Batched in transactions of 100 for performance.
+    Each row commits independently; groups of 100 are only an iteration detail.
     """
     from ..domain.tradeable import filter_tradeable
 
@@ -96,20 +96,23 @@ def upsert_instruments(db_path: str, rows: list[dict]) -> int:
         return 0
     inserted = 0
     BATCH = 100
-    for i in range(0, len(filtered), BATCH):
-        batch = filtered[i : i + BATCH]
-        for r in batch:
-            execute_returning_id(
-                db_path,
-                "INSERT INTO instruments "
-                "(ticker, figi, class, name, currency, lot_size, isin, sector) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(figi) DO UPDATE SET "
-                "ticker=excluded.ticker, class=excluded.class, "
-                "name=excluded.name, currency=excluded.currency, "
-                "lot_size=excluded.lot_size, isin=excluded.isin, "
-                "sector=excluded.sector",
-                (
+    sql = (
+        "INSERT INTO instruments "
+        "(ticker, figi, class, name, currency, lot_size, isin, sector) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(figi) DO UPDATE SET "
+        "ticker=excluded.ticker, class=excluded.class, "
+        "name=excluded.name, currency=excluded.currency, "
+        "lot_size=excluded.lot_size, isin=excluded.isin, "
+        "sector=excluded.sector"
+    )
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        for i in range(0, len(filtered), BATCH):
+            batch = filtered[i : i + BATCH]
+            for r in batch:
+                params = (
                     r["ticker"],
                     r["figi"],
                     r["class"],
@@ -118,7 +121,26 @@ def upsert_instruments(db_path: str, rows: list[dict]) -> int:
                     r["lot_size"],
                     r.get("isin"),
                     r.get("sector"),
-                ),
-            )
-            inserted += 1
+                )
+                with writer_lock(db_path, role="universe-sync", phase="instruments"):
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        conn.execute(sql, params)
+                        conn.commit()
+                    except BaseException as exc:
+                        try:
+                            conn.rollback()
+                        except BaseException:
+                            pass
+                        if is_sqlite_busy(exc):
+                            raise WriterLockBusy(
+                                role="universe-sync", phase="instruments",
+                                database_path=str(writer_lock_path(db_path))[:-len(".writer.lock")],
+                                lock_path=str(writer_lock_path(db_path)),
+                                timeout_seconds=30.0, reason="sqlite-busy",
+                            ) from exc
+                        raise
+                inserted += 1
+    finally:
+        conn.close()
     return inserted
