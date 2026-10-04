@@ -40,6 +40,20 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _fixed_trading_calendar(monkeypatch):
+    """Keep yesterday a completed weekday, using the real DB calendar."""
+    from algotrader_api.ingestion import backfill
+
+    class FixedDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 9, 24)  # Thursday; Wednesday is complete.
+
+    monkeypatch.setattr(backfill, "date", FixedDate)
+    monkeypatch.setattr(f"{__name__}.date", FixedDate)
+
+
 # ─── Test doubles ──────────────────────────────────────────────────
 
 
@@ -67,9 +81,8 @@ def _seed_db(
     bars_through: date | None = None,
 ) -> date:
     """Create a minimal schema with one or more figis + bars through
-    ``bars_through`` (default: ``date.today() - timedelta(days=1)``).
-    The day after is the only missing trading day at the end of the
-    window.
+    ``bars_through`` (default: the pinned Wednesday, 2026-09-23).
+    Supplying the preceding Tuesday leaves Wednesday missing.
 
     Returns ``bars_through`` so callers can compute the expected
     ``yesterday`` / missing-window dates without hardcoding them.
@@ -129,9 +142,7 @@ def _seed_db(
                 "VALUES (?, ?, 'share', ?, '2099-12-31')",
                 (figi, ticker, listed_from),
             )
-            # Bars through ``end`` (weekdays only). The day after
-            # ``end`` is the only missing trading day at the end of
-            # the window.
+            # Bars through ``end`` (weekdays only).
             cur = date(2014, 1, 1)
             while cur <= end:
                 if cur.weekday() < 5:
@@ -215,9 +226,8 @@ async def test_tinkoff_fallback_uses_only_missing_dates_window():
     """
     with tempfile.TemporaryDirectory() as td:
         db_path = str(Path(td) / "test.db")
-        # Seed bars through 2 days before yesterday so the only gap is
-        # yesterday (a weekday). For example, on a Thursday seed bars
-        # through Tuesday, leaving Wednesday as the missing day.
+        # The clock is Thursday, 2026-09-24. Seed through Tuesday so
+        # Wednesday is the only missing completed trading day.
         yesterday = date.today() - timedelta(days=1)
         bars_through = yesterday - timedelta(days=1)
         while bars_through.weekday() >= 5:
