@@ -712,8 +712,18 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
         from algotrader_api.ingestion.backfill import BackfillRunner
 
         client = client_mod.make_client(sqlite_path=db_path, )
+        failed_trailing_figis: set[str] = set()
+        active_trailing_figi: str | None = None
+
+        async def observe_trailing_error(event) -> None:
+            if (active_trailing_figi is not None
+                    and event.type == "ticker_progress"
+                    and event.payload.get("status") == "error"
+                    and event.payload.get("figi") == active_trailing_figi):
+                failed_trailing_figis.add(active_trailing_figi)
+
         runner = BackfillRunner(client=client, db_path=db_path,
-                                event_sink=_async_noop_sink)
+                                event_sink=observe_trailing_error)
         gaps = find_gaps(db_path)
 
         # Resolve tickers for the trailing set BEFORE entering the event
@@ -750,6 +760,7 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
         # so the cached gRPC channel stays valid throughout. aclose()
         # runs in finally to release the channel cleanly on exit.
         async def _run_all() -> tuple[int, int, dict[str, int]]:
+            nonlocal active_trailing_figi
             hist_total = 0
             trailing_total = 0
             trailing_by_source_inner: dict[str, int] = {"moex": 0, "tinkoff": 0}
@@ -774,6 +785,7 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
                             from_=from_.isoformat(), to=to_.isoformat(),
                             source=source, stale=stale,
                         )
+                        active_trailing_figi = figi
                         try:
                             n = await runner._backfill_one(
                                 figi=figi, ticker=ticker,
@@ -782,11 +794,14 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
                         except Exception as exc:  # noqa: BLE001
                             if isinstance(exc, WriterLockBusy) and exc.role == "backfill-metadata":
                                 raise
+                            failed_trailing_figis.add(figi)
                             logger.warning(
                                 "worker.gap_recovery.fill_failed",
-                                figi=figi, error=str(exc),
+                                figi=figi, error_type=type(exc).__name__,
                             )
                             continue
+                        finally:
+                            active_trailing_figi = None
                         trailing_total += int(n or 0)
                         trailing_by_source_inner[source] += int(n or 0)
                 return hist_total, trailing_total, trailing_by_source_inner
@@ -803,12 +818,13 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
         total_added = hist_added + trailing_added
         if not gaps and not trailing:
             return True, "gap recovery: no gaps"
-        return True, (
+        return not failed_trailing_figis, (
             f"gap recovery: {total_added} bars filled "
             f"(historical={hist_added} across {len(gaps)} gaps, "
             f"trailing={trailing_added} across {len(trailing)} figis "
             f"[moex={trailing_by_source.get('moex', 0)}, "
-            f"tinkoff={trailing_by_source.get('tinkoff', 0)}])"
+            f"tinkoff={trailing_by_source.get('tinkoff', 0)}], "
+            f"failed={len(failed_trailing_figis)})"
         )
     except Exception as exc:
         if isinstance(exc, WriterLockBusy) and exc.role == "backfill-metadata":

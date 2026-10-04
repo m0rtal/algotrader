@@ -2469,6 +2469,10 @@ def gap_env(adapter_env, monkeypatch):
         def today(cls):
             return date(2024, 5, 17)
 
+        @classmethod
+        def fromisoformat(cls, value):
+            return date.fromisoformat(value)
+
     # Only the worker's calendar is frozen; keep actual runner dates/signatures.
     monkeypatch.setattr(env.worker, "date", FrozenWorkerDate)
     return env
@@ -2550,9 +2554,13 @@ def test_gap_metadata_adapters_preserve_other_error_policy(gap_env, monkeypatch,
     if historical:
         assert ok is False and detail == f"gap recovery failed: {exc}"
     else:
-        assert ok is True and detail.startswith("gap recovery: 0 bars filled ")
-        assert [fields["error"] for event, fields in env.log.rows
-                if event == "worker.gap_recovery.fill_failed"] == [str(exc)]
+        assert ok is False and detail.startswith("gap recovery: 0 bars filled ")
+        assert detail.endswith("failed=1)") and not detail.startswith("DEFER")
+        failures = [fields for event, fields in env.log.rows
+                    if event == "worker.gap_recovery.fill_failed"]
+        assert failures == [{"figi": "FCOORD", "error_type": type(exc).__name__}]
+        assert all("error" not in fields for fields in failures)
+        assert str(exc) not in detail and str(exc) not in str(failures)
     assert client.candle_calls and client.closed
     assert snapshot(env.db, env.real_connect) == before
 
