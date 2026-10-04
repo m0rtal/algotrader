@@ -358,12 +358,19 @@ def _stub_runner_with_recorder(records: list, n_returned: int = 1):
     return runner
 
 
-def test_step_gap_recovery_routes_fresh_figi_to_tinkoff(tmp_path):
+def test_step_gap_recovery_routes_fresh_figi_to_tinkoff(tmp_path, monkeypatch):
     """last_ts = today - 1d → tinkoff (recent, no need for MOEX bridge)."""
     worker = _import_worker()
     p = str(tmp_path / "state.db")
     run_migrations(p, str(MIGRATIONS_DIR))
     today = date(2026, 9, 22)
+
+    class FixedDate(date):
+        @classmethod
+        def today(cls):
+            return today
+
+    monkeypatch.setattr(worker, "date", FixedDate)
     with closing(_row_connect(p)) as con:
         _seed_bar(con, "F1", "2026-09-21")
         _seed_instrument(con, "F1", "TKR1")

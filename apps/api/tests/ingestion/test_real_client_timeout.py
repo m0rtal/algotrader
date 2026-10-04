@@ -455,31 +455,113 @@ def test_is_unavailable_recognises_real_grpc_status() -> None:
     )
 
 
+@pytest.mark.parametrize("blocking_enter", [False, True])
+async def test_ensure_uses_cumulative_initialization_budget(monkeypatch, blocking_enter):
+    """Neither a fresh enter budget nor a late success may publish services."""
+    import time
+
+    events = []
+
+    class _BudgetClient:
+        def __init__(self, token, *, target):
+            time.sleep(0.1)
+
+        async def __aenter__(self):
+            events.append("entered")
+            if blocking_enter:
+                time.sleep(0.2)
+            else:
+                await asyncio.sleep(0.2)
+            events.append("completed")
+            return SimpleNamespace()
+
+        async def __aexit__(self, *args):
+            events.append("closed")
+
+    services = _StubServices()
+    _patch_sdk(monkeypatch, services, _StubAsyncClient(services))
+    wrapper = RealTinkoffClient(token="t", request_timeout=0.25)
+    monkeypatch.setattr(wrapper, "_sdk", SimpleNamespace(AsyncClient=_BudgetClient))
+
+    with pytest.raises(RealClientTimeoutError) as exc_info:
+        await wrapper._ensure()
+
+    assert exc_info.value.label == "AsyncClient.__aenter__"
+    assert exc_info.value.timeout == 0.25
+    assert events == (["entered", "completed", "closed"] if blocking_enter else ["entered", "closed"])
+    assert wrapper._client is None
+    assert wrapper._services is None
+
+
+async def test_cancelled_initialization_closes_unpublished_client(monkeypatch):
+    entered = asyncio.Event()
+    closed = asyncio.Event()
+
+    class _EnteringClient:
+        async def __aenter__(self):
+            entered.set()
+            await asyncio.Event().wait()
+
+        async def __aexit__(self, *args):
+            closed.set()
+
+    services = _StubServices()
+    _patch_sdk_with(monkeypatch, services, _EnteringClient())
+    wrapper = RealTinkoffClient(token="t", request_timeout=1.0)
+    task = asyncio.create_task(wrapper._ensure())
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    unpublished = wrapper._client is None and wrapper._services is None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert unpublished
+    assert closed.is_set()
+    assert wrapper._client is None
+    assert wrapper._services is None
+
+
 # ----------------------------------------------------------------------------
 # _ensure() timeout coverage — PR #99 regression fix
 # ----------------------------------------------------------------------------
 
 
 def test_ensure_times_out_on_slow_async_client_ctor(monkeypatch):
-    """A blocking AsyncClient() constructor must be timed out, not awaited forever."""
+    """Reject a constructor that returns after the budget; do not claim preemption."""
     import asyncio as _asyncio
     import time as _time
 
     client = RealTinkoffClient(token="t", target="sandbox", request_timeout=0.3)
 
+    events = []
+
     class _BlockingCtor:
         def __init__(self, *args, **kwargs):
-            _time.sleep(2.0)  # would hang forever without timeout
+            _time.sleep(2.0)  # Synchronous work cannot be interrupted by asyncio.
+            events.append("constructed")
+
+        async def __aenter__(self):
+            events.append("entered")
+            return self
+
+        async def __aexit__(self, *args):
+            events.append("closed")
+            return None
 
     class _FakeSDK:
         AsyncClient = _BlockingCtor
     monkeypatch.setattr(client, "_sdk", _FakeSDK())
 
     async def run() -> None:
+        started = _time.monotonic()
         with pytest.raises(RealClientTimeoutError) as ei:
             await client._ensure()
         assert ei.value.label == "AsyncClient.__init__"
         assert ei.value.timeout == 0.3
+        assert _time.monotonic() - started >= 2.0
+        assert events == ["constructed", "closed"]
+        assert client._client is None
+        assert client._services is None
 
     _asyncio.run(run())
 

@@ -114,52 +114,41 @@ def test_get_tickers_gaps_count_matches_find_gaps(seeded_tickers):
     )
 
 
-def test_get_tickers_returns_real_gap_counts_on_prod_db():
-    """Regression: prod API returned ``gaps: 0`` for every ticker because
-    ``data_reads.py`` left a placeholder literal. Verify the field now
-    equals the real ``find_gaps()`` count for at least one ticker that
-    has gaps in the prod DB.
+@pytest.fixture
+def regression_tickers(seeded_tickers):
+    """Synthetic production regressions: gap, zero-bar classes, orphan, exclusion."""
+    with sqlite3.connect(seeded_tickers) as con:
+        con.execute("DELETE FROM bars WHERE figi='FIGI-SBER' AND ts='2025-12-02'")
+        con.executemany(
+            "INSERT INTO instruments (ticker, figi, class, name, currency, lot_size) "
+            "VALUES (?, ?, ?, ?, 'rub', 1)",
+            [("EMPTY", "FIGI-EMPTY", "share", "Empty"),
+             ("ETF", "FIGI-ETF", "etf", "ETF"),
+             ("BOND", "FIGI-BOND", "bond", "Bond"),
+             ("FUT", "FIGI-FUT", "future", "Future")],
+        )
+        con.execute(
+            "INSERT INTO bars (figi, ts, open, high, low, close, volume) "
+            "VALUES ('ORPHAN', '2025-12-01', 1, 1, 1, 1, 1)"
+        )
+    from algotrader_api.config import get_settings
+    assert get_settings().sqlite_path == seeded_tickers
+    return seeded_tickers
 
-    This test reads the prod DB directly — it asserts the production
-    code path is wired to ``find_gaps()``, not a hardcoded zero.
-    """
-    import os
+
+def test_get_tickers_returns_real_gap_counts_on_prod_db(regression_tickers):
+    """Historical production zero-gap regression, exercised on a temporary DB."""
     from algotrader_api.data_quality.gap_recovery import find_gaps
     from algotrader_api.main import create_app
-    from algotrader_api.routes import data_reads as data_reads_route
 
-    prod_db = "/home/hermes/algotrader/apps/api/data/state.db"
-    if not os.path.exists(prod_db):
-        pytest.skip(f"prod DB not at {prod_db}")
-
-    data_reads_route.set_sqlite_path(prod_db)
-    app = create_app()
-    with TestClient(app) as c:
-        body = c.get("/api/tickers").json()
-
-    # Pick a ticker whose first bar is at the chain start — that figi
-    # is in the find_gaps index and should report a non-zero count.
-    # Use SBER (BBG004730N88 — the canonical example) and verify
-    # at least 1 gap (SBER has 6 real gaps post moex_holidays fix).
-    sber = next((r for r in body if r["symbol"] == "SBER"), None)
-    assert sber is not None, "SBER must be in /api/tickers"
-    assert sber["gaps"] >= 1, (
-        f"SBER.gaps={sber['gaps']} — expected >=1 from find_gaps(), "
-        f"got 0 which means data_reads.py is still returning the placeholder"
-    )
-
-    # Cross-check: the find_gaps() count for SBER must equal what API says.
-    import sqlite3
-    conn = sqlite3.connect(prod_db)
-    sber_figi = conn.execute(
-        "SELECT figi FROM instruments WHERE ticker='SBER' LIMIT 1"
-    ).fetchone()[0]
-    conn.close()
-    prod_gaps = [g for g in find_gaps(prod_db) if g.figi == sber_figi]
-    assert sber["gaps"] == len(prod_gaps), (
-        f"SBER.gaps={sber['gaps']} vs find_gaps={len(prod_gaps)} — "
-        f"data_reads.py is not reading from find_gaps()"
-    )
+    expected = [g for g in find_gaps(regression_tickers) if g.figi == "FIGI-SBER"]
+    assert expected, "fixture must exercise a real missing trading-day gap"
+    with TestClient(create_app()) as c:
+        response = c.get("/api/tickers")
+    assert response.status_code == 200
+    sber = next(r for r in response.json() if r["symbol"] == "SBER")
+    assert sber["gaps"] >= 1
+    assert sber["gaps"] == len(expected)
 
 
 def test_get_tickers_excludes_bars_without_instruments(seeded_tickers):
@@ -453,107 +442,35 @@ def test_get_tickers_zero_bar_figis_count_as_zero_completeness(seeded_tickers):
     assert by_symbol["EMPTY"]["lastDate"] == ""
 
 
-def test_get_tickers_response_includes_all_tradable_on_prod_db():
-    """Regression against the real prod DB.
-
-    Pre-fix this query returned 3795 rows (only figis that had bars).
-    Post-fix it must return the full tradable set (share + etf + bond
-    on the current prod state.db). A drop back to ~3795 means
-    someone reintroduced the `FROM bars` grouping.
-
-    Snapshot caveat: this is a live DB that the running worker
-    process is actively writing to, so individual counts drift by a
-    few rows between sample points. We snapshot the expected symbol
-    set BEFORE the API call so we compare against the same
-    consistent view, not against a different point-in-time.
-    """
-    prod_db = "/home/hermes/algotrader/apps/api/data/state.db"
-    if not Path(prod_db).exists():
-        pytest.skip(f"prod DB not present at {prod_db}")
-
+def test_get_tickers_response_includes_all_tradable_on_prod_db(regression_tickers):
+    """Historical production denominator regression, without a live DB lock."""
     from algotrader_api.domain.tradeable import TRADEABLE_CLASSES
     from algotrader_api.main import create_app
-    from algotrader_api.routes import data_reads as data_reads_route
 
-    # Precompute the SQL class-list literal outside f-strings because
-    # Python 3.11 disallows backslashes inside f-string expressions.
-    classes_sql = ",".join("'" + c + "'" for c in TRADEABLE_CLASSES)
-
-    # Snapshot expected figi set from prod DB BEFORE the app reads it,
-    # so the worker process can't drift the values out from under us
-    # between the two reads. Use a single connection with BEGIN so the
-    # read is consistent even with the WAL writer active.
-    #
-    # The response uses `symbol = ticker OR figi` — i.e. ticker when
-    # present, falling back to figi. To compare apples to apples we
-    # snapshot BOTH columns and build the expected response symbol
-    # set the same way the API does.
-    con = sqlite3.connect(prod_db)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        n_tradable = con.execute(
-            f"SELECT COUNT(*) FROM instruments WHERE class IN ({classes_sql})"
-        ).fetchone()[0]
-        n_tradable_with_bars = con.execute(
-            f"""
-            SELECT COUNT(DISTINCT i.figi) FROM instruments i
-            JOIN bars b ON b.figi = i.figi
-            WHERE i.class IN ({classes_sql})
-            """
-        ).fetchone()[0]
-        # Build the expected response symbol set exactly the way the
-        # API does: prefer ticker, fall back to figi. This is the set
-        # the Полнота fix promised /api/tickers would return.
+    placeholders = ",".join("?" for _ in TRADEABLE_CLASSES)
+    with sqlite3.connect(regression_tickers) as con:
         expected_symbols = {
-            (row[0] or row[1])
-            for row in con.execute(
-                f"SELECT ticker, figi FROM instruments WHERE class IN ({classes_sql})"
-            ).fetchall()
-            if row[1]  # must have a figi to qualify (matches WHERE i.figi IS NOT NULL)
+            ticker or figi for ticker, figi in con.execute(
+                f"SELECT ticker, figi FROM instruments WHERE class IN ({placeholders})",
+                tuple(TRADEABLE_CLASSES),
+            ) if figi
         }
-        con.rollback()
-    finally:
-        con.close()
-    assert n_tradable > 0
-    missing_in_prod = n_tradable - n_tradable_with_bars
-    assert missing_in_prod > 0, (
-        f"prod DB has {n_tradable} tradable figis but {n_tradable_with_bars} "
-        f"have bars (missing={missing_in_prod}); this test cannot exercise "
-        f"the Полнота fix on a DB where every tradable figi already has bars"
-    )
-
-    data_reads_route.set_sqlite_path(prod_db)
-
-    app = create_app()
-    with TestClient(app) as c:
-        r = c.get("/api/tickers")
-    assert r.status_code == 200
-    body = r.json()
-
-    returned_symbols = {row["symbol"] for row in body}
-
-    # Core invariant: every tradable symbol that existed at snapshot
-    # time must be present in the response. A drop means the
-    # Полнота fix has regressed. Live-worker drift between the
-    # snapshot and the response is acceptable, but specific symbols
-    # that vanished from the response would point at a code bug.
-    missing_in_response = expected_symbols - returned_symbols
-    assert not missing_in_response, (
-        f"/api/tickers is missing {len(missing_in_response)} of "
-        f"{len(expected_symbols)} tradable symbols snapshotted from prod DB "
-        f"(sample: {sorted(missing_in_response)[:5]}) — "
-        f"the Полнота fix has regressed"
-    )
-
-    # Cross-check: at least one zero-bar tradable figi is present with
-    # bars=0 and empty dates — i.e. the LEFT JOIN path was used, not a
-    # fresh `FROM bars` aggregation. The exact count drifts with the
-    # worker, so we don't assert equality here, only presence.
-    zero_bar = [row for row in body if row["bars"] == 0]
-    assert len(zero_bar) > 0, (
-        f"expected at least one zero-bar tradable row in /api/tickers, "
-        f"got {len(zero_bar)} — the LEFT JOIN path appears unused"
-    )
-    sample = zero_bar[0]
-    assert sample["firstDate"] == ""
-    assert sample["lastDate"] == ""
+        n_with_bars = con.execute(
+            f"SELECT COUNT(DISTINCT i.figi) FROM instruments i JOIN bars b USING(figi) "
+            f"WHERE i.class IN ({placeholders})", tuple(TRADEABLE_CLASSES),
+        ).fetchone()[0]
+    assert len(expected_symbols) == 6
+    assert n_with_bars == 3
+    assert len(expected_symbols) > n_with_bars
+    with TestClient(create_app()) as c:
+        response = c.get("/api/tickers")
+    assert response.status_code == 200
+    body = response.json()
+    assert {row["symbol"] for row in body} == expected_symbols
+    assert len(body) == len(expected_symbols)
+    zero_bar = {row["symbol"]: row for row in body if row["bars"] == 0}
+    assert set(zero_bar) == {"EMPTY", "ETF", "BOND"}
+    for row in zero_bar.values():
+        assert row["firstDate"] == ""
+        assert row["lastDate"] == ""
+        assert row["gaps"] == 0

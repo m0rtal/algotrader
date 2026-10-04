@@ -651,7 +651,10 @@ def test_async_backfill_impl_close_failure_logs_exception_type_only(
         import structlog
 
         buf = io.StringIO()
-        structlog.configure(
+        # Bind the logger used by this call site, not global structlog state.
+        # Earlier tests may already have cached backfill's lazy logger.
+        test_logger = structlog.wrap_logger(
+            structlog.PrintLogger(file=buf),
             processors=[
                 structlog.contextvars.merge_contextvars,
                 structlog.stdlib.add_log_level,
@@ -659,9 +662,9 @@ def test_async_backfill_impl_close_failure_logs_exception_type_only(
             ],
             wrapper_class=structlog.make_filtering_bound_logger(logging.WARNING),
             context_class=dict,
-            logger_factory=structlog.PrintLoggerFactory(file=buf),
             cache_logger_on_first_use=False,
         )
+        monkeypatch.setattr(backfill, "logger", test_logger)
 
         asyncio.run(
             backfill._async_backfill_impl(target_days=30, conn=con),

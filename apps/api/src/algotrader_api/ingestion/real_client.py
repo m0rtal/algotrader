@@ -19,9 +19,9 @@ Wrapper responsibilities are kept narrow on purpose:
   so downstream `universe.upsert_instruments` and `bars.run_bars_phase`
   don't depend on the SDK type hierarchy.
 
-Why the __aenter__ dance: `AsyncClient(token, target=...)` only stores
-config; it doesn't open the gRPC channel until you call `__aenter__()`
-on it, and the return value is `AsyncServices`, not the client itself.
+Why the __aenter__ dance: `AsyncClient(token, target=...)` stores config
+and creates the gRPC channel. Its `__aenter__()` enters that channel and
+returns `AsyncServices`, not the client itself.
 Trying to call `client.instruments.shares(...)` directly raises
 `AttributeError` because the bare AsyncClient has no service attributes
 — they're added during `__aenter__` by `services.Services(...)`.
@@ -61,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 from datetime import date
+from time import monotonic
 from typing import Any
 
 from ..observability.logging import get_logger
@@ -179,7 +180,7 @@ class RealTinkoffClient:
         self._target = target_constant
         self._token = token
         self._request_timeout = float(request_timeout)
-        # AsyncClient is the entrypoint; constructor just stores config.
+        # AsyncClient creates a channel on the current event loop's thread.
         # `__aenter__()` returns AsyncServices which has `.users`,
         # `.instruments`, `.market_data`. We cache it for the lifetime
         # of the wrapper; aclose() closes the channel.
@@ -192,42 +193,37 @@ class RealTinkoffClient:
         return self._request_timeout
 
     async def _ensure(self) -> Any:
-        """Open the AsyncClient and cache the resulting AsyncServices.
+        """Open and publish AsyncServices within one initialization budget.
 
-        Both the AsyncClient constructor (sync, runs gRPC channel
-        setup on first access) and the ``__aenter__`` awaitable
-        (opens the actual HTTP/2 connection) can hang indefinitely
-        against a stuck or rate-limited Tinkoff endpoint. We wrap
-        both in ``asyncio.wait_for`` so a poisoned channel is
-        detected at init time, not at the first RPC.
-
-        Raises ``RealClientTimeoutError`` on timeout. Caller is
-        expected to retry via the existing UNAVAILABLE retry loop.
+        The synchronous constructor must run on the current event loop's
+        thread for grpc.aio. It cannot be preempted by asyncio; reject an
+        over-budget result once it returns. Only the remaining monotonic
+        budget is available to ``__aenter__``, and late success is rejected.
+        Failed or cancelled initialization closes the unpublished client.
+        Cleanup has its own best-effort timeout, outside this budget.
         """
         if self._services is None:
             AsyncClient = getattr(self._sdk, "AsyncClient")
-            # Constructor is synchronous AND requires a running event
-            # loop in the current thread (grpc.aio.Channel.__init__
-            # calls cygrpc.get_working_loop()). Calling it directly
-            # inside an async function is fine — it returns in
-            # microseconds (channel is lazy; no network until
-            # __aenter__). The previous off-thread wrap (dispatched
-            # via the default executor, which has no event loop)
-            # surfaced as "There is no current event loop in thread
-            # 'asyncio_0'" during universe_sync.
-            self._client = AsyncClient(self._token, target=self._target)
+            deadline = monotonic() + self._request_timeout
+            client = AsyncClient(self._token, target=self._target)
+            label = "AsyncClient.__init__"
             try:
-                self._services = await asyncio.wait_for(
-                    self._client.__aenter__(),
-                    timeout=self._request_timeout,
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                label = "AsyncClient.__aenter__"
+                services = await asyncio.wait_for(
+                    client.__aenter__(), timeout=remaining,
                 )
-            except asyncio.TimeoutError as exc:
-                # Channel handshake timed out — drop the partial client.
-                await self._safe_aexit(self._client)
-                self._client = None
-                raise RealClientTimeoutError(
-                    "AsyncClient.__aenter__", self._request_timeout,
-                ) from exc
+                if monotonic() >= deadline:
+                    raise asyncio.TimeoutError
+            except BaseException as exc:
+                await self._safe_aexit(client)
+                if isinstance(exc, asyncio.TimeoutError):
+                    raise RealClientTimeoutError(label, self._request_timeout) from exc
+                raise
+            self._client = client
+            self._services = services
         return self._services
 
     async def _safe_aexit(self, client: Any) -> None:

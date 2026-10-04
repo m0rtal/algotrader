@@ -41,6 +41,15 @@ if str(_API_SRC) not in sys.path:
 # ─── helpers ────────────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _close_test_connections():
+    from algotrader_api.db import sqlite as sqlitedb
+
+    sqlitedb.close_all()
+    yield
+    sqlitedb.close_all()
+
+
 def _migrate(db: Path) -> None:
     """Run the project's migrations against a fresh temp DB."""
     from algotrader_api.db import sqlite as sqlitedb
@@ -385,13 +394,15 @@ def test_cli_listed_till_uses_separate_lock_from_evidence(tmp_path, monkeypatch)
     def _active_tracking_lock(db_path, **kw):
         rec = {**kw, "db_path": str(db_path)}
         acquisitions.append(rec)
-        was_active = outermost["active"]
-        outermost["active"] = True
-        try:
-            with real_cm(db_path, **kw):
+        assert not outermost["active"], "CLI nested writer locks"
+        # Only the yielded critical section holds the kernel lock.
+        # Acquisition polling is not a held lock.
+        with real_cm(db_path, **kw):
+            outermost["active"] = True
+            try:
                 yield
-        finally:
-            outermost["active"] = was_active
+            finally:
+                outermost["active"] = False
 
     monkeypatch.setattr(wl_mod, "writer_lock", _active_tracking_lock)
 
@@ -418,40 +429,54 @@ def test_cli_listed_till_uses_separate_lock_from_evidence(tmp_path, monkeypatch)
     # exposes ``record_no_trade_evidence`` as a name it imports
     # at load time; the helper we patched at the source level
     # already takes the lazy path.
-    monkeypatch.setattr(mod, "_get_meta_moex", lambda *a, **kw: None)
+    def _outside_lock(value):
+        assert not outermost["active"], "CLI performed MOEX I/O under writer lock"
+        return value
+
+    monkeypatch.setattr(mod, "_get_meta_moex", lambda *a, **kw: _outside_lock(None))
     monkeypatch.setattr(
-        mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
+        mod, "_probe_board_last", lambda ticker: _outside_lock(("TQCB", "2026-09-10")),
     )
-    # Patch _fetch_moex_range to return a single zero-trade row so
-    # the evidence write path is exercised. The downstream
-    # ``record_no_trade_evidence`` then acquires the second
-    # ``no-trade-evidence / evidence`` lock.
-    def _fake_fetch(market, board, ticker, lo, hi, last_trading_day=None):  # noqa: ARG001
-        return [{
+    # R1: stub the upstream ISIN probe so the CLI's identity guard
+    # sees a match against the seeded instrument ISIN and proceeds
+    # to the evidence write. Without this stub the production probe
+    # returns ``None`` and the guard emits ``identity_mismatch``
+    # (fail-closed).
+    from algotrader_api.ingestion import no_trade_evidence as _nte_cli
+    monkeypatch.setattr(_nte_cli, "fetch_issuer_identity", lambda ticker: _outside_lock({
+        "board": "TQCB", "isin": "X",
+    }))
+    # Patch _fetch_year_moex_outcome (Task 2) to return a single
+    # zero-trade row so the evidence write path is exercised. The
+    # downstream ``record_historical_no_trade_evidence`` then
+    # acquires the second ``no-trade-evidence / evidence`` lock.
+    def _fake_fetch(market, board, ticker, year, last_trading_day=None):  # noqa: ARG001
+        _outside_lock(None)
+        return ([{
             "ts": "2026-09-08",
             "open": None, "high": None, "low": None, "close": None,
             "volume": 0,
             "_secid": ticker, "_boardid": board,
             "_numtrades": 0, "_value": 0,
             "figi": None, "source": "moex",
-        }]
-    monkeypatch.setattr(mod, "_fetch_moex_range", _fake_fetch)
+        }], "complete")
+    monkeypatch.setattr(mod, "_fetch_year_moex_outcome", _fake_fetch)
 
-    # Patch time.sleep inside the loaded CLI module so we can detect
-    # whether the lock is held during the sleep.
-    import time as _time
-    real_sleep = _time.sleep
+    # Replace module bindings, not the shared stdlib time.sleep: unrelated
+    # background threads and writer-lock acquisition polling are not CLI I/O.
+    from types import SimpleNamespace
+    sleeps: list[float] = []
 
     def _spy_sleep(secs):
+        sleeps.append(secs)
         if outermost["active"]:
             sleep_seen_under_lock["value"] = True
-        real_sleep(min(secs, 0.001))
+        time.sleep(min(secs, 0.001))
 
-    monkeypatch.setattr(mod.time, "sleep", _spy_sleep)
-    # Also patch on the backfill module (the CLI uses it for module-
-    # level lookups in some paths).
+    scoped_time = SimpleNamespace(time=time.time, monotonic=time.monotonic, sleep=_spy_sleep)
+    monkeypatch.setattr(mod, "time", scoped_time)
     import algotrader_api.ingestion.backfill as _bf_mod
-    monkeypatch.setattr(_bf_mod.time, "sleep", _spy_sleep)
+    monkeypatch.setattr(_bf_mod, "time", scoped_time)
 
     # Run the CLI directly via main() so the test stays in-process.
     argv = ["x", "--db", str(db), "--limit", "1", "--days", "60"]
@@ -481,6 +506,7 @@ def test_cli_listed_till_uses_separate_lock_from_evidence(tmp_path, monkeypatch)
     assert not sleep_seen_under_lock["value"], (
         "CLI called time.sleep while the writer lock was held"
     )
+    assert sleeps == [0.25], f"CLI throttle not exercised: {sleeps!r}"
 
 
 # ─── RED: CLI exits 75 on writer-lock-busy ─────────────────────────────
@@ -518,7 +544,16 @@ def test_cli_busy_exits_75_and_emits_one_defer_line(tmp_path, monkeypatch):
     monkeypatch.setattr(
         mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
     )
-    monkeypatch.setattr(mod, "_fetch_moex_range", lambda *a, **kw: [])
+    # R1: stub the upstream ISIN probe so the CLI's identity guard
+    # sees a match against the seeded instrument ISIN and proceeds
+    # to the evidence write. Without this stub the production probe
+    # returns ``None`` and the guard emits ``identity_mismatch``
+    # (fail-closed).
+    from algotrader_api.ingestion import no_trade_evidence as _nte_cli
+    monkeypatch.setattr(_nte_cli, "fetch_issuer_identity", lambda ticker: {
+        "board": "TQCB", "isin": "X",
+    })
+    monkeypatch.setattr(mod, "_fetch_year_moex_outcome", lambda *a, **kw: ([], "complete"))
 
     def _busy_always(db_path, **kw):
         # Every writer_lock acquisition is immediately refused.
@@ -595,7 +630,16 @@ def test_cli_dry_run_does_not_acquire_writer_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(
         mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
     )
-    monkeypatch.setattr(mod, "_fetch_moex_range", lambda *a, **kw: [])
+    # R1: stub the upstream ISIN probe so the CLI's identity guard
+    # sees a match against the seeded instrument ISIN and proceeds
+    # to the evidence write. Without this stub the production probe
+    # returns ``None`` and the guard emits ``identity_mismatch``
+    # (fail-closed).
+    from algotrader_api.ingestion import no_trade_evidence as _nte_cli
+    monkeypatch.setattr(_nte_cli, "fetch_issuer_identity", lambda ticker: {
+        "board": "TQCB", "isin": "X",
+    })
+    monkeypatch.setattr(mod, "_fetch_year_moex_outcome", lambda *a, **kw: ([], "complete"))
 
     acquisitions: list[dict] = []
     real_cm = wl_mod.writer_lock
@@ -622,3 +666,118 @@ def test_cli_dry_run_does_not_acquire_writer_lock(tmp_path, monkeypatch):
     # Verify the dry-run message was emitted.
     out = buf.getvalue()
     assert "[dry]" in out, f"dry-run marker missing from output: {out!r}"
+
+
+# ─── Canonical: CLI partial outcome exits 0 with zero evidence ─────────
+
+
+def test_cli_partial_outcome_exits_zero_without_writing_evidence(
+    tmp_path, monkeypatch,
+):
+    """Canonical spec scenario: when every figi's MOEX fetch returns
+    a non-``complete`` outcome (``partial``), the CLI exits 0 and
+    writes zero evidence rows. The diagnostic line
+    ``moex_historical_evidence_rejected`` is emitted so the
+    operator sees the degraded run; cron / supervisor policy
+    relies on that structured log, not on a new exit code.
+
+    No new exit code is introduced — the existing
+    ``WriterLockBusy`` -> ``return 75`` path is the only non-zero
+    exit.
+
+    Bounded: 1 figi, 1 year, ``partial`` outcome, matching upstream
+    ISIN, no ``WriterLockBusy``.
+    """
+    import importlib.util
+    import io
+    import contextlib
+
+    db = tmp_path / "partial.db"
+    _migrate(db)
+    _seed_instrument(db, "FIGI-PARTIAL", "DELISTED")
+    con = sqlite3.connect(str(db))
+    con.execute(
+        "INSERT INTO bars (figi, ts, open, high, low, close, volume, source) "
+        "VALUES ('FIGI-PARTIAL', '2026-09-05', 1, 1, 1, 1, 1, 'tinkoff')",
+    )
+    con.commit()
+    con.close()
+
+    from algotrader_api.ingestion import writer_lock as wl_mod
+    script_path = (
+        Path(__file__).resolve().parent.parent / "scripts"
+        / "backfill_no_trade_evidence.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "backfill_no_trade_evidence_cli_partial", script_path,
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    monkeypatch.setattr(mod, "_get_meta_moex", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
+    )
+    # R1: stub the upstream ISIN probe so the CLI's identity guard
+    # sees a match against the seeded instrument ISIN and proceeds
+    # to the per-year fetch loop.
+    from algotrader_api.ingestion import no_trade_evidence as _nte_cli
+    monkeypatch.setattr(_nte_cli, "fetch_issuer_identity", lambda ticker: {
+        "board": "TQCB", "isin": "X",
+    })
+    # Force a ``partial`` outcome from the per-year fetcher — the
+    # helper short-circuits, no evidence is written, the CLI
+    # exits 0 because the canonical contract is
+    # ``partial -> zero evidence rows -> exit 0`` with the
+    # ``moex_historical_evidence_rejected`` log line carrying
+    # the diagnostic.
+    monkeypatch.setattr(
+        mod, "_fetch_year_moex_outcome",
+        lambda *a, **kw: ([], "partial"),
+    )
+
+    # Allow the writer lock to be acquired normally (we are not
+    # testing the lock path here).
+    real_cm = wl_mod.writer_lock
+
+    @wl_mod.contextmanager  # type: ignore[attr-defined]
+    def _passthrough(db_path, **kw):
+        with real_cm(db_path, **kw):
+            yield
+
+    monkeypatch.setattr(mod, "writer_lock", _passthrough)
+
+    buf = io.StringIO()
+    monkeypatch.setattr(
+        sys, "argv",
+        ["x", "--db", str(db), "--limit", "1", "--sleep", "0"],
+    )
+    with contextlib.redirect_stdout(buf):
+        rc = mod.main()
+    output = buf.getvalue()
+    # Canonical: partial outcome + zero evidence rows -> exit 0.
+    # The diagnostic line is what surfaces the degraded run to
+    # operators / cron — not a new exit code.
+    assert rc == 0, (
+        f"CLI must exit 0 on partial outcome (zero evidence); "
+        f"got rc={rc}, output={output!r}"
+    )
+    # And no evidence row was persisted — the partial fetcher
+    # returned no rows, so the writer must not fabricate any.
+    con2 = sqlite3.connect(str(db))
+    try:
+        n = con2.execute(
+            "SELECT COUNT(*) FROM moex_no_trade_evidence "
+            "WHERE figi = ?",
+            ("FIGI-PARTIAL",),
+        ).fetchone()[0]
+    finally:
+        con2.close()
+    assert n == 0, (
+        f"partial outcome must NOT write evidence, got n={n}"
+    )
+    # Diagnostic must surface the degraded run in the operator log.
+    assert (
+        "moex_historical_evidence_rejected" in output
+        and "figi=FIGI-PARTIAL" in output
+        and "reason=partial" in output
+    ), f"missing diagnostic line in output={output!r}"

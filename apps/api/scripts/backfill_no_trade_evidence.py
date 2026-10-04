@@ -30,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import sqlite3
 import sys
 import threading
@@ -43,12 +44,15 @@ sys.path.insert(0, str(API_SRC))
 
 from algotrader_api.ingestion.backfill import (  # noqa: E402
     _fetch_moex_range,
+    _fetch_year_moex_outcome,
     _get_meta_moex,
     _last_trading_day,
+    _reduce_outcomes,
 )
 from algotrader_api.ingestion.no_trade_evidence import (  # noqa: E402
     _extract_zero_trade_rows,
     _moex_session,
+    record_historical_no_trade_evidence,
     record_no_trade_evidence,
 )
 from algotrader_api.ingestion.writer_lock import (  # noqa: E402
@@ -213,34 +217,108 @@ def main() -> int:
             lo = max(floor, date.fromisoformat(r["max_ts"]) + timedelta(days=1))
             if lo > win_hi:
                 continue
-            try:
-                bars = _fetch_moex_range(
-                    market, board, ticker,
-                    lo, win_hi, last_trading_day=win_hi,
-                )
-            except Exception as e:  # noqa: BLE001 — keep walking the list
-                print(f"  [{i}/{len(todo)}] {ticker}: fetch failed: {e!r}")
+            # Task 2: walk the outcome-emitting fetcher per touched
+            # calendar year. The historical evidence helper gates on
+            # the per-fetch outcome (``complete`` vs degraded) and
+            # threads the explicit ``ticker`` from the ``instruments``
+            # row through to the per-row identity filter — it does
+            # NOT guess the ticker from the first row. The bar-list
+            # consumer contract is preserved (the existing
+            # ``_fetch_moex_range`` is replaced by
+            # ``_fetch_year_moex_outcome`` per year; the rows it
+            # returned are the rows the helper sees, no second fetch
+            # per figi). On a non-``complete`` outcome, the helper
+            # emits exactly one ``moex_historical_evidence_rejected``
+            # line and continues to the next figi. No new exit code;
+            # the existing ``return 75`` on ``WriterLockBusy`` is
+            # unchanged. Dry-run short-circuits BEFORE the outcome
+            # gate so an unrelated test stubbing the fetcher with
+            # ``complete`` still walks the existing dry-run print.
+            years = list(range(lo.year, win_hi.year + 1))
+            all_rows: list[dict] = []
+            overall = "complete"
+            fetch_failed = False
+            for y in years:
+                try:
+                    year_rows, year_outcome = _fetch_year_moex_outcome(
+                        market, board, ticker, y,
+                        last_trading_day=win_hi,
+                    )
+                except Exception as e:  # noqa: BLE001 — keep walking the list
+                    print(f"  [{i}/{len(todo)}] {ticker}: fetch failed for year {y}: {e!r}")
+                    fetch_failed = True
+                    break
+                all_rows.extend(year_rows)
+                overall = _reduce_outcomes(overall, year_outcome)
+            if fetch_failed:
                 continue
-            zrows = _extract_zero_trade_rows(bars)
-            if not zrows:
-                continue
+            zrows = _extract_zero_trade_rows(all_rows)
             if args.dry_run:
-                print(f"  [dry] {ticker}: {len(zrows)} zero-trade days "
-                      f"({zrows[0]['ts']}..{zrows[-1]['ts']})")
+                if not zrows:
+                    print(f"  [dry] {ticker}: no zero-trade days in window")
+                else:
+                    print(f"  [dry] {ticker}: {len(zrows)} zero-trade days "
+                          f"({zrows[0]['ts']}..{zrows[-1]['ts']})")
                 figis_written += 1
                 rows_written += len(zrows)
                 continue
-            # Coordination (Task 3): evidence write uses the public
-            # ``record_no_trade_evidence`` wrapper, which acquires the
-            # shared lock with
+            if overall != "complete":
+                # The helper emits its own structured rejection line;
+                # we only need the figi context for the operator log.
+                print(
+                    f"  [{i}/{len(todo)}] {ticker}: "
+                    f"moex_historical_evidence_rejected figi={figi} "
+                    f"reason={overall} rows={len(all_rows)}"
+                )
+                continue
+            if not zrows:
+                continue
+            # Identity guard (R1): the helper compares the upstream
+            # ISIN it receives against the figi's stored ISIN. The
+            # ``isin`` argument MUST carry the upstream-verified
+            # metadata ISIN (not the local one), so the CLI does the
+            # same MOEX identity probe the historical walker does
+            # before invoking the helper. When the upstream ISIN is
+            # empty (probe failed or no primary board) AND the local
+            # ISIN is populated, we skip the figi with the same
+            # ``identity_mismatch`` log line the helper would emit
+            # — fail-closed, no DB write, no fabricated identity.
+            local_isin = str(r["isin"] or "").strip()
+            from algotrader_api.ingestion.no_trade_evidence import (
+                fetch_issuer_identity as _fii,
+            )
+            ident = _fii(ticker)
+            upstream_isin = (
+                (ident.get("isin") or "").strip() if ident else ""
+            )
+            if upstream_isin != local_isin:
+                logging.getLogger("algotrader.ingestion").info(
+                    "moex_historical_evidence_rejected figi=%s "
+                    "reason=identity_mismatch rows=%s",
+                    figi, len(all_rows),
+                )
+                print(
+                    f"  [{i}/{len(todo)}] {ticker}: "
+                    f"moex_historical_evidence_rejected figi={figi} "
+                    f"reason=identity_mismatch rows={len(all_rows)}"
+                )
+                continue
+            # Coordination (Task 3): evidence write goes through
+            # ``record_historical_no_trade_evidence`` which acquires
+            # the shared lock with
             # ``role="no-trade-evidence" / phase="evidence"``. The
             # ``listed_till`` lock (if any) was released above so the
-            # two never nest. MOEX fetch and ``time.sleep`` run OUTSIDE
-            # the lock.
+            # two never nest. MOEX fetch and ``time.sleep`` run
+            # OUTSIDE the lock. The ``WriterLockBusy`` propagation
+            # is unchanged — the existing ``return 75`` path still
+            # applies; the helper does not invent a new exit code.
             try:
-                n = record_no_trade_evidence(
-                    con, db_path=str(db_path), figi=figi, rows=zrows,
-                    board=board, isin=str(r["isin"] or ""),
+                n = record_historical_no_trade_evidence(
+                    con, db_path=str(db_path), figi=figi, ticker=ticker,
+                    rows=all_rows, board=board,
+                    isin=upstream_isin,
+                    outcome=overall,
+                    from_d=lo, to_d=win_hi, today=date.today(),
                 )
             except WriterLockBusy as exc:
                 print(format_busy_defer(exc))
@@ -253,7 +331,15 @@ def main() -> int:
                 time.sleep(args.sleep)
         dt = time.time() - t0
         print(f"done: figis_with_evidence={figis_written} rows={rows_written} "
-              f"delisted={figis_delisted} no_meta={figis_nometa} elapsed_s={dt:.1f}")
+              f"delisted={figis_delisted} no_meta={figis_nometa} "
+              f"elapsed_s={dt:.1f}")
+        # Canonical: the CLI exits 0 regardless of how many figis
+        # were degraded. The diagnostic
+        # ``moex_historical_evidence_rejected`` line above carries
+        # the operator signal; cron / supervisor policy reads the
+        # log, not the exit code. The only non-zero exit is the
+        # existing ``return 75`` on ``WriterLockBusy`` — no new
+        # exit code is introduced for partial outcomes.
         return 0
     finally:
         con.close()

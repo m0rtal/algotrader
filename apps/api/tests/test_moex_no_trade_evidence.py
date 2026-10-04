@@ -968,3 +968,1386 @@ def test_populate_script_ignores_listed_till_before_listing(tmp_path):
         _date.today() - _td(days=1),
     )
     assert value == want, f"expected_bars={value}, want {want} (guard must ignore 2020 listed_till)"
+
+
+# -- MOEXFetchOutcome (Task 1) -------------------------------------------
+
+
+def test_fetch_year_moex_outcome_complete_full_pagination():
+    """Single-page full cursor yields outcome == 'complete'."""
+    from algotrader_api.ingestion import backfill
+    from algotrader_api.ingestion.no_trade_evidence import (
+        MOEXFetchOutcome,
+    )
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0],
+                ["2025-09-30", "GAZP", "TQBR",
+                 100, 102, 99, 101, 1000, 5, 100000],
+            ],
+        },
+        # cursor: offset 0, total 2, page_size 2 (loop asked for 500,
+        # the loop is satisfied because 0 + 2 >= 2).
+        "history.cursor": {"data": [[0, 2, 2]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "complete"
+    assert len(rows) == 2
+    assert rows[0]["_secid"] == "GAZP"
+
+
+def test_fetch_year_moex_outcome_error_on_network_failure():
+    """requests.get raising -> outcome == 'error', rows == []."""
+    from algotrader_api.ingestion import backfill
+    from algotrader_api.ingestion.no_trade_evidence import (
+        MOEXFetchOutcome,
+    )
+
+    import unittest.mock as _mock
+
+    def boom(*a, **kw):
+        raise ConnectionError("net")
+
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=boom):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "error"
+    assert rows == []
+
+
+def test_fetch_year_moex_outcome_malformed_missing_tradedate():
+    """history.columns missing TRADEDATE -> 'malformed'."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["SECID", "BOARDID", "OPEN", "CLOSE"],
+            "data": [["GAZP", "TQBR", 100, 101]],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+    assert rows == []
+
+
+def test_fetch_year_moex_outcome_short_page_no_cursor_is_malformed():
+    """No cursor + short page cannot certify completeness."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID"],
+            "data": [["2025-09-29", "GAZP", "TQBR"]],
+        },
+        # No history.cursor; len(rows) < page_size (500).
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+
+
+def test_fetch_year_moex_outcome_partial_incomplete_cursor():
+    """True 2-page partial: cursor advances on page 1, the final page's
+    ``offset + len(rows) < total`` makes the per-fetch outcome ``partial``.
+
+    Genuine incomplete pagination — the cursor MUST advance (the spec
+    forbids repeated offsets; the dedicated repeated-offset test below
+    pins that rule separately). The first page returns a full 100 rows
+    with offset 0; the second page advances to offset 100 and returns
+    only 50 rows against a promised total of 300. The per-fetch
+    outcome becomes ``partial`` because the final page can't close the
+    loop.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    page1 = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [["2025-09-29", "GAZP", "TQBR",
+                      100, 102, 99, 101, 1000, 5, 100000]] * 100,
+        },
+        # offset 0, total 300, page_size 100 — full first page, more
+        # to come.
+        "history.cursor": {"data": [[0, 300, 100]]},
+    }
+    page2 = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [["2025-09-30", "GAZP", "TQBR",
+                      100, 102, 99, 101, 1000, 5, 100000]] * 50,
+        },
+        # offset 100 (advanced), total 300, page_size 100 — 50 rows
+        # returned, 100+50=150 < 300 → partial final page.
+        "history.cursor": {"data": [[100, 300, 100]]},
+    }
+    responses = [page1, page2]
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(responses.pop(0))):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "partial"
+    assert len(rows) == 150
+    assert responses == [], "loop did not advance past page 2"
+
+
+def test_fetch_year_moex_outcome_multipage_complete():
+    """True multi-page completion: ≥2 pages with advancing cursor that
+    closes the loop on the final page.
+
+    Distinct from ``test_fetch_year_moex_outcome_complete_full_pagination``
+    (which is single-page disguised — 2 rows returned, cursor closes
+    immediately). This test forces the loop to actually walk past page 1
+    and verify it terminates on the final page with a full
+    ``offset + len(rows) == total`` close.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    page1 = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [["2025-09-29", "GAZP", "TQBR",
+                      100, 102, 99, 101, 1000, 5, 100000]] * 100,
+        },
+        # offset 0, total 200, page_size 100 — full first page, more
+        # to come.
+        "history.cursor": {"data": [[0, 200, 100]]},
+    }
+    page2 = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [["2025-09-30", "GAZP", "TQBR",
+                      100, 102, 99, 101, 1000, 5, 100000]] * 100,
+        },
+        # offset 100 (advanced), total 200, page_size 100 — 100 rows
+        # returned, 100+100=200 >= 200 → loop closes, outcome complete.
+        "history.cursor": {"data": [[100, 200, 100]]},
+    }
+    responses = [page1, page2]
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(responses.pop(0))):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "complete"
+    assert len(rows) == 200
+    assert responses == [], "loop did not advance past page 2"
+
+
+def test_fetch_year_moex_outcome_identity_mismatch_poisons_batch():
+    """A single cross-listed mirror row poisons the whole fetch."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 100, 102, 99, 101, 1000, 5, 100000],
+                # identity mismatch — single row, batch poisoned.
+                ["2025-09-30", "SBER", "TQBR",
+                 200, 202, 199, 201, 2000, 10, 200000],
+            ],
+        },
+        "history.cursor": {"data": [[0, 2, 2]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "identity_mismatch"
+    assert len(rows) == 2
+
+
+def test_fetch_year_moex_outcome_worst_severity_wins():
+    """First page error forces outcome == 'error' even if subsequent
+    pages parse.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    call_count = {"n": 0}
+
+    def fake_get(url, params=None, timeout=None):  # noqa: ARG001
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ConnectionError("net")
+        return _FakeResp({
+            "history": {
+                "columns": ["TRADEDATE", "SECID", "BOARDID"],
+                "data": [["2025-09-29", "GAZP", "TQBR"]],
+            },
+            "history.cursor": {"data": [[0, 1, 1]]},
+        })
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=fake_get):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "error"
+    assert rows == []
+
+
+def test_fetch_year_moex_outcome_non_200_status_is_malformed():
+    """HTTP 500 is malformed, not complete, even if body parses."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 500
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID"],
+            "data": [["2025-09-29", "GAZP", "TQBR"]],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+    assert rows == []
+
+
+def test_fetch_year_moex_outcome_initial_cursor_offset_mismatch_is_malformed():
+    """Loop asks for start=0, server reports offset=2 -> malformed."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID"],
+            "data": [["2025-09-29", "GAZP", "TQBR"]],
+        },
+        # offset 2, total 3, page_size 1 -> loop asked start=0.
+        "history.cursor": {"data": [[2, 3, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+
+
+def test_fetch_year_moex_outcome_repeated_cursor_offset_is_malformed():
+    """Two pages with the same cursor offset -> malformed."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    page = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID"],
+            "data": [["2025-09-29", "GAZP", "TQBR"]],
+        },
+        # Same offset on every page — no progress, malformed.
+        "history.cursor": {"data": [[0, 999, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(page)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+
+
+def test_fetch_year_moex_outcome_missing_ohlc_nonzero_volume_is_malformed():
+    """OPEN/HIGH/LOW/CLOSE absent on a non-zero VOLUME row -> malformed."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    # Columns list includes all OHLC + VOLUME, but the row is short
+    # on the OHLC side (None) AND has a non-zero VOLUME.
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 None, None, None, None, 1000, 5, 100000],
+            ],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+
+
+def test_fetch_year_moex_outcome_zero_trade_missing_counters_is_malformed():
+    """VOLUME=0 row without explicit NUMTRADES=0/VALUE=0 -> malformed."""
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                # NUMTRADES / VALUE missing (None) on a zero-volume
+                # row — must be malformed, not complete.
+                ["2025-09-29", "GAZP", "TQBR",
+                 None, None, None, None, 0, None, None],
+            ],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed"
+
+
+# -- Task1 R2: strict raw-row poison (parent repro) ---------------------
+
+
+def test_fetch_year_moex_outcome_malformed_short_row_poisons_outcome():
+    """Parent repro: 1 valid row + 1 short row (len 9 vs cols 10). The
+    short row must poison the outcome to ``malformed`` BEFORE the loop
+    continues, and the valid row is preserved in the returned list
+    (bar consumers keep their data, evidence path is refused).
+
+    Without the fix: outcome=complete, len(rows)=1 (silent drop on
+    the short row, cursor close still reads complete). Spec demands
+    malformed.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    # short_row: drops the last column (VALUE) — len 9 vs cols 10.
+    short_row = valid_row[:-1]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row, short_row],
+        },
+        # Raw length 2, but kept length 1. Spec: any malformed raw row
+        # poisons outcome — cursor close is irrelevant.
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+    # The valid clean row is preserved — bar consumers still get the
+    # data they would have accepted today.
+    assert len(rows) == 1
+    assert rows[0]["_secid"] == "GAZP"
+
+
+def test_fetch_year_moex_outcome_malformed_long_row_poisons_outcome():
+    """A row LONGER than the columns list must also poison the outcome
+    (the strict feed contract is column-list-anchored, not "row shorter
+    than cols only"). Kept clean row preserved.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    long_row = valid_row + [99]  # one extra trailing value
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row, long_row],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+    assert len(rows) == 1
+    assert rows[0]["_secid"] == "GAZP"
+
+
+def test_fetch_year_moex_outcome_row_is_none_does_not_crash():
+    """A row whose value is ``None`` (where the strict contract expects a
+    scalar) must not crash the parser; it counts as malformed and poisons
+    the outcome. The remaining valid rows are preserved.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            # Second "row" is the literal None — common when a server
+            # pads an empty slot. Must not crash; must poison outcome.
+            "data": [valid_row, None],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+    assert len(rows) == 1
+    assert rows[0]["_secid"] == "GAZP"
+
+
+def test_fetch_year_moex_outcome_row_is_string_does_not_crash():
+    """A row whose value is a string (where the contract expects a
+    sequence) must not crash. The length check catches it cleanly:
+    ``len("a string") == 8`` which is shorter than the columns list
+    (10), so it drops + poisons. No exception bubbles to the caller.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row, "not-a-row"],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+    assert len(rows) == 1
+    assert rows[0]["_secid"] == "GAZP"
+
+
+def test_fetch_year_moex_outcome_cursor_offset_wrong_type_is_malformed():
+    """Spec cursor: ``[offset, total, page_size]`` integers only. A
+    fractional ``offset`` (``0.5``) is malformed — we cannot use a
+    non-integer as a pagination index. Bool, float fraction, None are
+    all malformed. The kept clean row is preserved.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row],
+        },
+        # offset is a fraction — the strict cursor contract is integer.
+        "history.cursor": {"data": [[0.5, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+    assert len(rows) == 1
+
+
+def test_fetch_year_moex_outcome_cursor_page_size_inconsistent_is_malformed():
+    """F1: cursor promises page_size=100 but the server returned 200
+    rows on the same page. Spec line 30-31: page_size consistency check
+    → malformed. Kept clean rows preserved.
+
+    Independent of the parent repro: this is the F1 page_size
+    consistency guard.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-29", "GAZP", "TQBR",
+                 100, 102, 99, 101, 1000, 5, 100000]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row] * 200,  # 200 rows
+        },
+        # cursor says page_size=100; server returned 200. Inconsistent.
+        "history.cursor": {"data": [[0, 200, 100]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+
+
+def test_fetch_year_moex_outcome_missing_status_code_is_malformed():
+    """F3: a response with no ``status_code`` attribute at all must
+    fail closed to ``malformed`` (cannot certify HTTP success without
+    the attribute). The legacy test that omits status_code goes
+    through the bar-list wrapper, which never reads status_code, so
+    that test is unaffected.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeRespNoStatus:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    valid_row = ["2025-09-01", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0]
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [valid_row],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeRespNoStatus(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+
+
+def test_fetch_year_moex_outcome_fractional_volume_is_malformed():
+    """F4: a non-integer VOLUME (e.g. 1000.5) is malformed. The strict
+    contract requires integer share counts; ``int(1000.5) == 1000``
+    would silently truncate. Reject fractional VOLUME explicitly.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 100, 102, 99, 101, 1000.5, 5, 100000],
+            ],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "malformed", f"want malformed, got {outcome!r}"
+
+
+# -- bar-list compatibility (Step 2 / Step 3) --------------------------
+
+
+def test_fetch_year_moex_list_only_signature_preserved_positional():
+    """The existing list-only path keeps the
+    positional-or-keyword ``last_trading_day`` signature; callers
+    can pass it positionally or by keyword.
+    """
+    from algotrader_api.ingestion import backfill
+    import datetime as _dt
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0],
+            ],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        # last_trading_day passed POSITIONALLY (legacy call style).
+        rows = backfill._fetch_year_moex(
+            "shares", "TQBR", "GAZP", 2025, _dt.date(2025, 9, 29),
+        )
+    assert len(rows) == 1
+    assert rows[0]["_secid"] == "GAZP"
+    assert rows[0]["_boardid"] == "TQBR"
+
+
+def test_fetch_year_moex_outcome_emits_raw_columns_per_dict():
+    """Regression: the existing raw-columns test must still pass after
+    the outcome addition; the outcome variant agrees on shape.
+    """
+    from algotrader_api.ingestion import backfill
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    payload = {
+        "history": {
+            "columns": ["TRADEDATE", "SECID", "BOARDID",
+                        "OPEN", "HIGH", "LOW", "CLOSE",
+                        "VOLUME", "NUMTRADES", "VALUE"],
+            "data": [
+                ["2025-09-29", "GAZP", "TQBR",
+                 None, None, None, None, 0, 0, 0],
+            ],
+        },
+        "history.cursor": {"data": [[0, 1, 1]]},
+    }
+    import unittest.mock as _mock
+    with _mock.patch.object(backfill.requests, "get",
+                            side_effect=lambda *a, **kw: _FakeResp(payload)):
+        rows, outcome = backfill._fetch_year_moex_outcome(
+            "shares", "TQBR", "GAZP", 2025,
+        )
+    assert outcome == "complete"
+    assert rows[0]["_secid"] == "GAZP"
+    assert rows[0]["_numtrades"] == 0
+
+
+# -- record_historical_no_trade_evidence (Task 2) -------------------------
+
+
+def test_record_historical_no_trade_evidence_rejects_partial(tmp_path):
+    """Partial outcome short-circuits and writes nothing."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+    ]
+    written = record_historical_no_trade_evidence(
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU000GAZP",
+        outcome="partial",
+    )
+    assert written == 0
+    n = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence"
+    ).fetchone()[0]
+    assert n == 0
+
+
+def test_record_historical_no_trade_evidence_rejects_error(tmp_path):
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    written = record_historical_no_trade_evidence(
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=[{"ts": "2025-09-29"}], board="TQBR", isin="RU",
+        outcome="error",
+    )
+    assert written == 0
+
+
+def test_record_historical_no_trade_evidence_rejects_malformed(tmp_path):
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    written = record_historical_no_trade_evidence(
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=[{"ts": "2025-09-29"}], board="TQBR", isin="RU",
+        outcome="malformed",
+    )
+    assert written == 0
+
+
+def test_record_historical_no_trade_evidence_rejects_identity_mismatch(tmp_path):
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    rows = [{"ts": "2025-09-29", "_secid": "SBER", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0}]
+    written = record_historical_no_trade_evidence(
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU",
+        outcome="identity_mismatch",
+    )
+    assert written == 0
+
+
+def test_is_business_date_for_evidence_weekday_not_holiday(tmp_path):
+    """A plain weekday with no holiday row is a business date."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        _is_business_date_for_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    # 2025-09-29 is a Monday.
+    assert _is_business_date_for_evidence(
+        con, "2025-09-29",
+    )
+
+
+def test_is_business_date_for_evidence_saturday_is_not(tmp_path):
+    """2025-09-27 is a Saturday."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        _is_business_date_for_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    assert not _is_business_date_for_evidence(
+        con, "2025-09-27",
+    )
+
+
+def test_is_business_date_for_evidence_holiday_is_not(tmp_path):
+    """A weekday that is in moex_holidays is not a business date."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        _is_business_date_for_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    con.execute(
+        "INSERT INTO moex_holidays(date, name) VALUES ('2025-09-29', 'X')"
+    )
+    con.commit()
+    assert not _is_business_date_for_evidence(
+        con, "2025-09-29",
+    )
+
+
+def test_is_business_date_for_evidence_malformed_ts_is_not(tmp_path):
+    from algotrader_api.ingestion.no_trade_evidence import (
+        _is_business_date_for_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    assert not _is_business_date_for_evidence(con, "garbage")
+    assert not _is_business_date_for_evidence(con, "")
+    assert not _is_business_date_for_evidence(con, "2025-9-29")
+
+
+def test_record_historical_no_trade_evidence_complete_filters_non_business(
+    tmp_path,
+):
+    """Complete outcome + mixed business / non-business rows -> only
+    business-date rows are persisted."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    con.execute(
+        "INSERT INTO moex_holidays(date, name) VALUES ('2025-09-29', 'X')"
+    )
+    # R1: seed the instrument so the new ISIN identity gate (helper
+    # compares upstream ``isin`` arg against the stored
+    # ``instruments.isin``) sees a match and proceeds.
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
+    con.commit()
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},  # holiday
+        {"ts": "2025-09-27", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},  # Sat
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},  # Tue ok
+        {"ts": "garbage",   "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},  # bad
+    ]
+    written = record_historical_no_trade_evidence(
+        con, from_d=date(2025, 9, 27), to_d=date(2025, 9, 30), db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU",
+        outcome="complete",
+    )
+    assert written == 1
+    rows_db = con.execute(
+        "SELECT session_date FROM moex_no_trade_evidence WHERE figi='FIGI1'"
+    ).fetchall()
+    assert [r["session_date"] for r in rows_db] == ["2025-09-30"]
+
+
+def test_record_historical_no_trade_evidence_complete_keeps_ttl_semantics(
+    tmp_path,
+):
+    """Recent row gets 7-day expiry, historical row gets 365-day
+    expiry."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        RECENT_EVIDENCE_EXPIRY,
+        HISTORICAL_EVIDENCE_EXPIRY,
+        record_historical_no_trade_evidence,
+    )
+    import datetime as _dt
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    # R1: seed the instrument so the new ISIN identity gate sees a
+    # match.
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
+    con.commit()
+    today = _dt.date(2026, 9, 30)
+    # 2026-09-25 is a Friday (recent), 2026-08-03 is a Monday (historical).
+    # Brief fixture 2026-08-01 was a Saturday — helper correctly rejects
+    # non-business dates per the ADDED Requirement; replace with a
+    # business-date sibling that still spans the recent/historical
+    # TTL cut-off (14 days from `today`).
+    rows = [
+        {"ts": "2026-09-25", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+        {"ts": "2026-08-03", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+    ]
+    record_historical_no_trade_evidence(
+        con, from_d=date(2026, 8, 3), to_d=date(2026, 9, 25), db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU",
+        outcome="complete", today=today,
+    )
+    recent = con.execute(
+        "SELECT expires_at FROM moex_no_trade_evidence "
+        "WHERE session_date = '2026-09-25'"
+    ).fetchone()[0]
+    historical = con.execute(
+        "SELECT expires_at FROM moex_no_trade_evidence "
+        "WHERE session_date = '2026-08-03'"
+    ).fetchone()[0]
+    assert recent == (today + RECENT_EVIDENCE_EXPIRY).isoformat()
+    assert historical == (today + HISTORICAL_EVIDENCE_EXPIRY).isoformat()
+
+
+def test_record_historical_no_trade_evidence_complete_respects_real_bar(
+    tmp_path,
+):
+    """A real bar for the same date suppresses the evidence row."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    # R1: seed the instrument so the new ISIN identity gate sees a
+    # match.
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
+    _insert_bar(con, "FIGI1", "2025-09-30", close=100)
+    rows = [
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+    ]
+    written = record_historical_no_trade_evidence(
+        con, from_d=date(2025, 9, 30), to_d=date(2025, 9, 30), db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU",
+        outcome="complete",
+    )
+    assert written == 0
+    n = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence"
+    ).fetchone()[0]
+    assert n == 0
+
+
+def test_record_historical_no_trade_evidence_uses_explicit_ticker_not_rows_zero(
+    tmp_path,
+):
+    """The helper MUST use the explicit ``ticker`` argument, not
+    ``rows[0].get("_secid")``. A batch whose first row is a mirror
+    SECID and whose every other row matches the caller's ticker is
+    rejected — the helper is end-to-end, not zero-trust."""
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    # R1: seed the instrument so the new ISIN identity gate sees a
+    # match.
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
+    con.commit()
+    rows = [
+        # First row is a mirror (would mislead a "guess from rows[0]"
+        # implementation). Every other row is identity-correct.
+        {"ts": "2025-09-29", "_secid": "SBER", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+    ]
+    written = record_historical_no_trade_evidence(
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 30), db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="RU",
+        outcome="complete",
+    )
+    # The SBER row is dropped (it does not match the caller's ticker),
+    # but the GAZP row is persisted.
+    assert written == 1
+    rows_db = con.execute(
+        "SELECT session_date FROM moex_no_trade_evidence "
+        "WHERE figi='FIGI1' ORDER BY session_date"
+    ).fetchall()
+    assert [r["session_date"] for r in rows_db] == ["2025-09-30"]
+
+
+# -- R1: ISIN identity gate (helper self-check) --------------------------
+
+
+def test_record_historical_no_trade_evidence_rejects_isin_mismatch(tmp_path):
+    """R1: the helper itself compares the upstream ISIN (the
+    ``isin`` argument, which the caller got from
+    ``fetch_issuer_identity``) against the figi's stored ISIN
+    in ``instruments.isin``. A mismatch rejects the whole batch
+    with one structured ``identity_mismatch`` log line and
+    performs no DB write. The existing ``outcome`` gate still
+    short-circuits non-``complete`` outcomes first, so the
+    ISIN check is only reached when ``outcome == "complete"``.
+    """
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    # Stored ISIN is "STORED"; the helper's ``isin`` argument is
+    # "UPSTREAM" — mismatch.
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'STORED')"
+    )
+    con.commit()
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+        {"ts": "2025-09-30", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+    ]
+    written = record_historical_no_trade_evidence(
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 30), db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="UPSTREAM",
+        outcome="complete",
+    )
+    assert written == 0
+    n = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence"
+    ).fetchone()[0]
+    assert n == 0, (
+        f"ISIN mismatch must NOT write evidence, got {n}"
+    )
+
+
+def test_record_historical_no_trade_evidence_fails_closed_on_missing_upstream_isin(
+    tmp_path,
+):
+    """R1: when the upstream ISIN (the ``isin`` argument) is empty
+    and the local ``instruments.isin`` is populated, the helper
+    fails closed: it cannot certify the row's identity against
+    upstream metadata, so the whole batch is rejected with one
+    structured ``identity_mismatch`` log line and no DB write.
+    """
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU0007661625')"
+    )
+    con.commit()
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+    ]
+    # Caller passed an empty upstream ISIN (the MOEX probe
+    # returned no value).
+    written = record_historical_no_trade_evidence(
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="",
+        outcome="complete",
+    )
+    assert written == 0
+    n = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence"
+    ).fetchone()[0]
+    assert n == 0, (
+        f"empty upstream ISIN + populated local ISIN must fail closed, "
+        f"got n={n}"
+    )
+
+
+def test_record_historical_no_trade_evidence_allows_blank_to_blank(tmp_path):
+    """R1: when both the upstream ISIN (the ``isin`` argument) and
+    the stored ``instruments.isin`` are blank, the helper
+    proceeds (no identity to mismatch on). The brief says
+    "decide spec allow matching blanks" — blank matches blank.
+    """
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    # No instrument row seeded at all — local_isin is "". Upstream
+    # ISIN is also "". They match (both blank).
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+    ]
+    written = record_historical_no_trade_evidence(
+        con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
+        rows=rows, board="TQBR", isin="",
+        outcome="complete",
+    )
+    assert written == 1
+    n = con.execute(
+        "SELECT COUNT(*) FROM moex_no_trade_evidence"
+    ).fetchone()[0]
+    assert n == 1, f"blank-blank ISIN must proceed, got n={n}"
+
+
+# -- R1: lock propagation, no nested acquisition ----------------------
+
+
+def test_record_historical_no_trade_evidence_acquires_lock_exactly_once(
+    tmp_path,
+):
+    """The helper delegates the actual ``INSERT ... ON CONFLICT`` to
+    ``record_no_trade_evidence``, which acquires the shared
+    writer lock exactly once with
+    ``role="no-trade-evidence" / phase="evidence"``. The helper
+    itself does NOT acquire the lock; the wrapped
+    ``record_no_trade_evidence`` does. There is no nested
+    acquisition.
+
+    We trace every ``writer_lock`` call in this test and assert
+    that exactly one acquisition matches the
+    ``no-trade-evidence / evidence`` role/phase pair.
+    """
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+    from algotrader_api.ingestion import writer_lock as _wl_mod
+    acquisitions: list[dict] = []
+    real_lock = _wl_mod.writer_lock
+
+    @_wl_mod.contextmanager  # type: ignore[attr-defined]
+    def _tracking_lock(db_path, **kw):
+        acquisitions.append({**kw, "db_path": str(db_path)})
+        with real_lock(db_path, **kw):
+            yield
+
+    import unittest.mock as _mock
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
+    con.commit()
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+    ]
+    with _mock.patch.object(_wl_mod, "writer_lock", _tracking_lock):
+        written = record_historical_no_trade_evidence(
+            con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
+            rows=rows, board="TQBR", isin="RU",
+            outcome="complete",
+        )
+    assert written == 1
+    evidence_acqs = [
+        a for a in acquisitions
+        if a.get("role") == "no-trade-evidence"
+        and a.get("phase") == "evidence"
+    ]
+    assert len(evidence_acqs) == 1, (
+        f"helper must acquire evidence lock exactly once, "
+        f"got {evidence_acqs!r}"
+    )
+
+
+def test_record_historical_no_trade_evidence_lock_busy_propagates(tmp_path):
+    """When ``record_no_trade_evidence`` (called by the helper)
+    raises ``WriterLockBusy`` because the lock is held by another
+    writer, the helper does NOT swallow the exception. The
+    public wrapper's ``WriterLockBusy`` propagates so the
+    caller's defer/abort/fallback decision is honoured.
+    """
+    from algotrader_api.ingestion.no_trade_evidence import (
+        record_historical_no_trade_evidence,
+    )
+    from algotrader_api.ingestion import writer_lock as _wl_mod
+    from algotrader_api.ingestion.writer_lock import WriterLockBusy
+
+    real_lock = _wl_mod.writer_lock
+
+    @_wl_mod.contextmanager  # type: ignore[attr-defined]
+    def _busy_lock(db_path, **kw):
+        raise WriterLockBusy(
+            role=kw["role"], phase=kw["phase"],
+            database_path=str(db_path),
+            lock_path=str(db_path) + ".writer.lock",
+            timeout_seconds=kw.get("timeout_seconds", 0.0),
+            reason="test-forced-busy",
+        )
+
+    import unittest.mock as _mock
+    db = tmp_path / "nte.db"
+    con = _make_conn(db)
+    con.execute(
+        "INSERT INTO instruments (figi, ticker, isin) "
+        "VALUES ('FIGI1', 'GAZP', 'RU')"
+    )
+    con.commit()
+    rows = [
+        {"ts": "2025-09-29", "_secid": "GAZP", "_boardid": "TQBR", "open": None, "high": None, "low": None, "close": None, "volume": 0, "_numtrades": 0, "_value": 0},
+    ]
+    with _mock.patch.object(_wl_mod, "writer_lock", _busy_lock):
+        with pytest.raises(WriterLockBusy):
+            record_historical_no_trade_evidence(
+                con, from_d=date(2025, 9, 29), to_d=date(2025, 9, 29), db_path=str(db), figi="FIGI1", ticker="GAZP",
+                rows=rows, board="TQBR", isin="RU",
+                outcome="complete",
+            )

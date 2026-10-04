@@ -25,10 +25,12 @@ with the persistent backfill lifecycle.
 from __future__ import annotations
 
 import asyncio
+import math
 import sqlite3
 import threading
 import time
 import urllib.parse
+from collections.abc import Iterator
 import requests
 import requests.adapters  # HTTPAdapter lives here, not on requests namespace
 from dataclasses import dataclass, field
@@ -39,6 +41,7 @@ from typing import Any, Awaitable, Callable, Iterable
 
 from ..observability.logging import get_logger
 from .closed_candles import is_closed_candle
+from .no_trade_evidence import MOEXFetchOutcome  # noqa: F401  (re-exported)
 # Imported lazily inside the call sites that need it; this keeps the
 # module-level import surface minimal — `_backfill_one_moex` is the
 # only path that calls ``fetch_issuer_identity`` directly (the other
@@ -467,13 +470,36 @@ def _tinkoff_breaker_record_success(db_path: str, figi: str) -> None:
 _TINKOFF_BREAKER_OPEN_HOURS_GLOBAL = 24
 
 
-def _fetch_year_moex(
+def _reduce_outcomes(prev: str, new: str) -> str:
+    """Return the more-severe of two ``MOEXFetchOutcome`` values.
+
+    Severity order (most-severe first): ``error`` > ``malformed`` >
+    ``partial`` > ``identity_mismatch`` > ``complete``.
+
+    Used to collapse per-page outcomes into a single per-fetch value:
+    callers only see the worst thing the upstream did during the
+    walk, regardless of how many pages preceded the bad one.
+    """
+    order = {
+        "error": 5,
+        "malformed": 4,
+        "partial": 3,
+        "identity_mismatch": 2,
+        "complete": 1,
+    }
+    if order.get(new, 0) > order.get(prev, 0):
+        return new
+    return prev
+
+
+def _fetch_year_moex_iter(
     market: str,
     board: str,
     ticker: str,
     year: int,
+    *,
     last_trading_day: date | None = None,
-) -> list[dict]:
+) -> Iterator[tuple[list[dict], str]]:
     """Walk MOEX ISS /iss/history/.../securities/{ticker}.json for ``year``.
 
     MOEX caps a single response at 500 bars; for a year with >500
@@ -490,11 +516,10 @@ def _fetch_year_moex(
     dated after the last published trading day. Earlier years are
     unaffected.
 
-    The parameter is positional-or-keyword (no ``*`` separator) so
-    existing tests that mock via ``side_effect=callable`` with the
-    4-arg signature keep working unchanged — they just get
-    ``last_trading_day=None`` and the function falls back to
-    ``year-12-31``.
+    The iterator yields ``(page_rows, page_outcome)`` after every
+    page. The legacy ``_fetch_year_moex`` simply concatenates the
+    rows; ``_fetch_year_moex_outcome`` folds the per-page outcomes
+    into a single worst-severity value via ``_reduce_outcomes``.
 
     Each emitted dict carries the raw MOEX columns the no-trade
     evidence helper needs (``SECID``, ``BOARDID``, ``NUMTRADES``,
@@ -502,8 +527,28 @@ def _fetch_year_moex(
     row without a second HTTP round-trip. Empty OHLC values are kept
     as ``None`` — the bars writer already drops such rows, but the
     evidence helper relies on the explicit None shape.
+
+    Strict feed contract (Task 1) — for every page:
+
+    * HTTP ``status_code == 200`` else ``"malformed"`` and stop.
+    * ``history.columns`` must contain ``TRADEDATE``, the four OHLC
+      columns, and ``VOLUME``; otherwise ``"malformed"`` and stop.
+    * Each parsed row's length must equal the column-list length;
+      too-short rows are dropped silently.
+    * Zero-trade rows (``VOLUME == 0``) require ``NUMTRADES == 0``
+      AND ``VALUE == 0``; a missing counter on a zero-trade row is
+      ``"malformed"``.
+    * Non-zero-volume rows with missing OHLC are dropped, page
+      ``"malformed"``.
+    * Cursor block carries ``[offset, total, page_size]``. The
+      server-reported ``offset`` must equal the loop's requested
+      ``start``; mismatch → ``"malformed"`` and stop. Non-positive
+      ``total`` → ``"malformed"`` and stop. Repeated cursor offset
+      across two pages → ``"malformed"`` and stop.
+    * Identity: any row with ``SECID != ticker`` OR
+      ``BOARDID != board`` flips the page's outcome to
+      ``"identity_mismatch"`` (batch-poisoning; identity is per-batch).
     """
-    import requests
     base = (
         f"https://iss.moex.com/iss/history/engines/stock/markets/{market}/boards/{board}"
         f"/securities/{urllib.parse.quote(ticker)}.json"
@@ -512,12 +557,37 @@ def _fetch_year_moex(
         till = last_trading_day.isoformat()
     else:
         till = f"{year}-12-31"
-    out: list[dict] = []
+    required_cols = {"TRADEDATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"}
     start = 0
     page_size = 500
+    # Hard cap on the number of HTTP pages the iterator will walk
+    # for a single year. MOEX never returns more than 500 rows per
+    # page, so a normal year finishes in 1 page and a busy year in
+    # 2. The cap exists to bound an upstream that fails to terminate
+    # (no cursor + full pages forever) or that breaks the page-size
+    # contract; without it a buggy upstream would loop indefinitely.
+    # A year of MOEX history is at most a few hundred trading days,
+    # so 20 pages is far more than any real year needs and acts as
+    # a circuit-breaker. On hit we mark ``partial`` (we have rows;
+    # we just couldn't certify) and return — never malformed, so
+    # the bar consumer keeps what it got.
+    max_pages = 20
+    pages_walked = 0
+    prev_cursor_total: int | None = None
     while True:
+        pages_walked += 1
+        if pages_walked > max_pages:
+            # Cap reached. Yield the rows collected so far as
+            # ``partial`` (caller keeps the data; the outcome tells
+            # the evidence path to refuse).
+            yield ([], "partial")
+            return
+        # Network failure: the iterator signals ``error`` exactly
+        # once and stops — callers that care (the evidence path)
+        # see it; bar consumers keep the partial list they already
+        # collected from prior pages.
         try:
-            data = requests.get(
+            response = requests.get(
                 base,
                 params={
                     "from": f"{year}-01-01",
@@ -525,25 +595,119 @@ def _fetch_year_moex(
                     "start": start,
                 },
                 timeout=30,
-            ).json()
+            )
         except Exception:
-            break
-        cols = data.get("history", {}).get("columns", [])
-        if not cols or "TRADEDATE" not in cols:
-            break
-        rows = data.get("history", {}).get("data", [])
-        if not rows:
-            break
-        for row in rows:
+            yield ([], "error")
+            return
+        kept_rows: list[dict] = []
+        try:
+            data = response.json()
+        except Exception:
+            yield (kept_rows, "malformed")
+            return
+        if not isinstance(data, dict) or not isinstance(data.get("history"), dict):
+            yield (kept_rows, "malformed")
+            return
+        history = data["history"]
+        cols = history.get("columns")
+        if (not isinstance(cols, list) or not cols
+                or not all(isinstance(c, str) for c in cols)
+                or len(set(cols)) != len(cols)
+                or not required_cols.issubset(set(cols))):
+            yield (kept_rows, "malformed")
+            return
+        rows_raw = history.get("data")
+        if not isinstance(rows_raw, list):
+            yield (kept_rows, "malformed")
+            return
+        page_outcome = "complete"
+        for row in rows_raw:
+            # Strict feed contract: every raw row MUST match the
+            # column-list length. Any malformed raw row (short, long,
+            # non-sequence) POISONS the page's outcome to ``malformed``
+            # BEFORE the loop continues; valid clean rows already
+            # accepted in earlier iterations are preserved in
+            # ``kept_rows`` so the bar consumer keeps its data, and
+            # the evidence path refuses the batch via the outcome.
+            # Without the poison: cursor-close on a kept-only count
+            # would certify a fetch that actually contained a bad row
+            # (parent repro, round 2).
+            row_ok = isinstance(row, list) and len(row) == len(cols)
+            if not row_ok:
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                continue
             d = dict(zip(cols, row))
-            out.append({
+            # SECID/BOARDID identity check (per-batch poison).
+            if str(d.get("SECID") or "") != ticker \
+                    or str(d.get("BOARDID") or "") != board:
+                page_outcome = _reduce_outcomes(
+                    page_outcome, "identity_mismatch",
+                )
+                # Still keep the row — the bar consumer sees the
+                # data they already accepted today; the outcome is
+                # the signal the evidence path uses to refuse.
+            volume_raw = d.get("VOLUME")
+            if volume_raw is None:
+                # VOLUME column present but row's value is missing
+                # — treat as malformed. The strict contract requires
+                # VOLUME to be present (zero is a valid value).
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                continue
+            # VOLUME must be an integer count of shares, not a
+            # fractional float. ``int(0.5) == 0`` would silently
+            # promote a 0.5 row into the zero-trade shape (false
+            # positive no-trade evidence); ``int(1000.5) == 1000``
+            # would silently corrupt a real bar. Reject any float
+            # that is not a whole number, plus any non-numeric type.
+            if isinstance(volume_raw, bool) or not isinstance(
+                volume_raw, (int, float),
+            ):
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                continue
+            if isinstance(volume_raw, float):
+                if not volume_raw.is_integer():
+                    page_outcome = _reduce_outcomes(
+                        page_outcome, "malformed",
+                    )
+                    continue
+                volume = int(volume_raw)
+            else:
+                volume = int(volume_raw)
+            if volume < 0 or any(
+                v is not None and (type(v) not in (int, float)
+                                   or v < 0 or (isinstance(v, float) and not math.isfinite(v)))
+                for v in (d.get(k) for k in ("OPEN", "HIGH", "LOW", "CLOSE", "NUMTRADES", "VALUE"))
+            ):
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                continue
+            # Per-shape contract:
+            #  * zero-volume rows MUST carry NUMTRADES == 0 AND VALUE == 0;
+            #    missing/None on those counters is malformed.
+            #  * non-zero rows MUST have all four OHLC columns present;
+            #    missing/None on OHLC when VOLUME > 0 is malformed.
+            if volume == 0:
+                if d.get("NUMTRADES") != 0 or d.get("VALUE") != 0:
+                    page_outcome = _reduce_outcomes(
+                        page_outcome, "malformed",
+                    )
+                    continue
+            else:
+                if (d.get("OPEN") is None
+                        or d.get("HIGH") is None
+                        or d.get("LOW") is None
+                        or d.get("CLOSE") is None):
+                    page_outcome = _reduce_outcomes(
+                        page_outcome, "malformed",
+                    )
+                    continue
+            kept_rows.append({
                 "figi": None,  # filled by caller
                 "ts": d.get("TRADEDATE"),
                 "open": d.get("OPEN"),
                 "high": d.get("HIGH"),
                 "low": d.get("LOW"),
                 "close": d.get("CLOSE"),
-                "volume": int(d.get("VOLUME") or 0),
+                "volume": volume,
                 "source": "moex",
                 # No-trade evidence: raw upstream columns, kept verbatim.
                 "_secid": d.get("SECID"),
@@ -551,22 +715,201 @@ def _fetch_year_moex(
                 "_numtrades": d.get("NUMTRADES"),
                 "_value": d.get("VALUE"),
             })
-        # history.cursor rows: [offset, total, page_size]. When
-        # offset + len(rows) >= total, we've seen everything.
-        cursor_rows = data.get("history.cursor", {}).get("data") or []
+        # Spec line 53: HTTP ``status_code == 200`` is required for
+        # the page to be considered ``complete``. A missing
+        # ``status_code`` attribute is malformed (we cannot
+        # certify an unverified response), not 200-by-default.
+        # The check is done AFTER row parsing so the bar-list
+        # wrapper still gets the parsed rows (existing partial-
+        # bar tolerance is preserved); the outcome tag is the
+        # signal the evidence path uses to refuse.
+        # A real ``requests.Response`` always carries
+        # ``status_code``; a missing one means the test double
+        # is broken (or someone returned the wrong object).
+        if not hasattr(response, "status_code"):
+            yield (kept_rows, "malformed")
+            return
+        if response.status_code != 200:
+            yield (kept_rows, "malformed")
+            return
+        # Cursor validation. The cursor MUST advance (or close) —
+        # a repeated offset is a server-side loop / no-progress
+        # condition we cannot trust.
+        cursor_rows = []
+        if "history.cursor" in data:
+            cursor = data["history.cursor"]
+            if (not isinstance(cursor, dict)
+                    or not isinstance(cursor.get("data"), list)
+                    or ("columns" in cursor and (
+                        not isinstance(cursor["columns"], list)
+                        or not all(isinstance(c, str) for c in cursor["columns"])))):
+                yield (kept_rows, "malformed")
+                return
+            cursor_rows = cursor["data"]
+            if cursor_rows and (len(cursor_rows) != 1
+                    or not isinstance(cursor_rows[0], list)
+                    or len(cursor_rows[0]) != 3):
+                yield (kept_rows, "malformed")
+                return
         if cursor_rows:
+            offset, total, _srv_page_size = cursor_rows[0]
+            # Strict integer values (including decimal strings), never bool/float.
+            if any(type(v) not in (int, str) for v in (offset, total, _srv_page_size)):
+                yield (kept_rows, "malformed")
+                return
             try:
-                offset, total, _srv_page_size = cursor_rows[0][:3]
-                if offset is not None and total is not None and offset + len(rows) >= total:
-                    break
-            except (TypeError, ValueError):
-                pass
-        else:
-            # No cursor at all: fall back to "short page = last".
-            if len(rows) < page_size:
-                break
-        start += len(rows)
+                offset_i = int(offset)
+                total_i = int(total)
+                srv_page_size_i = int(_srv_page_size)
+            except ValueError:
+                yield (kept_rows, "malformed")
+                return
+            if srv_page_size_i <= 0:
+                # A non-positive server-reported page_size is
+                # malformed — we cannot reason about "short page"
+                # without a valid denominator. Same severity as a
+                # non-positive ``total`` (spec line 33).
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            if offset_i != start:
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            if total_i <= 0:
+                # A non-positive server-reported ``total`` is
+                # malformed (spec line 33): we cannot reason
+                # about pagination completeness without a valid
+                # upper bound.
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            if (prev_cursor_total is not None
+                    and total_i != prev_cursor_total):
+                # The cursor's ``total`` must be stable across
+                # pages (a real MOEX session reports a single
+                # value). A change mid-walk means the upstream
+                # is shifting its count — a contract-less state
+                # we cannot certify. Spec line 30-31 (consistency
+                # check).
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            prev_cursor_total = total_i
+            if len(kept_rows) > srv_page_size_i:
+                # Spec line 30-31: page_size consistency check
+                # on the high side. The server reported a
+                # page_size, but the response carried MORE rows
+                # than that — the loop cannot trust a server
+                # that doesn't even keep its own page-size
+                # contract (the low side is the short-page-no-
+                # cursor / partial case handled below).
+                page_outcome = _reduce_outcomes(page_outcome, "malformed")
+                yield (kept_rows, page_outcome)
+                return
+            # Decide between final-page-yield and intermediate-yield:
+            # the per-page outcome stays whatever this page's data
+            # determined; the ``partial`` tag is reserved for the
+            # final-page case (cursor closed but offset+len<total).
+            if offset_i + len(kept_rows) >= total_i:
+                yield (kept_rows, page_outcome)
+                return
+            # A short page (len(kept_rows) < server-reported
+            # page_size) with a consistent cursor that still
+            # promises more rows is the spec's "final page" signal
+            # — the server is wrapping up. Mark this per-fetch
+            # ``partial``: the data we have is fine, the loop
+            # just couldn't reach ``total``. The next request
+            # would either return the same offset (repeated →
+            # malformed) or advance (this branch would be
+            # skipped, we'd walk the next page).
+            # We use the server-reported page_size (from the
+            # cursor) rather than the loop's requested 500,
+            # because MOEX may serve fewer rows per response
+            # than we asked for; a server-full page (e.g. 100
+            # rows when the cursor reports page_size=100) is
+            # still a full page from MOEX's perspective.
+            if len(kept_rows) < srv_page_size_i:
+                page_outcome = _reduce_outcomes(page_outcome, "partial")
+                yield (kept_rows, page_outcome)
+                return
+            # Intermediate page — data parsed cleanly and the
+            # loop has more to walk. Yield with the per-page
+            # outcome (which is ``complete`` if this page's data
+            # was clean).
+            yield (kept_rows, page_outcome)
+            start += len(kept_rows)
+            continue
+        # No cursor at all.
+        if len(kept_rows) == 0 and len(rows_raw) == 0:
+            # Empty response — nothing more to do; this is not
+            # necessarily an error (the year genuinely may have no
+            # data). Yield once with whatever outcome we have so
+            # callers can record it, then stop.
+            yield (kept_rows, page_outcome)
+            return
+        if len(rows_raw) < page_size:
+            # Short page, no cursor → cannot certify completeness;
+            # the strict contract marks this ``malformed``.
+            page_outcome = _reduce_outcomes(page_outcome, "malformed")
+            yield (kept_rows, page_outcome)
+            return
+        # Full page, no cursor → not malformed per se, but we
+        # cannot certify pagination completeness without a cursor.
+        # Mark ``partial`` so the outcome reflects "we don't know
+        # if this is everything".
+        page_outcome = _reduce_outcomes(page_outcome, "partial")
+        yield (kept_rows, page_outcome)
+        start += len(kept_rows)
+
+
+def _fetch_year_moex(
+    market: str,
+    board: str,
+    ticker: str,
+    year: int,
+    last_trading_day: date | None = None,
+) -> list[dict]:
+    """Bar-list wrapper around :func:`_fetch_year_moex_iter`.
+
+    Signature preserved (positional-or-keyword ``last_trading_day``,
+    no ``*`` separator) so existing callers keep working unchanged —
+    they just get ``last_trading_day=None`` and the function falls
+    back to ``year-12-31``.
+    """
+    out: list[dict] = []
+    for page_rows, _outcome in _fetch_year_moex_iter(
+        market, board, ticker, year,
+        last_trading_day=last_trading_day,
+    ):
+        out.extend(page_rows)
     return out
+
+
+def _fetch_year_moex_outcome(
+    market: str,
+    board: str,
+    ticker: str,
+    year: int,
+    last_trading_day: date | None = None,
+) -> tuple[list[dict], str]:
+    """Same walk as :func:`_fetch_year_moex` but returns an outcome.
+
+    Returns ``(rows, outcome)``. ``outcome`` is one of the values in
+    the ``MOEXFetchOutcome`` literal declared in
+    :mod:`no_trade_evidence` (re-exported here for callers that
+    already imported it from this module). The outcome is the
+    worst-severity per-page outcome across the whole walk.
+    """
+    out: list[dict] = []
+    overall = "complete"
+    for page_rows, page_outcome in _fetch_year_moex_iter(
+        market, board, ticker, year,
+        last_trading_day=last_trading_day,
+    ):
+        out.extend(page_rows)
+        overall = _reduce_outcomes(overall, page_outcome)
+    return out, overall
 
 
 def _fetch_moex_range(
@@ -801,7 +1144,21 @@ class BackfillRunner:
     # can patch them with ``patch.object(BackfillRunner, '_fetch_year_moex')``.
     # These bindings mirror the inner closures that used to live inside
     # backfill_from_moex — same logic, but reachable from outside.
+    #
+    # ``_fetch_year_moex_outcome`` is the outcome-emitting variant
+    # (Task 2). The binding mirrors ``_fetch_year_moex`` exactly so
+    # test doubles can monkeypatch at the class level via
+    # ``BackfillRunner._fetch_year_moex_outcome = staticmethod(...)``.
+    # Production callers see the real implementation; the
+    # ``_backfill_one_moex`` walker calls
+    # ``self._fetch_year_moex_outcome(...)`` so a test double installed
+    # via ``runner._fetch_year_moex_outcome = ...`` is used (the
+    # instance attribute shadows the class binding). Do NOT set this
+    # in ``__post_init__`` — that would force every test to override
+    # the assignment; the class binding plus optional instance
+    # attribute is the proven pattern.
     _fetch_year_moex = staticmethod(_fetch_year_moex)
+    _fetch_year_moex_outcome = staticmethod(_fetch_year_moex_outcome)
     _fetch_moex_range = staticmethod(_fetch_moex_range)
     _get_meta_moex = staticmethod(_get_meta_moex)
     _fetch_tinkoff_fallback = staticmethod(_fetch_tinkoff_fallback_impl)
@@ -1184,8 +1541,19 @@ class BackfillRunner:
         _TINKOFF_BREAKER_THRESHOLD = 3
         _TINKOFF_BREAKER_OPEN_HOURS = 24
 
-        async def _process_moex_year(inst: dict, meta: dict, year: int) -> list[dict]:
-            year_bars = self._fetch_year_moex(
+        async def _process_moex_year(
+            inst: dict, meta: dict, year: int, from_d: date, to_d: date,
+        ) -> list[dict]:
+            # Task 2 (R1 fix): call through the ``self._fetch_year_moex_outcome``
+            # binding so the class-level staticmethod (which is the
+            # production default) is used, and so test doubles
+            # installed on the class via
+            # ``BackfillRunner._fetch_year_moex_outcome = staticmethod(...)``
+            # are picked up. Task 3 (the end-to-end test) expects this
+            # ``self`` binding — the prior module-level lookup meant
+            # ``monkeypatch.setattr(BackfillRunner, ...)`` had no
+            # effect on the public walker.
+            year_bars, outcome = self._fetch_year_moex_outcome(
                 meta["market"], meta["board"], inst["ticker"], year,
                 last_trading_day=yesterday,
             )
@@ -1199,6 +1567,49 @@ class BackfillRunner:
             )
             for b in year_bars:
                 b["figi"] = inst["figi"]
+            # Evidence path (Task 2). Gate on ``outcome == "complete"``;
+            # any other outcome short-circuits inside the helper (it
+            # returns 0, emits one structured log line, and performs
+            # no SQLite mutation). The bar list above is already
+            # filtered and will be returned to the caller — the bar
+            # write is unaffected by the evidence outcome. A busy
+            # writer lock MUST NOT undo the bar write; the helper
+            # acquires the lock for its own transaction only, and a
+            # failure here is logged and swallowed.
+            if outcome == "complete" and year_bars:
+                try:
+                    from .no_trade_evidence import (
+                        record_historical_no_trade_evidence,
+                    )
+                    from ..db.bars_sqlite import get_connection
+                    # R1: pass the UPSTREAM-VERIFIED ISIN (the
+                    # ``meta`` dict carries the MOEX probe result;
+                    # ``inst`` carries the locally-stored ISIN).
+                    # The helper compares the upstream ISIN against
+                    # the stored one in ``instruments.isin``; passing
+                    # the local ISIN would defeat the gate.
+                    upstream_isin = str(meta.get("isin") or "").strip()
+                    record_historical_no_trade_evidence(
+                        get_connection(self.db_path),
+                        db_path=self.db_path,
+                        figi=inst["figi"], ticker=inst["ticker"],
+                        rows=year_bars, board=meta["board"],
+                        isin=upstream_isin,
+                        outcome=outcome, today=today,
+                        from_d=max(from_d, date(year, 1, 1)),
+                        to_d=min(to_d, date(year, 12, 31)),
+                    )
+                except Exception as _exc:  # noqa: BLE001
+                    # Busy on the evidence lock OR a transient failure
+                    # MUST NOT undo the bar write. The bars table
+                    # commit is owned by the caller; we only log here.
+                    # The brief is explicit: no exception contents are
+                    # in the diagnostic line (no repr(_exc) / str(_exc)
+                    # by design — type name only).
+                    logger.info(
+                        "moex_historical_evidence_deferred figi=%s reason=%s",
+                        inst["figi"], type(_exc).__name__,
+                    )
             return year_bars
 
         async def _process_tinkoff(inst: dict) -> int:
@@ -1370,7 +1781,7 @@ class BackfillRunner:
             # distributed across the Semaphore).
             years = list(range(from_d.year, to_d.year + 1))
             year_batches = await asyncio.gather(
-                *[_process_moex_year(inst, meta, y) for y in years],
+                *[_process_moex_year(inst, meta, y, from_d, to_d) for y in years],
                 return_exceptions=True,
             )
             all_bars: list[dict] = []
@@ -1966,15 +2377,51 @@ class BackfillRunner:
         year = from_.year
         while year <= to.year:
             last_trading_day_for_year = today if year == to.year else None
+            # Task 2 (R1 fix): the historical walker has two ways to
+            # call MOEX. The new, production path uses the
+            # ``_fetch_year_moex_outcome`` staticmethod (the class
+            # binding lives next to ``_fetch_year_moex``; tests can
+            # monkeypatch at the class level via
+            # ``BackfillRunner._fetch_year_moex_outcome = staticmethod(...)``)
+            # — the fetcher returns ``(rows, outcome)`` and the walker
+            # routes only ``"complete"`` outcomes to the evidence
+            # helper. Production callers see the class binding.
+            # The legacy ``_fetch_year_moex`` staticmethod is preserved
+            # for bar-consumer compatibility but is NOT a valid
+            # evidence source: it does not return an outcome, so the
+            # evidence helper has no proof the upstream feed was
+            # validated-complete. Callers that drive the legacy
+            # fetcher (``runner._fetch_year_moex = ...``) are legacy
+            # bar-only stubs; the evidence path is intentionally
+            # bypassed by setting ``outcome = "error"`` (fail-closed).
+            # Stale tests that only stub the legacy list-only
+            # fetcher therefore see no evidence writes — that is the
+            # correct fail-closed behaviour, not a bug. Such tests
+            # MUST be migrated to stub ``_fetch_year_moex_outcome``
+            # (Task 2 contract) when they want to assert evidence.
+            outcome_fn = getattr(self, "_fetch_year_moex_outcome", None)
             try:
-                candles = self._fetch_year_moex(
-                    "shares", "TQBR", ticker, year,
-                    last_trading_day=last_trading_day_for_year,
-                )
+                if outcome_fn is not None:
+                    candles, outcome = outcome_fn(
+                        "shares", "TQBR", ticker, year,
+                        last_trading_day=last_trading_day_for_year,
+                    )
+                else:
+                    # Legacy path: bar-consumer stub. No outcome is
+                    # available; treat as ``"error"`` (fail-closed)
+                    # so the evidence helper short-circuits. The
+                    # bar list is still written; only the evidence
+                    # write is skipped.
+                    candles = self._fetch_year_moex(
+                        "shares", "TQBR", ticker, year,
+                        last_trading_day=last_trading_day_for_year,
+                    )
+                    outcome = "error"
             except Exception as e:  # noqa: BLE001
                 await self._log("warn", figi=figi,
                                 message=f"moex year {year} failed: {e}")
                 candles = []
+                outcome = "error"
             if not candles:
                 await self._log("warn", figi=figi,
                                 message=f"moex empty year={year} ticker={ticker}")
@@ -1995,6 +2442,45 @@ class BackfillRunner:
                     from ..db.bars_sqlite import replace_bars_for_figi
                     added = replace_bars_for_figi(self.db_path, figi, candles, replace=False)
                     total_added += added
+            # Evidence path (Task 2). Gate on ``outcome == "complete"``;
+            # any other outcome short-circuits inside the helper
+            # (returns 0, emits one structured log line, performs no
+            # SQLite mutation). The bar list above is already filtered
+            # and committed; a busy writer lock MUST NOT undo the bar
+            # write. The helper acquires its own evidence-section lock
+            # (no nested acquisition) and is independent of the bar
+            # write. A failure here is logged and swallowed.
+            if outcome == "complete" and candles:
+                try:
+                    from .no_trade_evidence import (
+                        record_historical_no_trade_evidence,
+                    )
+                    from ..db.bars_sqlite import get_connection
+                    # R1: pass the UPSTREAM-VERIFIED ISIN (the
+                    # ``meta_isin`` variable is the result of
+                    # ``fetch_issuer_identity``; ``inst_isin`` is the
+                    # locally-stored value). The two were compared
+                    # above and the early-return on mismatch is what
+                    # lets us reach this point, but the helper
+                    # itself re-checks against ``instruments.isin``,
+                    # so we pass the upstream value by convention.
+                    record_historical_no_trade_evidence(
+                        get_connection(self.db_path),
+                        db_path=self.db_path,
+                        figi=figi, ticker=ticker,
+                        rows=candles, board="TQBR",
+                        isin=meta_isin,
+                        outcome=outcome, today=today,
+                        from_d=max(from_, date(year, 1, 1)),
+                        to_d=min(to, date(year, 12, 31)),
+                    )
+                except Exception as _exc:  # noqa: BLE001
+                    # No exception contents in the diagnostic line —
+                    # type name only.
+                    logger.info(
+                        "moex_historical_evidence_deferred figi=%s reason=%s",
+                        figi, type(_exc).__name__,
+                    )
             year += 1
         # Trailing bridge: ask Tinkoff for the last 9 months of the window.
         # R1: bridge_start = to - 270 days (the trailing 9m), NOT year-aligned.
