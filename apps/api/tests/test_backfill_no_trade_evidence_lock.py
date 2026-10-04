@@ -420,6 +420,13 @@ def test_cli_listed_till_uses_separate_lock_from_evidence(tmp_path, monkeypatch)
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    class FrozenDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 10, 2)
+    from algotrader_api.ingestion import backfill, no_trade_evidence
+    for module in (mod, backfill, no_trade_evidence):
+        monkeypatch.setattr(module, "date", FrozenDate)
     # The CLI imported ``writer_lock`` into its own namespace at
     # load time, so patching the source module is not enough —
     # also patch the CLI's local binding.
@@ -435,7 +442,7 @@ def test_cli_listed_till_uses_separate_lock_from_evidence(tmp_path, monkeypatch)
 
     monkeypatch.setattr(mod, "_get_meta_moex", lambda *a, **kw: _outside_lock(None))
     monkeypatch.setattr(
-        mod, "_probe_board_last", lambda ticker: _outside_lock(("TQCB", "2026-09-10")),
+        mod, "_probe_board_last", lambda ticker: _outside_lock(("TQCB", "2026-09-10", "X")),
     )
     # R1: stub the upstream ISIN probe so the CLI's identity guard
     # sees a match against the seeded instrument ISIN and proceeds
@@ -540,9 +547,16 @@ def test_cli_busy_exits_75_and_emits_one_defer_line(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("backfill_no_trade_evidence_cli", script_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    class FrozenDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 10, 2)
+    from algotrader_api.ingestion import backfill, no_trade_evidence
+    for module in (mod, backfill, no_trade_evidence):
+        monkeypatch.setattr(module, "date", FrozenDate)
     monkeypatch.setattr(mod, "_get_meta_moex", lambda *a, **kw: None)
     monkeypatch.setattr(
-        mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
+        mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10", "X"),
     )
     # R1: stub the upstream ISIN probe so the CLI's identity guard
     # sees a match against the seeded instrument ISIN and proceeds
@@ -626,9 +640,16 @@ def test_cli_dry_run_does_not_acquire_writer_lock(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("backfill_no_trade_evidence_cli", script_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    class FrozenDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 10, 2)
+    from algotrader_api.ingestion import backfill, no_trade_evidence
+    for module in (mod, backfill, no_trade_evidence):
+        monkeypatch.setattr(module, "date", FrozenDate)
     monkeypatch.setattr(mod, "_get_meta_moex", lambda *a, **kw: None)
     monkeypatch.setattr(
-        mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
+        mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10", "X"),
     )
     # R1: stub the upstream ISIN probe so the CLI's identity guard
     # sees a match against the seeded instrument ISIN and proceeds
@@ -713,9 +734,16 @@ def test_cli_partial_outcome_exits_zero_without_writing_evidence(
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    class FrozenDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 10, 2)
+    from algotrader_api.ingestion import backfill, no_trade_evidence
+    for module in (mod, backfill, no_trade_evidence):
+        monkeypatch.setattr(module, "date", FrozenDate)
     monkeypatch.setattr(mod, "_get_meta_moex", lambda *a, **kw: None)
     monkeypatch.setattr(
-        mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10"),
+        mod, "_probe_board_last", lambda ticker: ("TQCB", "2026-09-10", "X"),
     )
     # R1: stub the upstream ISIN probe so the CLI's identity guard
     # sees a match against the seeded instrument ISIN and proceeds

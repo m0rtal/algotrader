@@ -73,36 +73,60 @@ _BONDS_BOARDS = {
 }
 
 
-def _probe_board_last(ticker: str) -> tuple[str, str] | None:
-    """Return ``(board, listed_till)`` for the board with the LATEST
-    ``listed_till`` across every MOEX board of ``ticker``.
-
-    Used for delisted instruments where no ``is_traded=1`` board exists.
-    Returns ``None`` on any upstream failure or when no board carries a
-    usable ``listed_till``.
-    """
+def _probe_board_last(ticker: str) -> tuple[str, str, str] | None:
+    """Return latest board end and verified ISIN only for an entirely inactive set."""
     url = f"https://iss.moex.com/iss/securities/{urllib.parse.quote(ticker)}.json"
     try:
-        data = _moex_session().get(url, timeout=(5, 30)).json()
+        response = _moex_session().get(url, timeout=(5, 30))
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        if not isinstance(data, dict):
+            return None
+        parsed = {}
+        for key, required in (
+            ("description", {"name", "value"}),
+            ("boards", {"secid", "boardid", "is_traded", "listed_till"}),
+        ):
+            block = data.get(key)
+            if not isinstance(block, dict):
+                return None
+            cols, rows = block.get("columns"), block.get("data")
+            if (not isinstance(cols, list) or not cols
+                    or any(not isinstance(c, str) or not c for c in cols)
+                    or len(set(cols)) != len(cols) or not required.issubset(cols)
+                    or not isinstance(rows, list) or not rows):
+                return None
+            if any(not isinstance(row, list) or len(row) != len(cols) for row in rows):
+                return None
+            parsed[key] = [dict(zip(cols, row)) for row in rows]
+        identity = {}
+        for row in parsed["description"]:
+            if row["name"] in ("SECID", "ISIN"):
+                if row["name"] in identity:
+                    return None
+                identity[row["name"]] = row["value"]
+        isin = identity.get("ISIN")
+        if (identity.get("SECID") != ticker or not isinstance(isin, str)
+                or not isin.strip()):
+            return None
+        candidates = []
+        for row in parsed["boards"]:
+            board, end, traded = row["boardid"], row["listed_till"], row["is_traded"]
+            inactive = ((type(traded) is int and traded == 0)
+                        or traded is False
+                        or (type(traded) is str and traded == "0"))
+            if (not isinstance(row["secid"], str) or not row["secid"]
+                    or row["secid"] != ticker
+                    or not isinstance(board, str) or not board.strip()
+                    or not inactive
+                    or not isinstance(end, str)
+                    or date.fromisoformat(end).isoformat() != end):
+                return None
+            candidates.append((board, end, isin.strip()))
+        return max(candidates, key=lambda candidate: candidate[1])
     except Exception:
         return None
-    boards_block = data.get("boards", {})
-    boards = boards_block.get("data") or []
-    cols = boards_block.get("columns") or []
-    if not boards or not cols:
-        return None
-    idx = {c: i for i, c in enumerate(cols)}
-    if "boardid" not in idx or "listed_till" not in idx:
-        return None
-    best: tuple[str, str] | None = None
-    for b in boards:
-        lt = b[idx["listed_till"]]
-        if not lt:
-            continue
-        lt_s = str(lt)[:10]
-        if best is None or lt_s > best[1]:
-            best = (str(b[idx["boardid"]]), lt_s)
-    return best
 
 
 def main() -> int:
@@ -159,10 +183,13 @@ def main() -> int:
             ticker = r["ticker"] or ""
             if not ticker:
                 continue
-            meta = _get_meta_moex(
-                ticker, last_session,
-                meta_cache=meta_cache, meta_lock=meta_lock,
-            )
+            try:
+                meta = _get_meta_moex(
+                    ticker, last_session,
+                    meta_cache=meta_cache, meta_lock=meta_lock,
+                )
+            except Exception:
+                meta = None
             win_hi = last_session
             if meta is not None:
                 board, market = meta["board"], meta["market"]
@@ -171,8 +198,18 @@ def main() -> int:
                 probe = _probe_board_last(ticker)
                 if probe is None:
                     figis_nometa += 1
+                    print(f"  [{i}/{len(todo)}] {ticker}: "
+                          f"moex_historical_evidence_rejected figi={figi} "
+                          "reason=invalid_metadata rows=0")
                     continue
-                board, lt_iso = probe
+                board, lt_iso, upstream_isin = probe
+                local_isin = str(r["isin"] or "").strip()
+                if not local_isin or upstream_isin != local_isin:
+                    figis_nometa += 1
+                    print(f"  [{i}/{len(todo)}] {ticker}: "
+                          f"moex_historical_evidence_rejected figi={figi} "
+                          "reason=identity_mismatch rows=0")
+                    continue
                 lt = date.fromisoformat(lt_iso)
                 if lt >= last_session:
                     # Still listed but probe says no board -> treat as
@@ -289,24 +326,17 @@ def main() -> int:
                 continue
             if not zrows:
                 continue
-            # Identity guard (R1): the helper compares the upstream
-            # ISIN it receives against the figi's stored ISIN. The
-            # ``isin`` argument MUST carry the upstream-verified
-            # metadata ISIN (not the local one), so the CLI does the
-            # same MOEX identity probe the historical walker does
-            # before invoking the helper. When the upstream ISIN is
-            # empty (probe failed or no primary board) AND the local
-            # ISIN is populated, we skip the figi with the same
-            # ``identity_mismatch`` log line the helper would emit
-            # — fail-closed, no DB write, no fabricated identity.
+            # Inactive metadata already verified identity before mutation.
+            # Preserve the existing issuer probe for active-primary routing only.
             local_isin = str(r["isin"] or "").strip()
-            from algotrader_api.ingestion.no_trade_evidence import (
-                fetch_issuer_identity as _fii,
-            )
-            ident = _fii(ticker)
-            upstream_isin = (
-                (ident.get("isin") or "").strip() if ident else ""
-            )
+            if meta is not None:
+                from algotrader_api.ingestion.no_trade_evidence import (
+                    fetch_issuer_identity as _fii,
+                )
+                ident = _fii(ticker)
+                upstream_isin = (
+                    (ident.get("isin") or "").strip() if ident else ""
+                )
             if upstream_isin != local_isin:
                 logging.getLogger("algotrader.ingestion").info(
                     "moex_historical_evidence_rejected figi=%s "

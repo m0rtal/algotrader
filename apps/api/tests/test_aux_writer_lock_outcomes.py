@@ -381,7 +381,7 @@ def _stub_http_for(name: str, mod, monkeypatch, *, figi: str, ticker: str,
             )
             monkeypatch.setattr(mod, "_get_meta_moex", lambda *a, **kw: None)
             monkeypatch.setattr(
-                mod, "_probe_board_last", lambda t: ("TQCB", "2026-09-10"),
+                mod, "_probe_board_last", lambda t: ("TQCB", "2026-09-10", isin),
             )
         # Return one zero-trade row so the second lock
         # (``evidence``) would also be exercised if not for the
@@ -739,7 +739,7 @@ def test_cli_defer_line_has_no_payload_token_or_userinfo(
                              lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_get_meta_moex", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_probe_board_last",
-                             lambda t: ("TQCB", "2026-09-10"))
+                             lambda t: ("TQCB", "2026-09-10", cfg["seed_isin"]))
         def _leaky_fetch(market, board, ticker_arg, from_d, to_d, *,
                           last_trading_day=None):
             return [{
