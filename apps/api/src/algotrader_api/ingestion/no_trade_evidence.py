@@ -591,7 +591,8 @@ def reconcile_no_trade_evidence(
     Coordination (writer-coordination spec, Task 3):
     * The shared writer lock is acquired exactly once via
       :func:`_evidence_writer_lock` with ``role="evidence-reconcile"``
-      and ``phase="reconcile"``. The private
+      and ``phase="reconcile"``. The lock covers DELETE and commit
+      or rollback. The private
       ``_reconcile_no_trade_evidence_tx`` performs the SQL; it does
       not re-acquire the lock.
     * The caller MUST pass an explicit ``db_path`` — there is no
@@ -603,19 +604,32 @@ def reconcile_no_trade_evidence(
       the caller (e.g. the bar writer) decides whether to defer,
       abort, or fall back. The bar writer's existing fallback is
       to swallow the busy error and leave the bar write committed.
+    * A failed DELETE or commit attempts rollback before unlock,
+      including on ``BaseException``. Numeric SQLite BUSY errors
+      become ``WriterLockBusy``; other failures propagate unchanged.
+      The borrowed connection remains open.
     """
     with _evidence_writer_lock(
         db_path, role="evidence-reconcile", phase="reconcile",
     ):
         try:
             removed = _reconcile_no_trade_evidence_tx(conn)
-        except Exception:
+            conn.commit()
+        except BaseException as exc:
             try:
                 conn.rollback()
-            except Exception:
+            except BaseException:
+                # Preserve the original failure; the lock must still release.
                 pass
+            if is_sqlite_busy(exc):
+                raise WriterLockBusy(
+                    role="evidence-reconcile", phase="reconcile",
+                    database_path=db_path,
+                    lock_path=str(writer_lock_path(db_path)),
+                    timeout_seconds=_EVIDENCE_LOCK_TIMEOUT_SECONDS,
+                    reason="sqlite-busy",
+                ) from exc
             raise
-        conn.commit()
     return removed
 
 
