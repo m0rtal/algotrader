@@ -49,6 +49,9 @@ from algotrader_api.pipeline.assertions import (
     snapshot_bars_count,
 )
 from algotrader_api.ingestion.backfill import BackfillRunner  # noqa: E402,F401
+from algotrader_api.ingestion.writer_lock import (  # noqa: E402
+    WriterLockBusy, is_sqlite_busy, writer_lock, writer_lock_path,
+)
 
 logger = get_logger("algotrader_api.worker")
 
@@ -806,7 +809,7 @@ def _step_gap_recovery(db_path: str) -> tuple[bool, str]:
 
 def _step_corporate_actions(db_path: str) -> tuple[bool, str]:
     """Re-run split derivation against the freshly-updated bars,
-    then apply_all_pending to forward-adjust bars."""
+    then forward-adjust bars for the selected splits."""
     try:
         import importlib
         import sqlite3
@@ -814,13 +817,40 @@ def _step_corporate_actions(db_path: str) -> tuple[bool, str]:
             "algotrader_api.scripts_import.derive_splits"
         )
         from algotrader_api.data_quality.forward_adjustment import (
-            apply_all_pending,
+            apply_forward_split,
         )
         written = derive_splits.run_derivation(db_path)
         conn = sqlite3.connect(db_path)
         try:
-            adjusted = apply_all_pending(conn)
-            conn.commit()
+            selected = conn.execute(
+                "SELECT figi, ex_date, factor FROM corporate_actions "
+                "WHERE action_type = 'split' ORDER BY ex_date"
+            ).fetchall()
+            prepared = [
+                (figi, date.fromisoformat(ex_date) if isinstance(ex_date, str) else ex_date,
+                 float(factor))
+                for figi, ex_date, factor in selected
+            ]
+            adjusted = 0
+            with writer_lock(db_path, role="corporate-actions", phase="adjusted-bars"):
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    for figi, ex_date, factor in prepared:
+                        adjusted += apply_forward_split(conn, figi, ex_date, factor)
+                    conn.commit()
+                except BaseException as exc:
+                    try:
+                        conn.rollback()
+                    except BaseException:
+                        pass
+                    if is_sqlite_busy(exc):
+                        raise WriterLockBusy(
+                            role="corporate-actions", phase="adjusted-bars",
+                            database_path=str(writer_lock_path(db_path))[:-len(".writer.lock")],
+                            lock_path=str(writer_lock_path(db_path)),
+                            timeout_seconds=30.0, reason="sqlite-busy",
+                        ) from exc
+                    raise
         finally:
             conn.close()
         return True, f"splits derived={written} bars adjusted={adjusted}"
