@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date, datetime, timezone
 import importlib
 import fcntl
+from pathlib import Path
 import socket
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -1257,5 +1260,477 @@ def test_corporate_adjustment_no_mutation_still_owns_one_transaction(corporate_d
     assert events == [("prepare-select",), ("acquire", "corporate-actions", "adjusted-bars"), ("BEGIN",),
                       ("commit",), ("release", "corporate-actions", "adjusted-bars"), ("close",)]
     assert snapshot(db, real_connect) == before
+    assert_closed(connections)
+    assert_unlocked(db, state)
+
+
+DIVIDEND_ROW = corporate.DividendRow(
+    figi="FCOORD", ex_date="2024-06-15", period_year=2024,
+    amount_per_share=10.0, retrieved_at="2024-09-14T12:00:00",
+)
+DIVIDEND_STORED = (
+    "FCOORD", "2024-06-15", None, None, None, 2024, 1, "rub", 10.0,
+    None, "regular", None, None, None, None, None, None, "tinkoff", None,
+    "2024-09-14T12:00:00", 1, 0, 10.0, None,
+)
+DIVIDEND_REVISION = corporate.DividendRow(
+    figi="FCOORD", ex_date="2024-06-15", period_year=2024,
+    pay_date="2024-07-01", record_date="2024-06-20",
+    declared_at="2024-03-15T10:00:00Z", period_no=1, currency="usd",
+    amount_per_share=12.5, fx_rate_used=2.0, dividend_type="interim",
+    regularity="semi-annual", close_price=100.0, yield_value=2.5,
+    yield_pct=0.025, tax_withheld_pct=0.13,
+    cancelled_at="2024-09-13T09:30:00+03:00", source="fixture:revision",
+    source_revision_ts="2024-09-13T10:00:00Z",
+    retrieved_at="2024-09-14T12:00:01", revision_n=2, note="corrected",
+)
+DIVIDEND_REVISION_STORED = (
+    "FCOORD", "2024-06-15", "2024-07-01", "2024-06-20",
+    "2024-03-15T10:00:00Z", 2024, 1, "usd", 12.5, 2.0, "interim",
+    "semi-annual", 100.0, 2.5, 0.025, 0.13,
+    "2024-09-13T09:30:00+03:00", "fixture:revision",
+    "2024-09-13T10:00:00Z", "2024-09-14T12:00:01", 2, 1, 25.0, "corrected",
+)
+DIVIDEND_FIELDS = (
+    "figi", "ex_date", "pay_date", "record_date", "declared_at", "period_year",
+    "period_no", "currency", "amount_per_share", "fx_rate_used", "dividend_type",
+    "regularity", "close_price", "yield_value", "yield_pct", "tax_withheld_pct",
+    "cancelled_at", "source", "source_revision_ts", "retrieved_at", "revision_n", "note",
+)
+
+
+@pytest.fixture
+def dividend_trace(coordinated_db, owner_trace, monkeypatch):
+    state, events, connections, base_install = owner_trace
+
+    def acquire(path, *, role, phase, **kwargs):
+        assert (role, phase) == ("dividends", "dividends")
+        return observed_lock(path, role=role, phase=phase, state=state, events=events, **kwargs)
+
+    def observe_sql(conn, sql, parameters):
+        normalized = " ".join(sql.split())
+        assert "corporate_actions" not in normalized
+        assert "dividends_throttle_pending" not in normalized
+        if normalized.startswith("SELECT 1 FROM dividends"):
+            assert state["held"] and conn.in_transaction, "dividend PK check outside owner transaction"
+            events.append(("duplicate-check",))
+        elif normalized.startswith("INSERT INTO dividends"):
+            assert state["held"] and conn.in_transaction
+            assert len(parameters) == 22
+
+    def install(**kwargs):
+        base_install(sql_observer=observe_sql, **kwargs)
+        monkeypatch.setattr(corporate, "writer_lock", acquire)
+
+    return state, events, connections, install
+
+
+def dividend_transaction_events(*, inserts=1, checks=None, rollback=False):
+    checks = inserts if checks is None else checks
+    return [
+        ("acquire", "dividends", "dividends"), ("BEGIN",),
+        *[(event,) for index in range(checks)
+          for event in (["duplicate-check", "INSERT"] if index < inserts else ["duplicate-check"])],
+        ("commit",), *([("rollback",)] if rollback else []),
+        ("release", "dividends", "dividends"), ("close",),
+    ]
+
+
+@pytest.mark.parametrize("journal", ["wal", "delete"])
+def test_dividend_merge_complete_list_transaction_order(coordinated_db, dividend_trace, journal):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    con = real_connect(db)
+    try:
+        assert con.execute(f"PRAGMA journal_mode={journal}").fetchone() == (journal,)
+    finally:
+        con.close()
+    before = snapshot(db, real_connect)
+    install()
+    assert corporate.merge_into_dividends(db, [DIVIDEND_ROW, DIVIDEND_REVISION]) == 2
+    assert events == dividend_transaction_events(inserts=2)
+    assert len(connections) == 1
+    assert connections[0].settings_at_begin == (0, 5000, journal)
+    after = snapshot(db, real_connect)
+    assert after == {**before, "dividends": [DIVIDEND_STORED, DIVIDEND_REVISION_STORED]}
+    assert_closed(connections)
+    assert_unlocked(db, state)
+
+
+def test_dividend_merge_same_pk_changed_amount_stays_skipped(coordinated_db, dividend_trace):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+    install()
+    assert corporate.merge_into_dividends(db, [DIVIDEND_ROW, DIVIDEND_ROW]) == 1
+    assert events == dividend_transaction_events(inserts=1, checks=2)
+    first = snapshot(db, real_connect)
+    assert first == {**before, "dividends": [DIVIDEND_STORED]}
+    events.clear()
+    changed = replace(DIVIDEND_ROW, amount_per_share=999.0, source="changed",
+                      retrieved_at="2025-01-01T00:00:00", note="changed")
+    assert corporate.merge_into_dividends(db, [changed, DIVIDEND_ROW]) == 0
+    assert snapshot(db, real_connect) == first
+    assert events == dividend_transaction_events(inserts=0, checks=2)
+    assert_closed(connections)
+    assert_unlocked(db, state)
+
+
+def test_dividend_merge_revisions_remain_distinct_and_retry_idempotent(coordinated_db, dividend_trace):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+    install()
+    assert corporate.merge_into_dividends(db, [DIVIDEND_ROW, DIVIDEND_REVISION, DIVIDEND_REVISION]) == 2
+    first = snapshot(db, real_connect)
+    assert first == {**before, "dividends": [DIVIDEND_STORED, DIVIDEND_REVISION_STORED]}
+    assert events == dividend_transaction_events(inserts=2, checks=3)
+    events.clear()
+    assert corporate.merge_into_dividends(db, [DIVIDEND_REVISION, DIVIDEND_ROW]) == 0
+    assert events == dividend_transaction_events(inserts=0, checks=2)
+    assert snapshot(db, real_connect) == first
+    assert_closed(connections)
+    assert_unlocked(db, state)
+
+
+@pytest.mark.parametrize("field,value,column", [
+    ("figi", "FOTHER", 0), ("ex_date", "2024-06-16", 1),
+    ("period_year", 2023, 5), ("period_no", 2, 6), ("revision_n", 2, 20),
+])
+def test_dividend_merge_preserves_each_pk_component(coordinated_db, dividend_trace, field, value, column):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+    changed = replace(DIVIDEND_ROW, **{field: value})
+    expected = list(DIVIDEND_STORED)
+    expected[column] = value
+    if field == "revision_n":
+        expected[21] = 1
+    install()
+    assert corporate.merge_into_dividends(db, [DIVIDEND_ROW, changed]) == 2
+    after = snapshot(db, real_connect)
+    assert sorted(after["dividends"]) == sorted([DIVIDEND_STORED, tuple(expected)])
+    assert {table: rows for table, rows in after.items() if table != "dividends"} == {
+        table: rows for table, rows in before.items() if table != "dividends"
+    }
+    assert events == dividend_transaction_events(inserts=2)
+    assert_closed(connections)
+    assert_unlocked(db, state)
+
+
+def test_dividend_merge_empty_input_has_no_connection_or_acquisition(coordinated_db, dividend_trace):
+    db, real_connect = coordinated_db
+    _, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+    install()
+    assert corporate.merge_into_dividends(db, []) == 0
+    assert events == [] and connections == []
+    assert snapshot(db, real_connect) == before
+    assert not locks.writer_lock_path(db).exists()
+
+
+def test_dividend_merge_prepares_all_22_fields_before_connection_and_acquisition(
+    coordinated_db, dividend_trace, monkeypatch,
+):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+
+    class PreparedRow(corporate.DividendRow):
+        def __getattribute__(self, name):
+            if name in DIVIDEND_FIELDS:
+                assert not state["held"], f"row field {name} inside owner lock"
+                assert ("acquire", "dividends", "dividends") not in events
+                events.append(("parameter", name))
+                time.sleep(0)
+            return super().__getattribute__(name)
+
+    rows: list[corporate.DividendRow] = [
+        PreparedRow(**vars(DIVIDEND_ROW)), PreparedRow(**vars(DIVIDEND_REVISION)),
+    ]
+    events.clear()  # __post_init__ validates identity before merge preparation.
+    install()
+    tracked_connect = sqlite3.connect
+    prepared_events = [("parameter", name) for name in DIVIDEND_FIELDS] * 2
+
+    def connect(*args, **kwargs):
+        assert events == prepared_events, "connection opened before complete row-list preparation"
+        events.append(("open",))
+        return tracked_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    assert corporate.merge_into_dividends(db, rows) == 2
+    assert events == [*prepared_events, ("open",), *dividend_transaction_events(inserts=2)]
+    assert snapshot(db, real_connect) == {
+        **before, "dividends": [DIVIDEND_STORED, DIVIDEND_REVISION_STORED],
+    }
+    assert_closed(connections)
+    assert_unlocked(db, state)
+
+
+def test_dividend_merge_later_preparation_error_opens_no_connection(coordinated_db, dividend_trace):
+    db, real_connect = coordinated_db
+    _, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+    primary = Interrupted("fixture-dividend-preparation-interrupted")
+
+    class BrokenRow(corporate.DividendRow):
+        def __getattribute__(self, name):
+            if name == "note":
+                raise primary
+            return super().__getattribute__(name)
+
+    rows = [DIVIDEND_ROW, BrokenRow(**vars(DIVIDEND_REVISION))]
+    install()
+    with pytest.raises(Interrupted) as caught:
+        corporate.merge_into_dividends(db, rows)
+    assert caught.value is primary
+    assert events == [] and connections == []
+    assert not locks.writer_lock_path(db).exists()
+    assert snapshot(db, real_connect) == before
+
+
+@pytest.mark.parametrize("primary_type", [sqlite3.IntegrityError, Interrupted])
+@pytest.mark.parametrize("broken_rollback", [False, True], ids=["healthy-rollback", "rollback-failure"])
+def test_dividend_merge_complete_list_commit_failure_preserves_primary(
+    coordinated_db, dividend_trace, primary_type, broken_rollback,
+):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+    primary = primary_type("fixture-dividend-commit-failure")
+    install(failure=primary, rollback_failure=Interrupted("fixture-rollback-failure") if broken_rollback else None)
+    with pytest.raises(primary_type) as caught:
+        corporate.merge_into_dividends(db, [DIVIDEND_ROW, DIVIDEND_REVISION])
+    assert caught.value is primary
+    assert events == dividend_transaction_events(inserts=2, rollback=True)
+    assert connections[0]._injected_rollback_failure is broken_rollback
+    assert snapshot(db, real_connect) == before
+    assert_closed(connections)
+    assert_unlocked(db, state)
+    events.clear()
+    install()
+    assert corporate.merge_into_dividends(db, [DIVIDEND_ROW, DIVIDEND_REVISION]) == 2
+    assert snapshot(db, real_connect) == {
+        **before, "dividends": [DIVIDEND_STORED, DIVIDEND_REVISION_STORED],
+    }
+    assert events == dividend_transaction_events(inserts=2)
+    assert_closed(connections)
+
+
+@pytest.mark.parametrize("location,operation,statement", [
+    ("begin", "BEGIN", 1), ("first-check", "SELECT", 1), ("second-check", "SELECT", 2),
+    ("first-insert", "INSERT", 1), ("second-insert", "INSERT", 2),
+])
+@pytest.mark.parametrize("broken_rollback", [False, True], ids=["healthy-rollback", "rollback-failure"])
+def test_dividend_merge_begin_and_body_interruption_is_atomic(
+    coordinated_db, dividend_trace, location, operation, statement, broken_rollback,
+):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+    primary = Interrupted(f"fixture-dividend-{location}-interrupted")
+    install(failure=primary, fail_operation=operation, failure_at_statement=statement,
+            rollback_failure=Interrupted("fixture-rollback-failure") if broken_rollback else None)
+    with pytest.raises(Interrupted) as caught:
+        corporate.merge_into_dividends(db, [DIVIDEND_ROW, DIVIDEND_REVISION])
+    assert caught.value is primary
+    assert events[:2] == [("acquire", "dividends", "dividends"), ("BEGIN",)]
+    assert events[-3:] == [("rollback",), ("release", "dividends", "dividends"), ("close",)]
+    assert events.count(("BEGIN",)) == 1
+    assert events.count(("INSERT",)) == (statement if operation == "INSERT" else
+                                         (1 if location == "second-check" else 0))
+    assert ("commit",) not in events
+    assert connections[0]._injected_rollback_failure is broken_rollback
+    assert snapshot(db, real_connect) == before
+    assert_closed(connections)
+    assert_unlocked(db, state)
+
+
+def test_dividend_merge_real_second_insert_constraint_failure_rolls_back_complete_list(
+    coordinated_db, dividend_trace,
+):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+    install()
+    invalid = replace(DIVIDEND_REVISION, amount_per_share=None)
+    with pytest.raises(sqlite3.IntegrityError) as caught:
+        corporate.merge_into_dividends(db, [DIVIDEND_ROW, invalid])
+    assert caught.value.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_NOTNULL
+    assert events == [
+        ("acquire", "dividends", "dividends"), ("BEGIN",),
+        ("duplicate-check",), ("INSERT",), ("duplicate-check",), ("INSERT",),
+        ("rollback",), ("release", "dividends", "dividends"), ("close",),
+    ]
+    assert snapshot(db, real_connect) == before
+    assert_closed(connections)
+    assert_unlocked(db, state)
+
+
+@pytest.mark.parametrize("code", [5, 517, 1, 6, "5", None],
+                         ids=["busy", "extended-busy", "error", "locked", "string-code", "text-only"])
+@pytest.mark.parametrize("broken_rollback", [False, True], ids=["healthy-rollback", "rollback-failure"])
+def test_dividend_merge_commit_busy_is_numeric_only(coordinated_db, dividend_trace, code, broken_rollback):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+    primary = sqlite3.OperationalError("database is locked")
+    if code is not None:
+        primary.sqlite_errorcode = code
+    install(failure=primary, rollback_failure=Interrupted("fixture-rollback-failure") if broken_rollback else None)
+    with pytest.raises(locks.WriterLockBusy if code in (5, 517) else sqlite3.OperationalError) as caught:
+        corporate.merge_into_dividends(db, [DIVIDEND_ROW, DIVIDEND_REVISION])
+    if code in (5, 517):
+        assert_busy(caught.value, db, "dividends", "dividends", reason="sqlite-busy", timeout=30.0)
+        assert caught.value.__cause__ is primary
+    else:
+        assert caught.value is primary
+    assert events == dividend_transaction_events(inserts=2, rollback=True)
+    assert connections[0]._injected_rollback_failure is broken_rollback
+    assert snapshot(db, real_connect) == before
+    assert_closed(connections)
+    assert_unlocked(db, state)
+
+
+@pytest.mark.parametrize("alias", [False, True], ids=["canonical", "symlink"])
+def test_dividend_merge_kernel_flock_timeout_is_retryable(coordinated_db, dividend_trace, alias):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    path = Path(db)
+    if alias:
+        path = path.with_name("alias.db")
+        path.symlink_to(db)
+    before = snapshot(db, real_connect)
+    install()
+    with open(locks.writer_lock_path(db), "a+b") as descriptor:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(locks.WriterLockBusy) as caught:
+            corporate.merge_into_dividends(str(path), [DIVIDEND_ROW])
+        assert_busy(caught.value, db, "dividends", "dividends", reason="flock-timeout", timeout=0.05)
+        assert events == [("close",)]
+        assert snapshot(db, real_connect) == before
+        assert_closed(connections)
+    events.clear()
+    assert corporate.merge_into_dividends(str(path), [DIVIDEND_ROW]) == 1
+    assert events == dividend_transaction_events()
+    assert snapshot(db, real_connect) == {**before, "dividends": [DIVIDEND_STORED]}
+    assert_closed(connections)
+    assert_unlocked(db, state)
+
+
+def test_dividend_merge_real_sqlite_busy_rolls_back_before_release(coordinated_db, dividend_trace):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+    blocker = real_connect(db)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        install(sqlite_timeout=0.05)
+        with pytest.raises(locks.WriterLockBusy) as caught:
+            corporate.merge_into_dividends(db, [DIVIDEND_ROW, DIVIDEND_REVISION])
+        assert_busy(caught.value, db, "dividends", "dividends", reason="sqlite-busy", timeout=30.0)
+        assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+        assert caught.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_BUSY
+        assert events == [("acquire", "dividends", "dividends"), ("BEGIN",), ("rollback",),
+                          ("release", "dividends", "dividends"), ("close",)]
+        assert snapshot(db, real_connect) == before
+        assert_closed(connections)
+        assert_unlocked(db, state)
+    finally:
+        blocker.rollback()
+        blocker.close()
+    events.clear()
+    assert corporate.merge_into_dividends(db, [DIVIDEND_ROW, DIVIDEND_REVISION]) == 2
+    assert events == dividend_transaction_events(inserts=2)
+    assert snapshot(db, real_connect) == {
+        **before, "dividends": [DIVIDEND_STORED, DIVIDEND_REVISION_STORED],
+    }
+    assert_closed(connections)
+
+
+@pytest.mark.parametrize("alias", ["canonical", "symlink", "dotdot"])
+@pytest.mark.parametrize("other_thread", [False, True], ids=["same-thread", "other-thread"])
+def test_dividend_merge_same_pid_guard_covers_threads_and_path_aliases(
+    coordinated_db, dividend_trace, alias, other_thread,
+):
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    path = Path(db)
+    if alias == "symlink":
+        path = path.with_name("alias.db")
+        path.symlink_to(db)
+    elif alias == "dotdot":
+        directory = path.parent / "child"
+        directory.mkdir()
+        path = directory / ".." / path.name
+    before = snapshot(db, real_connect)
+    install()
+    errors, cleanup_errors = [], []
+
+    def attempt():
+        try:
+            corporate.merge_into_dividends(str(path), [DIVIDEND_ROW])
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            assert_closed(connections)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+
+    with locks.writer_lock(db, role="bar-writer", phase="bars", timeout_seconds=0.05):
+        if other_thread:
+            thread = threading.Thread(target=attempt)
+            thread.start()
+            thread.join(timeout=1.0)
+            assert not thread.is_alive(), "same-PID guard did not fail immediately"
+        else:
+            attempt()
+        assert len(errors) == 1 and isinstance(errors[0], locks.WriterLockReentrant)
+        assert cleanup_errors == []
+        assert events == [("close",)]
+        assert snapshot(db, real_connect) == before
+    assert_unlocked(db, state)
+    events.clear()
+    assert corporate.merge_into_dividends(str(path), [DIVIDEND_ROW]) == 1
+    assert events == dividend_transaction_events()
+    assert snapshot(db, real_connect) == {**before, "dividends": [DIVIDEND_STORED]}
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[-1].execute("SELECT 1")
+
+
+def test_dividend_merge_constructs_pk_parameter_tuple_before_acquisition(coordinated_db, dividend_trace):
+    import dis
+    import sys
+
+    db, real_connect = coordinated_db
+    state, events, connections, install = dividend_trace
+    before = snapshot(db, real_connect)
+    install()
+    code = corporate.merge_into_dividends.__code__
+    codes = [code, *(constant for constant in code.co_consts if isinstance(constant, type(code)))]
+    operations = {
+        owner_code: {instruction.offset: instruction.opname for instruction in dis.get_instructions(owner_code)}
+        for owner_code in codes
+    }
+
+    def trace(frame, event, arg):
+        if frame.f_code in operations:
+            frame.f_trace_opcodes = True
+            if event == "opcode" and operations[frame.f_code].get(frame.f_lasti) == "BUILD_TUPLE":
+                assert not state["held"], "dividend parameter tuple constructed under flock"
+            return trace
+        return None
+
+    previous_trace = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        assert corporate.merge_into_dividends(db, [DIVIDEND_ROW, DIVIDEND_REVISION]) == 2
+    finally:
+        sys.settrace(previous_trace)
+    assert events == dividend_transaction_events(inserts=2)
+    assert snapshot(db, real_connect) == {
+        **before, "dividends": [DIVIDEND_STORED, DIVIDEND_REVISION_STORED],
+    }
     assert_closed(connections)
     assert_unlocked(db, state)
