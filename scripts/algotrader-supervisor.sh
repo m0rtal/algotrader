@@ -13,6 +13,12 @@
 # started us with (legacy behaviour).
 set -u
 NAME="${1:?service name required}"
+if [[ ! "$NAME" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+  printf '%s\n' '[supervisor] unknown:service-name' >&2
+  exit 2
+fi
+HELPER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/worker-watchdog.py"
+SUPERVISOR_PID=$$
 shift
 # The command to run is everything between NAME and the optional trailing
 # directory hint. IMPORTANT: pass the command as separate args (one per
@@ -22,7 +28,7 @@ shift
 #   ✗   bash supervisor.sh foo "python3 worker.py daily" /path/to/cwd
 #   ✓   bash supervisor.sh foo python3 worker.py daily /path/to/cwd
 SUP_CWD="${@: -1}"  # last positional argument if it looks like a directory
-LOG="/home/hermes/.hermes/logs/${NAME}.log"
+LOG="${ALGO_SUPERVISOR_LOG:-/home/hermes/.hermes/logs/${NAME}.log}"
 mkdir -p "$(dirname "$LOG")"
 echo "[supervisor] $(date -Iseconds) starting $NAME: $*" >> "$LOG"
 
@@ -37,130 +43,44 @@ if [[ -d "$SUP_CWD" && "$SUP_CWD" != "." ]]; then
   echo "[supervisor] $(date -Iseconds) cwd=$(pwd)" >> "$LOG"
 fi
 
-# Heartbeat watchdog (autonomous-chain-recovery phase 2). Look for a
-# pipeline row with phase='worker.heartbeat' that is younger than 30
-# minutes. If the latest is older (or absent), the worker is stalled —
-# SIGKILL its PID so the outer restart loop relaunches it.
-#
-# Watchdog runs in the background; the main restart loop is the
-# foreground. STATE_DB is `<cwd>/data/state.db` (matches the
-# supervisor's cwd pinning convention used by worker.py).
+# Each role checks only its verified current child through the pidfd helper.
+# Resolve state from the existing cwd convention before deriving the target.
 STATE_DB="${PWD}/data/state.db"
-HEARTBEAT_MAX_AGE_DAYS=0.0208  # 30 minutes in days (SQLite julianday unit)
+PIDFILE="${STATE_DB}.${NAME}.worker.pid"
+HEARTBEAT_MAX_AGE_DAYS=0.0208
 
 _watchdog() {
-  # Tunables.
-  HEARTBEAT_MAX_AGE_DAYS=0.0208  # 30 min
-  PROGRESS_MAX_AGE_DAYS=0.0625   # 90 min — if bars count hasn't grown
-                                   # in this window AND heartbeat is fresh,
-                                   # main loop is stuck (HTTP/2 flow
-                                   # control). Worker alive, daemon
-                                   # heartbeat ticks, but real work
-                                   # blocked.
-
-  # Worker pid is written to PIDFILE by the main loop, since
-  # subshell-exported vars don't propagate back. We poll the
-  # pidfile every watchdog cycle.
-  PIDFILE="${STATE_DB}.worker.pid"
-
-  # Snapshot bars_count at worker start so we can detect "fresh
-  # worker that's stuck from the very first Tinkoff call".
-  BASELINE_BARS=$(STATE_DB="$STATE_DB" python3 << 'PYEOF'
-import os, sqlite3
-con = sqlite3.connect(os.environ['STATE_DB'], timeout=5)
-print(con.execute("SELECT COUNT(*) FROM bars").fetchone()[0])
-PYEOF
-)
-  BASELINE_BARS=${BASELINE_BARS##*$'\n'}  # last line only
-  BASELINE_TIME=$(date +%s)
-
   while true; do
     sleep 30
-    if [[ ! -f "$STATE_DB" ]]; then
-      continue
-    fi
-
-    # Combined check via python (no sqlite3 CLI on this host).
-    OUT=$(STATE_DB="$STATE_DB" HEARTBEAT_MAX="$HEARTBEAT_MAX_AGE_DAYS" \
-    PROGRESS_MAX="$PROGRESS_MAX_AGE_DAYS" BASELINE_BARS="$BASELINE_BARS" \
-    BASELINE_TIME="$BASELINE_TIME" python3 << 'PYEOF'
-import os, sqlite3, time
-from datetime import datetime
-sd = os.environ['STATE_DB']
-hb_max = float(os.environ['HEARTBEAT_MAX'])
-pg_max = float(os.environ['PROGRESS_MAX'])
-baseline_bars = int(os.environ.get('BASELINE_BARS', '0') or 0)
-baseline_time = int(os.environ.get('BASELINE_TIME', '0') or 0)
-con = sqlite3.connect(sd, timeout=5)
-# Heartbeat freshness.
-hb_row = con.execute(
-    "SELECT finished_at FROM pipeline "
-    "WHERE phase='worker.heartbeat' ORDER BY id DESC LIMIT 1"
-).fetchone()
-hb_age_days = 999.0
-if hb_row:
-    hb_age_days = (datetime.utcnow() - datetime.strptime(
-        hb_row[0], "%Y-%m-%d %H:%M:%S"
-    )).total_seconds() / 86400
-# Bars progress.
-last_bar = con.execute(
-    "SELECT MAX(ts) FROM bars"
-).fetchone()[0]
-bar_age_days = 999.0
-if last_bar:
-    bar_age_days = (datetime.utcnow() - datetime.strptime(
-        last_bar + " 00:00:00", "%Y-%m-%d %H:%M:%S"
-    )).total_seconds() / 86400
-# Baseline progress (compare current bars to snapshot at startup).
-current_bars = con.execute("SELECT COUNT(*) FROM bars").fetchone()[0]
-bars_growth = current_bars - baseline_bars
-elapsed = time.time() - baseline_time
-print(f"hb_age={hb_age_days:.4f}d bar_age={bar_age_days:.4f}d bars_growth={bars_growth} elapsed={elapsed:.0f}s")
-# Kill if the heartbeat is stale (worker truly dead). The previous
-# "elapsed > 600 and bars_growth == 0" STUCK_AT_STARTUP rule was
-# removed in PR #123 (2026-09-23): after PR #120 fixed the asyncio
-# event-loop bug and PR #122 cut prefetch from infinite to ~8 min,
-# the worker is now alive for ~30 min per backfill cycle (8 min
-# prefetch + ~22 min _process_one_bounded walking 3800 figis at
-# Semaphore(5)). The old 600 s threshold killed the worker 5 min
-# before any bar could be written. Heartbeat freshness is the
-# right liveness signal; bar-progress is communicated via the
-# heartbeat age + bar count which the operator already monitors.
-if hb_age_days > hb_max:
-    print("STALL")
-PYEOF
-)
-
-    # Always log diagnostic, kill on STALL.
+    OUT=$(env -u PYTHONPATH -u PYTHONHOME /usr/bin/python3 "$HELPER" \
+      --db "$STATE_DB" --pid-file "$PIDFILE" --parent "$SUPERVISOR_PID" \
+      --max-age-days "$HEARTBEAT_MAX_AGE_DAYS" 2>/dev/null) || OUT='unknown:helper'
+    case "$OUT" in
+      fresh|grace|stale:signaled|unknown:*) ;;
+      *) OUT='unknown:helper-output' ;;
+    esac
+    # Bound unexpected output; the helper never emits raw exception messages.
+    if (( ${#OUT} > 79 )); then OUT='unknown:helper-output'; fi
     echo "[supervisor] $(date -Iseconds) watchdog check: $OUT" >> "$LOG"
-    if grep -qE "STALL|STUCK_AT_STARTUP" <<< "$OUT"; then
-      WORKER_PID=""
-      if [[ -f "$PIDFILE" ]]; then
-        WORKER_PID=$(cat "$PIDFILE" 2>/dev/null)
-      fi
-      if [[ -n "$WORKER_PID" ]] && kill -0 "$WORKER_PID" 2>/dev/null; then
-        echo "[supervisor] $(date -Iseconds) killing stalled worker pid=$WORKER_PID" >> "$LOG"
-        kill -9 "$WORKER_PID" 2>/dev/null || true
-      fi
-    fi
   done
 }
-
 _watchdog &
 WATCHDOG_PID=$!
-
-# Pidfile location shared with the watchdog subshell.
-PIDFILE="${STATE_DB}.worker.pid"
 
 while true; do
   echo "[supervisor] $(date -Iseconds) launching $*" >> "$LOG"
   "$@" >> "$LOG" 2>&1 &
   WORKER_PID=$!
-  echo "$WORKER_PID" > "$PIDFILE"
+  flock -w 5 "${PIDFILE}.lock" bash -c \
+    'printf "%s\n" "$2" > "$1"' _ "$PIDFILE" "$WORKER_PID" \
+    || echo '[supervisor] unknown:pid-publish' >> "$LOG"
   wait "$WORKER_PID"
   RC=$?
+  flock -w 5 "${PIDFILE}.lock" bash -c \
+    'if [[ -f "$1" && "$(<"$1")" == "$2" ]]; then rm -f -- "$1"; fi' \
+    _ "$PIDFILE" "$WORKER_PID" \
+    || echo '[supervisor] unknown:pid-cleanup' >> "$LOG"
   WORKER_PID=""
-  rm -f "$PIDFILE"
   echo "[supervisor] $(date -Iseconds) $NAME exited rc=$RC; restarting in 5s" >> "$LOG"
   sleep 5
 done
