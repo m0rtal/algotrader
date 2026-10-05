@@ -98,8 +98,7 @@ fi
 # release DB write-lock for migration phase" sleep is therefore
 # unnecessary and was removed.
 if ! pgrep -f 'worker.py daily' >/dev/null 2>&1; then
-    nohup bash "$PROJECT/scripts/algotrader-supervisor.sh algotrader-moex-backfill" \
-        "$PY" worker.py daily "$API_DIR" \
+    nohup bash "$PROJECT/scripts/algotrader-moex-supervisor-clean.sh" \
         >> "$LOG_DIR/algotrader-moex-backfill.log" 2>&1 &
     disown
     echo "[startup] worker launched (pid $!)"
@@ -113,7 +112,7 @@ fi
 # Distinct supervisor slot (algotrader-derived) so its watchdog does not
 # interfere with the algotrader-moex-backfill watchdog.
 if ! pgrep -f 'worker.py daily derived' >/dev/null 2>&1; then
-    nohup bash "$PROJECT/scripts/algotrader-supervisor.sh" \
+    nohup env -u PYTHONPATH -u PYTHONHOME bash "$PROJECT/scripts/algotrader-supervisor.sh" \
         algotrader-derived \
         "$PY" worker.py daily derived "$API_DIR" \
         >> "$LOG_DIR/algotrader-derived.log" 2>&1 &
